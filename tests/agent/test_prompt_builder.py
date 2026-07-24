@@ -43,12 +43,11 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
-    def test_memory_guidance_discourages_task_logs(self):
-        assert "durable facts" in MEMORY_GUIDANCE
-        assert "Do NOT save task progress" in MEMORY_GUIDANCE
-        assert "session_search" in MEMORY_GUIDANCE
-        assert "like a diary" not in MEMORY_GUIDANCE
-        assert ">80%" not in MEMORY_GUIDANCE
+    def test_memory_guidance_separates_private_and_shared_facts(self):
+        assert "profile-private durable facts" in MEMORY_GUIDANCE
+        assert "shared environment/runtime facts" in MEMORY_GUIDANCE
+        assert "shared_state" in MEMORY_GUIDANCE
+        assert "CLUSTER.md" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
@@ -717,6 +716,13 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
+
+    def test_cluster_md_is_not_a_context_source(self, tmp_path):
+        (tmp_path / "CLUSTER.md").write_text("Shared runtime architecture.")
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert result == ""
 
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
@@ -1699,5 +1705,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
