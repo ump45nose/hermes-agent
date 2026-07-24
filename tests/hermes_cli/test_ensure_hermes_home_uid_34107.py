@@ -193,3 +193,27 @@ class TestSecureDirChown:
         with patch.object(cfg.os, "chown") as mock_chown:
             cfg._secure_dir(d)
         mock_chown.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+def test_named_profile_group_access_marker_preserves_collaboration(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as cfg
+
+    home = tmp_path / "profiles" / "lingjun"
+    home.mkdir(parents=True)
+    (home / ".group_access").write_text("enabled\n", encoding="utf-8")
+    child = home / "config.yaml"
+    child.write_text("model: {}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
+    monkeypatch.setattr(cfg, "is_managed", lambda: False)
+    monkeypatch.setattr(cfg, "_is_container", lambda: False)
+
+    cfg._secure_dir(home)
+    cfg._secure_file(child)
+
+    assert home.stat().st_mode & 0o7777 == 0o2770
+    assert child.stat().st_mode & 0o777 == 0o660
