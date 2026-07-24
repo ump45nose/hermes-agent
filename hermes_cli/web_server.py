@@ -14707,7 +14707,7 @@ class SkillToggle(BaseModel):
 @app.get("/api/skills")
 async def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
-    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_cli.skills_config import get_cron_only_skills, get_disabled_skills
     from tools.skill_usage import (
         _read_bundled_manifest_names,
         _read_hub_installed_names,
@@ -14717,6 +14717,7 @@ async def get_skills(profile: Optional[str] = None):
     with _profile_scope(profile):
         config = load_config()
         disabled = get_disabled_skills(config)
+        cron_only = get_cron_only_skills(config)
         skills = _find_all_skills(skip_disabled=True)
         usage = load_usage()
         # Set-based provenance (same classification as skill_usage.provenance,
@@ -14726,7 +14727,8 @@ async def get_skills(profile: Optional[str] = None):
         bundled_names = _read_bundled_manifest_names()
         hub_names = _read_hub_installed_names()
     for s in skills:
-        s["enabled"] = s["name"] not in disabled
+        s["cron_only"] = s["name"] in cron_only
+        s["enabled"] = s["name"] not in disabled and not s["cron_only"]
         s["usage"] = activity_count(usage.get(s["name"], {}))
         s["provenance"] = (
             "hub" if s["name"] in hub_names

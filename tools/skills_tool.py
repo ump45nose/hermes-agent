@@ -616,14 +616,14 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 
-def _get_disabled_skill_names() -> Set[str]:
+def _get_disabled_skill_names(platform: str = None) -> Set[str]:
     """Load disabled skill names from config.
 
     Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
     as a public re-export so existing callers don't need updating.
     """
     from agent.skill_utils import get_disabled_skill_names
-    return get_disabled_skill_names()
+    return get_disabled_skill_names(platform=platform)
 
 
 def _get_session_platform() -> str:
@@ -654,6 +654,11 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         skills_cfg = config.get("skills", {})
         resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
         global_disabled = skills_cfg.get("disabled", [])
+        cron_only = skills_cfg.get("cron_only", [])
+        if isinstance(cron_only, str):
+            cron_only = [cron_only]
+        if resolved_platform != "cron" and name in cron_only:
+            return True
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
             if platform_disabled is not None:
@@ -666,7 +671,9 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *, skip_disabled: bool = False, platform: str = None
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -687,7 +694,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    if skip_disabled:
+        disabled = set()
+    elif platform is None:
+        # Keep the no-override call shape stable for plugins/tests that
+        # monkeypatch this compatibility helper.
+        disabled = _get_disabled_skill_names()
+    else:
+        disabled = _get_disabled_skill_names(platform=platform)
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -963,6 +977,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    platform: str = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -975,6 +990,8 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        platform: Internal platform override used by scheduled jobs so
+            ``skills.cron_only`` remains hidden from interactive sessions.
 
     Returns:
         JSON string with skill content or error message
@@ -1207,7 +1224,10 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = [
+                s["name"]
+                for s in _sort_skills(_find_all_skills(platform=platform))[:20]
+            ]
             return json.dumps(
                 {
                     "success": False,
@@ -1277,7 +1297,7 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
-        if _is_skill_disabled(resolved_name):
+        if _is_skill_disabled(resolved_name, platform=platform):
             return json.dumps(
                 {
                     "success": False,

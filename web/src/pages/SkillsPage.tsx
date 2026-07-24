@@ -746,7 +746,8 @@ function SkillRow({
         <Switch
           checked={skill.enabled}
           onCheckedChange={onToggle}
-          disabled={toggling}
+          disabled={toggling || skill.cron_only}
+          title={skill.cron_only ? "Cron only" : undefined}
         />
       </div>
       <div className="flex-1 min-w-0">
@@ -758,6 +759,7 @@ function SkillRow({
           >
             {skill.name}
           </span>
+          {skill.cron_only && <Badge tone="outline">Cron only</Badge>}
         </div>
         <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
           {skill.description || noDescriptionLabel}

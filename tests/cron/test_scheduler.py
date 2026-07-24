@@ -2365,7 +2365,7 @@ class TestRunJobSkillBacked:
 
         fake_db = MagicMock()
 
-        def _skill_view(name):
+        def _skill_view(name, **kwargs):
             assert name == "notion"
             from tools.env_passthrough import register_env_passthrough
 
@@ -2423,7 +2423,7 @@ class TestRunJobSkillBacked:
         cred_dir.mkdir()
         (cred_dir / "google_token.json").write_text('{"token": "t"}')
 
-        def _skill_view(name):
+        def _skill_view(name, **kwargs):
             assert name == "google-workspace"
             from tools.credential_files import register_credential_file
 
@@ -2522,7 +2522,7 @@ class TestRunJobSkillBacked:
 
         fake_db = MagicMock()
 
-        def _skill_view(name):
+        def _skill_view(name, **kwargs):
             return json.dumps({"success": True, "content": f"# {name}\nInstructions for {name}."})
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -2979,7 +2979,7 @@ class TestRunJobWakeGate:
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""
 
-    def _missing_skill_view(self, name: str) -> str:
+    def _missing_skill_view(self, name: str, **kwargs) -> str:
         return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
     def test_missing_skill_does_not_raise(self):
@@ -3006,7 +3006,7 @@ class TestBuildJobPromptMissingSkill:
     def test_valid_skill_loaded_alongside_missing(self):
         """A valid skill is still loaded when another skill in the list is missing."""
 
-        def _mixed_skill_view(name: str) -> str:
+        def _mixed_skill_view(name: str, **kwargs) -> str:
             if name == "real-skill":
                 return json.dumps({"success": True, "content": "Real skill content."})
             return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
@@ -3028,7 +3028,7 @@ class TestBuildJobPromptAbsoluteSkillPath:
         absolute_path = str(skill_dir)
         seen_names: list[str] = []
 
-        def _skill_view(name: str) -> str:
+        def _skill_view(name: str, **kwargs) -> str:
             seen_names.append(name)
             if name == "alpha-skill":
                 return json.dumps({"success": True, "content": "# Alpha\nDo alpha."})
@@ -3048,7 +3048,7 @@ class TestBuildJobPromptBumpUse:
     def test_bump_use_called_for_loaded_skill(self):
         """bump_use is called for each successfully loaded skill."""
 
-        def _skill_view(name: str) -> str:
+        def _skill_view(name: str, **kwargs) -> str:
             return json.dumps({"success": True, "content": f"Content for {name}."})
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
@@ -3063,7 +3063,7 @@ class TestBuildJobPromptBumpUse:
     def test_bump_use_not_called_for_missing_skill(self):
         """bump_use is NOT called when a skill fails to load."""
 
-        def _missing_view(name: str) -> str:
+        def _missing_view(name: str, **kwargs) -> str:
             return json.dumps({"success": False, "error": "not found"})
 
         with patch("tools.skills_tool.skill_view", side_effect=_missing_view), \
@@ -3075,7 +3075,7 @@ class TestBuildJobPromptBumpUse:
     def test_bump_failure_does_not_break_prompt(self, caplog):
         """If bump_use raises, the prompt still builds — error is logged at DEBUG."""
 
-        def _skill_view(name: str) -> str:
+        def _skill_view(name: str, **kwargs) -> str:
             return json.dumps({"success": True, "content": "Works."})
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \

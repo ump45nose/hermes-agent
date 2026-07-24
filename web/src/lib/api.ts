@@ -2199,6 +2199,7 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+  cron_only?: boolean;
 }
 
 export interface SkillContent {
