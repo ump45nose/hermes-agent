@@ -144,6 +144,37 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_tools_visible_with_platform_toolsets_config(monkeypatch, tmp_path):
+    """Current platform_toolsets config must satisfy the registry gate."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - terminal\n"
+        "    - kanban\n"
+        "  telegram:\n"
+        "    - terminal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(
+        set(resolve_toolset("kanban")), quiet=True
+    )
+    names = {item["function"].get("name") for item in schema}
+
+    assert "kanban_list" in names
+    assert "kanban_unblock" in names
+    assert "kanban_complete" in names
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------

@@ -56,8 +56,22 @@ def _profile_has_kanban_toolset() -> bool:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        # ``toolsets`` is the legacy root field. Current multi-platform
+        # profiles store the effective selection under
+        # ``platform_toolsets.<platform>``. The registry check does not receive
+        # the active platform, but returning true when any configured platform
+        # enables kanban is safe: model_tools has already intersected schemas
+        # with the caller's enabled toolsets before registry check_fn filtering.
+        if "kanban" in (cfg.get("toolsets", []) or []):
+            return True
+        platform_toolsets = cfg.get("platform_toolsets", {}) or {}
+        if not isinstance(platform_toolsets, dict):
+            return False
+        return any(
+            "kanban" in (toolsets or [])
+            for toolsets in platform_toolsets.values()
+            if isinstance(toolsets, (list, tuple, set))
+        )
     except Exception:
         return False
 

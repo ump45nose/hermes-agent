@@ -250,6 +250,54 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
 
+    def test_kanban_worker_children_cannot_inherit_parent_task_tools(self):
+        """A delegate inside a kanban worker must not own the parent task.
+
+        HERMES_KANBAN_TASK is process-wide, so model_tools force-adds the
+        kanban toolset for every AIAgent built in that process.  The child's
+        disabled toolsets must subtract it after expansion.
+        """
+        import model_tools
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file", "kanban"]
+        parent.disabled_toolsets = []
+
+        with (
+            patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_parent"}),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Research one part without closing the parent task",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=2,
+                role="leaf",
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertNotIn("kanban", kwargs["enabled_toolsets"])
+            self.assertIn("kanban", kwargs["disabled_toolsets"])
+
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=kwargs["enabled_toolsets"],
+                disabled_toolsets=kwargs["disabled_toolsets"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+
+        names = {item["function"]["name"] for item in definitions}
+        self.assertTrue(names & {"terminal", "read_file"})
+        self.assertFalse(
+            {name for name in names if name.startswith("kanban_")},
+            f"delegated child inherited parent task tools: {sorted(names)}",
+        )
+
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
 
@@ -1152,7 +1200,16 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
+        for tool in [
+            "delegate_task",
+            "clarify",
+            "memory",
+            "send_message",
+            "execute_code",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        ]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):

@@ -449,6 +449,61 @@ class TestGeneratedSystemdUnits:
         # tool-call children before systemd SIGKILLs the cgroup — #8202.
         assert "KillMode=mixed" in unit
 
+    def test_profile_user_unit_loads_root_then_profile_env(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "companion"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile)
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root", lambda: root
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        root_line = f"EnvironmentFile=-{root / '.env'}"
+        profile_line = f"EnvironmentFile=-{profile / '.env'}"
+        assert root_line in unit
+        assert profile_line in unit
+        assert unit.index(root_line) < unit.index(profile_line)
+
+    def test_default_user_unit_does_not_duplicate_env_file(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root)
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root", lambda: root
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert unit.count(f"EnvironmentFile=-{root / '.env'}") == 1
+
+    def test_profile_system_unit_loads_target_root_then_profile_env(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+        monkeypatch.setenv("HERMES_HOME", "/root/.hermes/profiles/companion")
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("hermes", "hermes", "/home/hermes"),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home, existing: []
+        )
+
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="hermes"
+        )
+
+        root_line = "EnvironmentFile=-/home/hermes/.hermes/.env"
+        profile_line = (
+            "EnvironmentFile=-/home/hermes/.hermes/profiles/companion/.env"
+        )
+        assert root_line in unit
+        assert profile_line in unit
+        assert unit.index(root_line) < unit.index(profile_line)
+
     def test_user_unit_adds_cleanup_headroom_to_positive_drain_timeout(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 45)
 

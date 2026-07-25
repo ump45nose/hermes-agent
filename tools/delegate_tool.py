@@ -51,6 +51,25 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
+        # A delegated child created inside a dispatcher worker shares the
+        # process-wide HERMES_KANBAN_TASK environment.  Without an explicit
+        # deny, model_tools interprets that inherited identity as ownership and
+        # gives every child the parent's task lifecycle surface.  A child can
+        # then complete/block the parent task while siblings are still running,
+        # which removes their shared workspace underneath them.  The parent
+        # worker owns the handoff; children return results through delegation.
+        "kanban_show",
+        "kanban_list",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "kanban_link",
+        "kanban_unblock",
+        "kanban_attach",
+        "kanban_attach_url",
+        "kanban_attachments",
     ]
 )
 

@@ -2750,6 +2750,30 @@ def _systemd_watchdog_service_fields(
     return "notify", f"NotifyAccess=main\nWatchdogSec={seconds}s\n"
 
 
+def _systemd_environment_file_fields(
+    hermes_home: str | Path,
+    default_root: str | Path,
+) -> str:
+    """Load shared credentials before profile-local credentials.
+
+    Named profiles are intentionally isolated for config/state, but this
+    deployment model keeps common provider credentials in the default Hermes
+    root and identity/channel credentials in the profile's own ``.env``.
+    systemd must seed both before Python starts so dispatcher-spawned profile
+    workers inherit the common credentials too.  The profile file is listed
+    last and therefore wins on intentional key overlap.
+
+    A leading ``-`` keeps fresh installs without either optional file
+    startable.  Default-profile units emit the path only once.
+    """
+    root_env = Path(default_root).resolve() / ".env"
+    profile_env = Path(hermes_home).resolve() / ".env"
+    paths = [root_env]
+    if profile_env != root_env:
+        paths.append(profile_env)
+    return "".join(f"EnvironmentFile=-{path}\n" for path in paths)
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
@@ -2792,6 +2816,9 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
+        systemd_env_files = _systemd_environment_file_fields(
+            hermes_home, Path(home_dir) / ".hermes"
+        )
         profile_arg = _profile_arg_for_target_user(hermes_home, home_dir)
         # Remap all paths that may resolve under the calling user's home
         # (e.g. /root/) to the target user's home so the service can
@@ -2825,7 +2852,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{systemd_env_files}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
@@ -2845,6 +2872,11 @@ WantedBy=multi-user.target
     systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
         hermes_home
     )
+    from hermes_constants import get_default_hermes_root
+
+    systemd_env_files = _systemd_environment_file_fields(
+        hermes_home, get_default_hermes_root()
+    )
     profile_arg = _profile_arg(hermes_home)
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
@@ -2863,7 +2895,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{systemd_env_files}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
