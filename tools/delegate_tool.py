@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import re
+from contextvars import copy_context
 
 logger = logging.getLogger(__name__)
 import os
@@ -2147,7 +2148,13 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # The actual child conversation runs in a second worker thread so a
+        # hard timeout can abandon it. ContextVars do not cross that boundary
+        # automatically; copy the profile secret scope and HERMES_HOME context
+        # so lazy MCP connections resolve this profile's ${ENV} placeholders.
+        _child_future = _timeout_executor.submit(
+            copy_context().run, _run_with_thread_capture
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2554,6 +2561,30 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 
+def _run_single_child_scoped(
+    task_index: int,
+    goal: str,
+    child: Any,
+    parent_agent: Any,
+) -> Dict[str, Any]:
+    """Run one child with the parent profile's explicit secret scope.
+
+    Delegation uses worker threads, while the secret boundary is ContextVar
+    based. Store the immutable snapshot on the child at construction and
+    reinstall it at the worker entry point; never fall back to ambient process
+    secrets from another profile.
+    """
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    scope = getattr(child, "_delegate_secret_scope", None)
+    token = set_secret_scope(scope) if scope is not None else None
+    try:
+        return _run_single_child(task_index, goal, child, parent_agent)
+    finally:
+        if token is not None:
+            reset_secret_scope(token)
+
+
 def _recover_tasks_from_json_string(
     tasks: Any,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -2763,6 +2794,16 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                current_secret_scope,
+            )
+            from hermes_constants import get_hermes_home
+
+            child._delegate_secret_scope = dict(
+                current_secret_scope()
+                or build_profile_secret_scope(get_hermes_home())
+            )
             # Tee the child's progress events into its live transcript log.
             # wrap_progress_callback preserves the inner callback contract
             # (including the _flush attribute) and never lets writer failures
@@ -2792,7 +2833,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child_scoped(
+                _i, _t["goal"], child, parent_agent
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2807,7 +2850,7 @@ def delegate_task(
                 futures = {}
                 for i, t, child in children:
                     future = executor.submit(
-                        _run_single_child,
+                        _run_single_child_scoped,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
