@@ -23,9 +23,10 @@ Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A)
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, Iterator, Mapping, Optional
 
 
 # ── multiplex-active flag ────────────────────────────────────────────────
@@ -214,3 +215,29 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     if shared_home != home:
         secrets.update(load_env_file(home / ".env"))
     return secrets
+
+
+@contextmanager
+def profile_secret_scope_if_unset(hermes_home: Path) -> Iterator[Mapping[str, str]]:
+    """Install a root-baseline + profile-overlay scope for standalone callers.
+
+    Gateway multiplexing already establishes the active profile scope around
+    each routed request.  Standalone CLI entrypoints do not have that outer
+    request wrapper, so a named profile would otherwise see only whichever
+    values happened to be loaded into ``os.environ``.  Install a temporary
+    scope only when the caller is currently unscoped, and always restore it.
+
+    This deliberately does not mutate ``os.environ`` and therefore cannot
+    union credentials from multiple profiles in a long-running process.
+    """
+    existing = current_secret_scope()
+    if existing is not None:
+        yield existing
+        return
+
+    scope = build_profile_secret_scope(Path(hermes_home))
+    token = set_secret_scope(scope)
+    try:
+        yield scope
+    finally:
+        reset_secret_scope(token)

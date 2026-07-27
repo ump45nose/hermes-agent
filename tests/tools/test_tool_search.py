@@ -238,6 +238,30 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_progressive_exposes_only_four_stable_bridges(self):
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+            bridge_tool_schemas,
+        )
+
+        first = assemble_tool_defs(
+            [_td("terminal", "Run shell"), _td("read_file", "Read")],
+            progressive=True,
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        second = assemble_tool_defs(
+            [_td("terminal", "Different reachable count")],
+            progressive=True,
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        assert {t["function"]["name"] for t in first.tool_defs} == set(BRIDGE_TOOL_NAMES)
+        assert json.dumps(first.tool_defs, sort_keys=True) == json.dumps(
+            second.tool_defs, sort_keys=True
+        )
+        assert len(json.dumps(bridge_tool_schemas()).encode()) <= 4096
+
     def test_no_deferrable_returns_unchanged(self):
         """Pure-core toolset: pass-through, no bridge tools added."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
@@ -535,4 +559,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-

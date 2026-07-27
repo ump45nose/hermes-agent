@@ -92,6 +92,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import logging
@@ -102,6 +103,7 @@ import shutil
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -109,6 +111,8 @@ from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+_MCP_SCHEMA_CACHE_VERSION = 1
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
@@ -2815,11 +2819,13 @@ class MCPServerTask:
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
+        if self._idle_timeout_seconds is None:
+            self._idle_timeout_seconds = _mcp_progressive_settings()["idle_disconnect_seconds"]
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
-        if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
+        if sampling_config.get("enabled", False) and _MCP_SAMPLING_TYPES:
             self._sampling = SamplingHandler(self.name, sampling_config)
         else:
             self._sampling = None
@@ -2829,7 +2835,7 @@ class MCPServerTask:
         # input mid-tool-call (e.g. payment authorization). The handler
         # routes those requests through Hermes' approval system.
         elicitation_config = config.get("elicitation", {})
-        if elicitation_config.get("enabled", True) and _MCP_ELICITATION_TYPES:
+        if elicitation_config.get("enabled", False) and _MCP_ELICITATION_TYPES:
             self._elicitation = ElicitationHandler(self.name, elicitation_config, owner=self)
         else:
             self._elicitation = None
@@ -3930,6 +3936,123 @@ def _interrupted_call_result() -> str:
 # Config loading
 # ---------------------------------------------------------------------------
 
+
+def _mcp_progressive_settings() -> Dict[str, Any]:
+    """Return profile-local MCP disclosure/lifecycle settings."""
+    defaults = {
+        "lazy_connect": False,
+        "schema_cache_ttl_seconds": 86400,
+        "idle_disconnect_seconds": 600,
+    }
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (((load_config() or {}).get("tools") or {}).get("mcp") or {})
+        if not isinstance(raw, dict):
+            return defaults
+        ttl = max(0, int(raw.get("schema_cache_ttl_seconds", 86400)))
+        idle = max(0, int(raw.get("idle_disconnect_seconds", 600)))
+        return {
+            "lazy_connect": raw.get("lazy_connect") is True,
+            "schema_cache_ttl_seconds": ttl,
+            "idle_disconnect_seconds": idle or None,
+        }
+    except Exception:
+        return defaults
+
+
+def _mcp_schema_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "cache" / "mcp-schemas"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _mcp_cache_path(server_name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", server_name).strip("._") or "server"
+    suffix = hashlib.sha256(server_name.encode()).hexdigest()[:12]
+    return _mcp_schema_cache_dir() / f"{safe}-{suffix}.json"
+
+
+def _mcp_config_fingerprint(config: dict) -> str:
+    """Hash config without persisting any credential/header value."""
+    return hashlib.sha256(
+        json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _read_mcp_schema_cache(server_name: str, config: dict) -> Optional[dict]:
+    try:
+        record = json.loads(_mcp_cache_path(server_name).read_text(encoding="utf-8"))
+        if record.get("version") != _MCP_SCHEMA_CACHE_VERSION:
+            return None
+        if record.get("server_name") != server_name:
+            return None
+        if record.get("config_fingerprint") != _mcp_config_fingerprint(config):
+            return None
+        return record
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_mcp_schema_cache(server_name: str, server: Any, config: dict) -> None:
+    """Atomically persist sanitized discovery metadata for one profile."""
+    tools = []
+    for mcp_tool in getattr(server, "_tools", []) or []:
+        description = getattr(mcp_tool, "description", "") or ""
+        schema = _convert_mcp_schema(server_name, mcp_tool)
+        tools.append({
+            "remote_name": str(getattr(mcp_tool, "name", "") or ""),
+            "schema": schema,
+            "schema_hash": hashlib.sha256(
+                json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "quarantined": bool(
+                _scan_mcp_description(
+                    server_name,
+                    str(getattr(mcp_tool, "name", "") or ""),
+                    description,
+                )
+            ),
+        })
+
+    init_result = getattr(server, "initialize_result", None)
+    caps = getattr(init_result, "capabilities", None)
+    record = {
+        "version": _MCP_SCHEMA_CACHE_VERSION,
+        "server_name": server_name,
+        "config_fingerprint": _mcp_config_fingerprint(config),
+        "discovered_at": time.time(),
+        "protocol_version": str(getattr(init_result, "protocolVersion", "") or ""),
+        "capabilities": {
+            "tools": bool(getattr(caps, "tools", None)),
+            "resources": bool(getattr(caps, "resources", None)),
+            "prompts": bool(getattr(caps, "prompts", None)),
+        },
+        "tools": tools,
+    }
+    path = _mcp_cache_path(server_name)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        path.chmod(0o600)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
 def _interpolate_env_vars(value):
     """Recursively resolve ``${VAR}`` placeholders.
 
@@ -4036,8 +4159,18 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
-    await server.start(config)
-    return server
+    try:
+        await server.start(config)
+        return server
+    except BaseException:
+        # ``MCPServerTask.run`` intentionally parks after exhausting its
+        # initial retries so a long-lived gateway can revive later.  A failed
+        # one-shot discovery/warm attempt does not own that parked task,
+        # though: if it is not explicitly shut down it outlives the caller's
+        # event loop and produces "Event loop is closed" during interpreter
+        # teardown (and may leave a stdio child behind).
+        await server.shutdown()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -5058,7 +5191,16 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             continue
 
         # Scan tool description for prompt injection patterns
-        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
+        _description_findings = _scan_mcp_description(
+            name, mcp_tool.name, mcp_tool.description or ""
+        )
+        if _description_findings and _mcp_progressive_settings()["lazy_connect"]:
+            logger.warning(
+                "MCP server '%s': quarantining tool '%s' from automatic search",
+                name,
+                mcp_tool.name,
+            )
+            continue
 
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
@@ -5143,8 +5285,18 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connect_errors.pop(name, None)
         _servers[name] = server
 
+    try:
+        from tools.registry import registry
+
+        registry.deregister(mcp_prefixed_tool_name(name, "connect"))
+    except Exception:
+        pass
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
+    try:
+        _write_mcp_schema_cache(name, server, config)
+    except Exception as exc:
+        logger.warning("MCP server '%s': schema cache write failed: %s", name, exc)
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -5158,6 +5310,201 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _ensure_lazy_mcp_server_connected(server_name: str) -> Optional[MCPServerTask]:
+    with _lock:
+        existing = _servers.get(server_name)
+    if existing is not None and existing.session is not None:
+        return existing
+    config = _load_mcp_config().get(server_name)
+    if not isinstance(config, dict):
+        return None
+    register_mcp_servers({server_name: config})
+    with _lock:
+        return _servers.get(server_name)
+
+
+def _make_lazy_cached_handler(
+    server_name: str,
+    remote_name: str,
+    tool_timeout: float,
+):
+    def _handler(args: dict, **kwargs) -> str:
+        server = _ensure_lazy_mcp_server_connected(server_name)
+        if server is None or server.session is None:
+            return json.dumps(
+                {"error": f"MCP server '{server_name}' could not be connected"},
+                ensure_ascii=False,
+            )
+        live_names = {
+            str(getattr(tool, "name", "") or "")
+            for tool in (getattr(server, "_tools", []) or [])
+        }
+        if remote_name not in live_names:
+            return json.dumps(
+                {
+                    "error": (
+                        f"MCP tool '{remote_name}' is no longer advertised by "
+                        f"server '{server_name}'. Refresh its schema cache."
+                    )
+                },
+                ensure_ascii=False,
+            )
+        return _make_tool_handler(server_name, remote_name, tool_timeout)(args, **kwargs)
+
+    return _handler
+
+
+def _register_cached_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+    """Register cache-backed schemas without opening any MCP transport."""
+    from tools.registry import registry
+
+    registered: List[str] = []
+    settings = _mcp_progressive_settings()
+    ttl = int(settings["schema_cache_ttl_seconds"])
+    now = time.time()
+    for server_name, config in _filter_suspicious_mcp_servers(servers).items():
+        if not _parse_boolish(config.get("enabled", True), default=True):
+            continue
+        record = _read_mcp_schema_cache(server_name, config)
+        entries = list((record or {}).get("tools") or [])
+        age = now - float((record or {}).get("discovered_at") or 0)
+        stale = bool(record) and (ttl <= 0 or age > ttl)
+        toolset_name = f"mcp-{server_name}"
+        for entry in entries:
+            if entry.get("quarantined"):
+                continue
+            schema = entry.get("schema")
+            remote_name = str(entry.get("remote_name") or "")
+            if not isinstance(schema, dict) or not schema.get("name") or not remote_name:
+                continue
+            if stale:
+                schema = dict(schema)
+                schema["description"] = (
+                    str(schema.get("description") or "")[:200]
+                    + " [cached schema; connection will refresh before invocation]"
+                )
+            registered_name = str(schema["name"])
+            registry.register(
+                name=registered_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=_make_lazy_cached_handler(
+                    server_name,
+                    remote_name,
+                    float(config.get("timeout", _DEFAULT_TOOL_TIMEOUT)),
+                ),
+                check_fn=lambda: True,
+                is_async=False,
+                description=str(schema.get("description") or ""),
+            )
+            _track_mcp_tool_server(registered_name, server_name)
+            registered.append(registered_name)
+
+        # Resource and prompt utility schemas are deterministic Hermes
+        # wrappers.  Reconstruct them from the cached capability flags so
+        # startup remains cache-only while these interfaces are still
+        # discoverable.  Their handlers establish the real connection only
+        # when invoked.
+        cached_caps = dict((record or {}).get("capabilities") or {})
+        tools_filter = config.get("tools") or {}
+        resources_enabled = _parse_boolish(
+            tools_filter.get("resources"), default=True
+        )
+        prompts_enabled = _parse_boolish(
+            tools_filter.get("prompts"), default=True
+        )
+        utility_factories = {
+            "list_resources": _make_list_resources_handler,
+            "read_resource": _make_read_resource_handler,
+            "list_prompts": _make_list_prompts_handler,
+            "get_prompt": _make_get_prompt_handler,
+        }
+        tool_timeout = float(config.get("timeout", _DEFAULT_TOOL_TIMEOUT))
+        for utility in _build_utility_schemas(server_name):
+            handler_key = utility["handler_key"]
+            if (
+                handler_key in {"list_resources", "read_resource"}
+                and not (resources_enabled and cached_caps.get("resources"))
+            ):
+                continue
+            if (
+                handler_key in {"list_prompts", "get_prompt"}
+                and not (prompts_enabled and cached_caps.get("prompts"))
+            ):
+                continue
+            schema = utility["schema"]
+            util_name = str(schema["name"])
+            factory = utility_factories[handler_key]
+
+            def _lazy_utility(
+                args: dict,
+                _server_name=server_name,
+                _factory=factory,
+                _timeout=tool_timeout,
+                **kwargs,
+            ) -> str:
+                connected = _ensure_lazy_mcp_server_connected(_server_name)
+                if connected is None or connected.session is None:
+                    return json.dumps(
+                        {"error": f"MCP server '{_server_name}' could not be connected"},
+                        ensure_ascii=False,
+                    )
+                return _factory(_server_name, _timeout)(args, **kwargs)
+
+            registry.register(
+                name=util_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=_lazy_utility,
+                check_fn=lambda: True,
+                is_async=False,
+                description=str(schema.get("description") or ""),
+            )
+            _track_mcp_tool_server(util_name, server_name)
+            registered.append(util_name)
+
+        if not entries:
+            # A failed first warm still leaves a searchable server-level entry.
+            connect_schema = {
+                "name": mcp_prefixed_tool_name(server_name, "connect"),
+                "description": (
+                    f"Connect to MCP server '{server_name}' and refresh its "
+                    "available tool index."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }
+
+            def _connect(_args: dict, _server_name=server_name, **_kwargs) -> str:
+                server = _ensure_lazy_mcp_server_connected(_server_name)
+                if server is None or server.session is None:
+                    return json.dumps(
+                        {"error": f"MCP server '{_server_name}' could not be connected"},
+                        ensure_ascii=False,
+                    )
+                return json.dumps(
+                    {
+                        "server": _server_name,
+                        "connected": True,
+                        "tools": list(getattr(server, "_registered_tool_names", []) or []),
+                    },
+                    ensure_ascii=False,
+                )
+
+            registry.register(
+                name=connect_schema["name"],
+                toolset=toolset_name,
+                schema=connect_schema,
+                handler=_connect,
+                check_fn=lambda: True,
+                is_async=False,
+                description=connect_schema["description"],
+            )
+            _track_mcp_tool_server(connect_schema["name"], server_name)
+            registered.append(connect_schema["name"])
+        registry.register_toolset_alias(server_name, toolset_name)
+    return registered
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
@@ -5299,6 +5646,14 @@ def discover_mcp_tools() -> List[str]:
     if not servers:
         logger.debug("No MCP servers configured")
         return []
+
+    if _mcp_progressive_settings()["lazy_connect"]:
+        names = _register_cached_mcp_servers(servers)
+        logger.info(
+            "MCP lazy startup: registered %d cache-backed tool(s); opened 0 connections",
+            len(names),
+        )
+        return names
 
     with _lock:
         new_server_names = [
@@ -5583,11 +5938,14 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
+    progressive = bool(getattr(agent, "_progressive_disclosure", False))
     new_defs = list(
         get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            skip_tool_search_assembly=progressive,
+            progressive_disclosure=progressive,
         )
         or []
     )
@@ -5616,17 +5974,30 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
+        current_surface = (
+            getattr(agent, "reachable_tools", None)
+            if progressive
+            else getattr(agent, "tools", None)
+        )
         current = {
             t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
+            for t in (current_surface or [])
         }
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
-        agent.tools = new_defs
-        agent.valid_tool_names = new_names
+        if progressive:
+            from tools.tool_search import BRIDGE_TOOL_NAMES, bridge_tool_schemas
+
+            agent.reachable_tools = new_defs
+            agent.reachable_tool_names = new_names
+            agent.tools = bridge_tool_schemas()
+            agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        else:
+            agent.tools = new_defs
+            agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

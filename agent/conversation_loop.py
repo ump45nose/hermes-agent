@@ -446,6 +446,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
+    if getattr(agent, "_progressive_disclosure", False):
+        from agent.system_prompt import CAPABILITY_PROMPT_VERSION
+
+        if line_value("Capability-Prompt-Version") != str(CAPABILITY_PROMPT_VERSION):
+            return False
+
     return True
 
 

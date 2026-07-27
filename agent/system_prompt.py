@@ -50,6 +50,9 @@ from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
 
+CAPABILITY_PROMPT_VERSION = 2
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -180,6 +183,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+    if getattr(agent, "_progressive_disclosure", False):
+        stable_parts.append(
+            f"Capability-Prompt-Version: {CAPABILITY_PROMPT_VERSION}"
+        )
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping

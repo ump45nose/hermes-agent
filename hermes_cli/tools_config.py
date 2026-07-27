@@ -10,6 +10,7 @@ the `platform_toolsets` key.
 """
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import json as _json
 import logging
@@ -1756,6 +1757,122 @@ def _exempt_explicit_platform_native(
             default_off.discard(ts)
 
 
+@dataclass(frozen=True)
+class PlatformToolExposure:
+    """Resolved permission and schema-exposure policy for one platform."""
+
+    mode: str
+    direct: frozenset[str]
+    deferred: frozenset[str]
+
+    @property
+    def reachable(self) -> frozenset[str]:
+        return self.direct | self.deferred
+
+    @property
+    def progressive(self) -> bool:
+        return self.mode == "progressive"
+
+
+def _get_platform_tool_exposure(config: dict, platform: str) -> PlatformToolExposure:
+    """Resolve legacy or V2 platform capability configuration.
+
+    A mapping-shaped ``platform_toolsets.<platform>`` is deliberately strict:
+    malformed groups, overlaps, and unknown names fail closed instead of
+    silently expanding to the platform default.
+    """
+    from toolsets import validate_toolset
+
+    platform_map = config.get("platform_toolsets") or {}
+    raw = platform_map.get(platform)
+    if not isinstance(raw, dict):
+        disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+        if isinstance(disclosure, dict) and disclosure.get("mode") == "progressive":
+            if disclosure.get("schema_scope", "turn") != "turn":
+                raise ValueError(
+                    "progressive disclosure currently requires schema_scope: turn"
+                )
+            # V2 separates permission from exposure and is allowlist-based.
+            # An unlisted platform therefore has no reachable functional
+            # capabilities; only the four runtime bridges remain visible.
+            return PlatformToolExposure(
+                mode="progressive",
+                direct=frozenset(),
+                deferred=frozenset(),
+            )
+        legacy = _get_platform_tools(config, platform)
+        return PlatformToolExposure(
+            mode="legacy",
+            direct=frozenset(legacy),
+            deferred=frozenset(),
+        )
+
+    disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+    if not isinstance(disclosure, dict):
+        disclosure = {}
+    if disclosure.get("mode") != "progressive":
+        raise ValueError(
+            f"platform_toolsets.{platform} uses V2 structure but "
+            "tools.disclosure.mode is not 'progressive'"
+        )
+    if disclosure.get("schema_scope", "turn") != "turn":
+        raise ValueError("progressive disclosure currently requires schema_scope: turn")
+
+    def _group(name: str) -> frozenset[str]:
+        value = raw.get(name, [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise ValueError(
+                f"platform_toolsets.{platform}.{name} must be a list of names"
+            )
+        return frozenset(item.strip() for item in value)
+
+    unknown_keys = set(raw) - {"direct", "deferred"}
+    if unknown_keys:
+        raise ValueError(
+            f"unknown platform_toolsets.{platform} keys: "
+            + ", ".join(sorted(unknown_keys))
+        )
+
+    direct = _group("direct")
+    deferred = _group("deferred")
+    overlap = direct & deferred
+    if overlap:
+        raise ValueError(
+            f"platform_toolsets.{platform} direct/deferred overlap: "
+            + ", ".join(sorted(overlap))
+        )
+
+    configured_mcp = enabled_mcp_server_names(config)
+    unknown = {
+        name
+        for name in direct | deferred
+        if not validate_toolset(name) and name not in configured_mcp
+    }
+    if unknown:
+        raise ValueError(
+            f"platform_toolsets.{platform} contains unknown capabilities: "
+            + ", ".join(sorted(unknown))
+        )
+
+    # Worker-only Kanban is an explicit profile policy. It augments reachability
+    # only in a dispatcher worker, never in normal chat.
+    kanban_cfg = ((config.get("tools") or {}).get("kanban") or {})
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and isinstance(kanban_cfg, dict)
+        and kanban_cfg.get("worker_only") is True
+    ):
+        deferred = frozenset(set(deferred) | {"kanban"})
+
+    return PlatformToolExposure(
+        mode="progressive",
+        direct=direct,
+        deferred=deferred,
+    )
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
@@ -1766,6 +1883,15 @@ def _get_platform_tools(
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
+    disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+    if (
+        isinstance(platform_toolsets.get(platform), dict)
+        or (
+            isinstance(disclosure, dict)
+            and disclosure.get("mode") == "progressive"
+        )
+    ):
+        return set(_get_platform_tool_exposure(config, platform).reachable)
     toolset_names = platform_toolsets.get(platform)
     # Track whether the user explicitly saved a toolset list for this platform
     # (vs. falling back to the platform default). An explicit composite (e.g.

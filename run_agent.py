@@ -238,6 +238,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    "_capability_transient",
 )
 
 
@@ -1907,6 +1908,12 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
+            from agent.capability_history import (
+                project_message as _project_capability_message,
+                transient_call_ids as _transient_capability_call_ids,
+            )
+            _capability_transient_ids = _transient_capability_call_ids(messages)
+
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
                     continue
@@ -1920,6 +1927,7 @@ class AIAgent:
                 # context. Skip regardless of position: an answered nudge leaves
                 # the synthetic pair buried mid-list, not just at the tail.
                 if _is_ephemeral_scaffolding(msg):
+                    msg[_DB_PERSISTED_MARKER] = True
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue
@@ -1929,16 +1937,23 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
-                role = msg.get("role", "unknown")
-                content = msg.get("content")
+                _durable_msg = _project_capability_message(
+                    msg,
+                    transient_ids=_capability_transient_ids,
+                )
+                if _durable_msg is None:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                role = _durable_msg.get("role", "unknown")
+                content = _durable_msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
                 # so replay can reproduce the sent prefix byte-for-byte.
-                _row_api_content = msg.get("api_content")
+                _row_api_content = _durable_msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
-                _row_timestamp = msg.get("timestamp")
+                _row_timestamp = _durable_msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete
                 # clean replacement for an API-local noted payload. Preserve the
@@ -2017,26 +2032,26 @@ class AIAgent:
                             _txt.append("[screenshot]")
                     content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
-                if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
+                if hasattr(_durable_msg, "tool_calls") and isinstance(_durable_msg.tool_calls, list) and _durable_msg.tool_calls:
                     tool_calls_data = [
                         {"name": tc.function.name, "arguments": tc.function.arguments}
-                        for tc in msg.tool_calls
+                        for tc in _durable_msg.tool_calls
                     ]
-                elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
+                elif isinstance(_durable_msg.get("tool_calls"), list):
+                    tool_calls_data = _durable_msg["tool_calls"]
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
-                    tool_name=msg.get("tool_name"),
+                    tool_name=_durable_msg.get("tool_name"),
                     tool_calls=tool_calls_data,
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning") if role == "assistant" else None,
-                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
-                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
-                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
-                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    tool_call_id=_durable_msg.get("tool_call_id"),
+                    finish_reason=_durable_msg.get("finish_reason"),
+                    reasoning=_durable_msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_content=_durable_msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details=_durable_msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=_durable_msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=_durable_msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                 )
@@ -2724,8 +2739,9 @@ class AIAgent:
             return
 
         try:
+            from agent.capability_history import durable_projection
             cleaned = []
-            for msg in messages:
+            for msg in durable_projection(messages):
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
@@ -6118,6 +6134,10 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
+        if getattr(self, "_progressive_disclosure", False):
+            from agent.capability_history import durable_projection
+
+            messages = durable_projection(messages)
         return compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,

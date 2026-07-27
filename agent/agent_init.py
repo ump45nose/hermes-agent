@@ -1203,6 +1203,33 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Resolve V2 permission/exposure separately from the model-visible schema
+    # list. Entry points still pass ``enabled_toolsets`` for legacy sessions;
+    # a structured platform config is authoritative and fail-closed here.
+    agent._progressive_disclosure = False
+    agent.direct_toolsets = frozenset()
+    agent.deferred_toolsets = frozenset()
+    try:
+        from hermes_cli.config import load_config as _load_config
+        from hermes_cli.tools_config import _get_platform_tool_exposure
+
+        _exposure = _get_platform_tool_exposure(
+            _load_config() or {},
+            platform or "cli",
+        )
+        if _exposure.progressive:
+            agent._progressive_disclosure = True
+            agent.direct_toolsets = _exposure.direct
+            agent.deferred_toolsets = _exposure.deferred
+            enabled_toolsets = sorted(_exposure.reachable)
+            agent.enabled_toolsets = enabled_toolsets
+    except ValueError:
+        # Invalid V2 configuration is a startup error, not a reason to fall
+        # back to the much broader legacy platform defaults.
+        raise
+    except Exception as exc:
+        logger.debug("Could not resolve platform capability exposure: %s", exc)
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
@@ -1211,10 +1238,23 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    agent.reachable_tools = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+        progressive_disclosure=agent._progressive_disclosure,
+    )
+    agent.reachable_tool_names = {
+        tool["function"]["name"] for tool in agent.reachable_tools
+    }
+    agent.reachable_toolsets = frozenset(enabled_toolsets or [])
+
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        progressive_disclosure=agent._progressive_disclosure,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1998,9 +2038,19 @@ def init_agent(
             or "context_engine" in agent.enabled_toolsets
         )
     ):
+        _context_tool_target = (
+            agent.reachable_tools
+            if agent._progressive_disclosure
+            else agent.tools
+        )
+        _context_name_target = (
+            agent.reachable_tool_names
+            if agent._progressive_disclosure
+            else agent.valid_tool_names
+        )
         _existing_tool_names = {
             t.get("function", {}).get("name")
-            for t in agent.tools
+            for t in _context_tool_target
             if isinstance(t, dict)
         }
         from agent.memory_manager import normalize_tool_schema as _normalize_tool_schema
@@ -2020,8 +2070,8 @@ def init_agent(
             if _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}
-            agent.tools.append(_wrapped)
-            agent.valid_tool_names.add(_tname)
+            _context_tool_target.append(_wrapped)
+            _context_name_target.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 

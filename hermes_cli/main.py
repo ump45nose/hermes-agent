@@ -2292,6 +2292,14 @@ def _resolve_use_tui(args) -> bool:
 
 
 def cmd_chat(args):
+    """Run chat inside the selected profile's isolated secret scope."""
+    from agent.secret_scope import profile_secret_scope_if_unset
+
+    with profile_secret_scope_if_unset(get_hermes_home()):
+        return _cmd_chat_scoped(args)
+
+
+def _cmd_chat_scoped(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 

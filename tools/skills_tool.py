@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -82,6 +83,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    extract_skill_conditions as _extract_skill_conditions,
     is_model_invocation_disabled as _is_model_invocation_disabled,
     is_skill_support_path as _is_skill_support_path,
 )
@@ -773,6 +775,11 @@ def _find_all_skills(
                     "name": name,
                     "description": description,
                     "category": category,
+                    "conditions": _extract_skill_conditions(frontmatter),
+                    "quarantined": any(
+                        pattern in content.lower()
+                        for pattern in _INJECTION_PATTERNS
+                    ),
                     "model_invocation_disabled": _is_model_invocation_disabled(
                         frontmatter
                     ),
@@ -798,6 +805,53 @@ def _find_all_skills(
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
+
+
+def search_skills(
+    query: str,
+    limit: int = 3,
+    *,
+    available_tools: Optional[Set[str]] = None,
+    available_toolsets: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return a compact, condition-aware Skill index for model invocation."""
+    from agent.prompt_builder import _skill_should_show
+
+    query_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]+", query or "")
+    }
+    if not query_tokens:
+        return []
+
+    scored: List[Tuple[int, str, Dict[str, Any]]] = []
+    for skill in _find_all_skills():
+        if skill.get("model_invocation_disabled") or skill.get("quarantined"):
+            continue
+        if not _skill_should_show(
+            skill.get("conditions") or {},
+            available_tools,
+            available_toolsets,
+        ):
+            continue
+        text = " ".join(
+            str(skill.get(key) or "")
+            for key in ("name", "description", "category")
+        ).lower()
+        score = sum(3 if token in str(skill.get("name") or "").lower() else 1
+                    for token in query_tokens if token in text)
+        if score:
+            scored.append((score, str(skill.get("name") or ""), skill))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {
+            "name": skill.get("name"),
+            "description": str(skill.get("description") or "")[:240],
+            "category": skill.get("category"),
+        }
+        for _, _, skill in scored[: max(1, min(int(limit), 3))]
+    ]
 
 
 def skills_list(category: str = None, task_id: str = None) -> str:
@@ -939,12 +993,28 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    # Injection scan — log but still serve (matches local-skill behaviour)
+    # Quarantine injection-shaped plugin content from model-driven loads.
+    # Explicit slash/preload invocations are the existing user-approval path.
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
             namespace, bare,
         )
+        if not explicit_user_invocation:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{namespace}:{bare}' is quarantined because its "
+                        "content contains prompt-injection patterns. The user "
+                        "must invoke it explicitly."
+                    ),
+                    "content_hash": content_hash,
+                    "quarantined": True,
+                },
+                ensure_ascii=False,
+            )
 
     description = str(parsed_frontmatter.get("description", ""))
     if len(description) > MAX_DESCRIPTION_LENGTH:
@@ -1307,6 +1377,23 @@ def skill_view(
             if _injection_detected:
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
+
+        if _injection_detected and not _explicit_user_invocation:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is quarantined because its content "
+                        "contains prompt-injection patterns. The user must "
+                        "invoke it explicitly."
+                    ),
+                    "content_hash": hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    "quarantined": True,
+                },
+                ensure_ascii=False,
+            )
 
         parsed_frontmatter: Dict[str, Any] = {}
         try:

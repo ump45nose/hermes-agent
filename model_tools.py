@@ -281,6 +281,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    progressive_disclosure: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -323,6 +324,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            bool(progressive_disclosure),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -334,8 +336,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        progressive_disclosure=progressive_disclosure,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -359,6 +366,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    progressive_disclosure: bool = False,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -366,7 +374,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            not progressive_disclosure
+            and os.environ.get("HERMES_KANBAN_TASK")
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
@@ -547,12 +559,16 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+        if (
+            not skip_tool_search_assembly
+            and (progressive_disclosure or ts_cfg.enabled != "off")
+        ):
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
                 filtered_tools,
                 context_length=context_length,
                 config=ts_cfg,
+                progressive=progressive_disclosure,
             )
             if assembly.activated and not quiet_mode:
                 print(
@@ -1037,6 +1053,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    progressive_disclosure: bool = False,
+    reachable_tool_defs: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1098,17 +1116,47 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
+                progressive_disclosure=progressive_disclosure,
             ) or []
+            if progressive_disclosure and reachable_tool_defs:
+                # Memory-provider/context-engine schemas are injected after
+                # registry assembly. Merge them without letting the static
+                # snapshot hide freshly connected MCP tools.
+                by_name = {
+                    (td.get("function") or {}).get("name"): td
+                    for td in current_defs
+                    if (td.get("function") or {}).get("name")
+                }
+                for td in reachable_tool_defs:
+                    name = (td.get("function") or {}).get("name")
+                    if name and name not in by_name:
+                        current_defs.append(td)
+                        by_name[name] = td
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
             return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
+                                                current_tool_defs=current_defs,
+                                                progressive=progressive_disclosure)
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
             return _ts_mod.dispatch_tool_describe(function_args or {},
-                                                  current_tool_defs=current_defs)
+                                                  current_tool_defs=current_defs,
+                                                  progressive=progressive_disclosure)
+        if function_name == _ts_mod.SKILL_SEARCH_NAME:
+            return _ts_mod.dispatch_skill_search(
+                function_args or {},
+                available_tools={
+                    (td.get("function") or {}).get("name")
+                    for td in current_defs
+                    if (td.get("function") or {}).get("name")
+                },
+                available_toolsets=set(enabled_toolsets or []),
+            )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {},
+                progressive=progressive_disclosure,
+            )
             if err or not underlying_name:
                 return json.dumps({"error": err or "tool_call could not be resolved"},
                                   ensure_ascii=False)
@@ -1118,7 +1166,10 @@ def handle_function_call(
             # additionally rejects any tool the session was not granted, so a
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+            _scoped_deferrable = _ts_mod.scoped_deferrable_names(
+                current_defs,
+                progressive=progressive_disclosure,
+            )
             if underlying_name not in _scoped_deferrable:
                 return json.dumps({
                     "error": (
@@ -1141,6 +1192,8 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                progressive_disclosure=progressive_disclosure,
+                reachable_tool_defs=reachable_tool_defs,
             )
 
     _tool_original_args = dict(function_args)

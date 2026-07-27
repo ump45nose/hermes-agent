@@ -90,6 +90,37 @@ class TestScopeIsolation:
             ss.reset_secret_scope(t1)
 
 
+class TestStandaloneProfileScope:
+    """Standalone CLI callers get an isolated temporary profile scope."""
+
+    def test_installs_root_baseline_and_profile_overlay_then_restores(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "companion"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("SHARED_KEY=shared\nOVERRIDE=root\n")
+        (profile_home / ".env").write_text("OVERRIDE=profile\nIDENTITY=companion\n")
+
+        assert ss.current_secret_scope() is None
+        with ss.profile_secret_scope_if_unset(profile_home) as scope:
+            assert scope == {
+                "SHARED_KEY": "shared",
+                "OVERRIDE": "profile",
+                "IDENTITY": "companion",
+            }
+            assert ss.get_secret("SHARED_KEY") == "shared"
+            assert ss.get_secret("OVERRIDE") == "profile"
+        assert ss.current_secret_scope() is None
+
+    def test_preserves_existing_gateway_scope(self, tmp_path):
+        token = ss.set_secret_scope({"IDENTITY": "gateway"})
+        try:
+            with ss.profile_secret_scope_if_unset(tmp_path) as scope:
+                assert scope == {"IDENTITY": "gateway"}
+                assert ss.get_secret("IDENTITY") == "gateway"
+            assert ss.current_secret_scope() == {"IDENTITY": "gateway"}
+        finally:
+            ss.reset_secret_scope(token)
+
+
 class TestEnvFileParsing:
     """load_env_file parses without mutating os.environ."""
 

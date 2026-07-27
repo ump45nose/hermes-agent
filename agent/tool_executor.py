@@ -53,6 +53,44 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _record_capability_metric(agent, tool_name: str, result: Any) -> None:
+    """Emit compact per-turn progressive-disclosure telemetry."""
+    if not getattr(agent, "_progressive_disclosure", False):
+        return
+    transient_names = {"tool_search", "tool_describe", "skill_search", "skill_view"}
+    if tool_name not in transient_names:
+        return
+    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    if getattr(agent, "_capability_metrics_turn", None) != turn_id:
+        agent._capability_metrics_turn = turn_id
+        agent._capability_metrics = {
+            "tool_search": 0,
+            "tool_describe": 0,
+            "skill_search": 0,
+            "skill_view": 0,
+            "transient_bytes": 0,
+        }
+    metrics = agent._capability_metrics
+    metrics[tool_name] += 1
+    if isinstance(result, str):
+        result_bytes = len(result.encode("utf-8"))
+    else:
+        result_bytes = len(
+            json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")
+        )
+    metrics["transient_bytes"] += result_bytes
+    logger.info(
+        "capability metric version=2 turn=%s tool_search=%d tool_describe=%d "
+        "skill_search=%d skill_view=%d transient_bytes=%d",
+        turn_id or "-",
+        metrics["tool_search"],
+        metrics["tool_describe"],
+        metrics["skill_search"],
+        metrics["skill_view"],
+        metrics["transient_bytes"],
+    )
+
+
 def _budget_for_agent(agent) -> BudgetConfig:
     """Resolve a tool-result BudgetConfig scaled to the agent's context window.
 
@@ -249,13 +287,31 @@ def _tool_search_scoped_names(agent) -> frozenset:
     if cached is not None and cached[0] == cache_key:
         return cached[1]
     try:
+        progressive = bool(getattr(agent, "_progressive_disclosure", False))
         scoped_defs = model_tools.get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            progressive_disclosure=progressive,
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        if progressive:
+            known = {
+                (td.get("function") or {}).get("name")
+                for td in scoped_defs
+                if (td.get("function") or {}).get("name")
+            }
+            for td in getattr(agent, "reachable_tools", []) or []:
+                name = (td.get("function") or {}).get("name")
+                if name and name not in known:
+                    scoped_defs.append(td)
+                    known.add(name)
+            agent.reachable_tools = scoped_defs
+            agent.reachable_tool_names = known
+        names = _ts.scoped_deferrable_names(
+            scoped_defs,
+            progressive=progressive,
+        )
     except Exception:
         names = frozenset()
     try:
@@ -406,7 +462,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    progressive=getattr(agent, "_progressive_disclosure", False),
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
@@ -941,6 +1000,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+        _record_capability_metric(agent, name, function_result)
 
         if not blocked and agent.tool_complete_callback:
             try:
@@ -1085,7 +1145,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    progressive=getattr(agent, "_progressive_disclosure", False),
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
@@ -1489,11 +1552,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=list(
+                        getattr(agent, "reachable_tool_names", set())
+                        if getattr(agent, "_progressive_disclosure", False)
+                        else agent.valid_tool_names
+                    ) or None,
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    progressive_disclosure=getattr(agent, "_progressive_disclosure", False),
+                    reachable_tool_defs=getattr(agent, "reachable_tools", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1531,11 +1600,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=list(
+                        getattr(agent, "reachable_tool_names", set())
+                        if getattr(agent, "_progressive_disclosure", False)
+                        else agent.valid_tool_names
+                    ) or None,
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    progressive_disclosure=getattr(agent, "_progressive_disclosure", False),
+                    reachable_tool_defs=getattr(agent, "reachable_tools", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
@@ -1567,6 +1642,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # Multimodal dict result (_multimodal=True) — not sliceable as string
             result_preview = function_result
             _result_len = len(str(function_result))
+
+        _record_capability_metric(agent, function_name, function_result)
 
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.

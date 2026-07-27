@@ -98,6 +98,26 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
     tools_json = json.dumps(tools, ensure_ascii=False)
+    reachable = getattr(agent, "reachable_tools", None) or tools
+    reachable_json = json.dumps(reachable, ensure_ascii=False)
+    if getattr(agent, "_progressive_disclosure", False):
+        from model_tools import get_tool_definitions
+
+        direct_defs = get_tool_definitions(
+            enabled_toolsets=sorted(getattr(agent, "direct_toolsets", set())),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            progressive_disclosure=True,
+        )
+        deferred_defs = get_tool_definitions(
+            enabled_toolsets=sorted(getattr(agent, "deferred_toolsets", set())),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            progressive_disclosure=True,
+        )
+    else:
+        direct_defs = reachable
+        deferred_defs = []
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -113,6 +133,12 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
         "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+        "tool_schema_bytes": {
+            "direct": _bytes(json.dumps(direct_defs, ensure_ascii=False)),
+            "deferred": _bytes(json.dumps(deferred_defs, ensure_ascii=False)),
+            "transient_loaded": 0,
+            "reachable_total": _bytes(reachable_json),
+        },
         "sections": sections,
     }
 
@@ -143,6 +169,15 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
+    schema = data.get("tool_schema_bytes") or {}
+    lines.append(
+        "    direct/deferred    : "
+        f"{schema.get('direct', 0):,} / {schema.get('deferred', 0):,} B"
+    )
+    lines.append(
+        "    transient loaded   : "
+        f"{schema.get('transient_loaded', 0):,} B (fresh-turn baseline)"
+    )
     return "\n".join(lines)
 
 
