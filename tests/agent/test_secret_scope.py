@@ -128,3 +128,46 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_named_profile_inherits_root_shared_secrets(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "lingjun"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text(
+            "HERMES_PROVIDER_COMPANY_PROXY_API_KEY=shared-provider\n"
+        )
+        (profile_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=lingjun-identity\n"
+        )
+
+        assert ss.build_profile_secret_scope(profile_home) == {
+            "HERMES_PROVIDER_COMPANY_PROXY_API_KEY": "shared-provider",
+            "TELEGRAM_BOT_TOKEN": "lingjun-identity",
+        }
+
+    def test_named_profile_layer_overrides_root_baseline(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "lingjun"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("TOKEN=root-value\n")
+        (profile_home / ".env").write_text("TOKEN=profile-value\n")
+
+        assert ss.build_profile_secret_scope(profile_home)["TOKEN"] == (
+            "profile-value"
+        )
+
+    def test_named_profile_scopes_do_not_mix_identity_secrets(self, tmp_path):
+        lingjun_home = tmp_path / "profiles" / "lingjun"
+        companion_home = tmp_path / "profiles" / "companion"
+        lingjun_home.mkdir(parents=True)
+        companion_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("SHARED_KEY=shared\n")
+        (lingjun_home / ".env").write_text("IDENTITY_KEY=lingjun\n")
+        (companion_home / ".env").write_text("IDENTITY_KEY=companion\n")
+
+        lingjun = ss.build_profile_secret_scope(lingjun_home)
+        companion = ss.build_profile_secret_scope(companion_home)
+
+        assert lingjun == {"SHARED_KEY": "shared", "IDENTITY_KEY": "lingjun"}
+        assert companion == {
+            "SHARED_KEY": "shared",
+            "IDENTITY_KEY": "companion",
+        }

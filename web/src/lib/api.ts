@@ -2231,6 +2231,10 @@ export interface ToolsetProviderEnvVar {
   prompt: string;
   url: string | null;
   default: string | null;
+  scope: "profile" | "global";
+  secret: boolean;
+  /** Present only for non-secret fields. */
+  value?: string;
   is_set: boolean;
 }
 

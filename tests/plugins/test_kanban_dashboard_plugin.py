@@ -1812,12 +1812,11 @@ def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels
 
     conn = kb.connect()
     try:
-        kb.add_notify_sub(
-            conn,
-            task_id=t["id"],
-            platform="telegram",
-            chat_id="1234567",
-            thread_id="42",
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (t["id"], "telegram", "1234567", "42", 1),
         )
     finally:
         conn.close()

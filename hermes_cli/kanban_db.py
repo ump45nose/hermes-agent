@@ -1256,9 +1256,14 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     task_id       TEXT NOT NULL,
     platform      TEXT NOT NULL,
     chat_id       TEXT NOT NULL,
+    chat_type     TEXT NOT NULL DEFAULT '',
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
-    notifier_profile TEXT,
+    source_profile TEXT,
+    notifier_profile TEXT NOT NULL DEFAULT '',
+    session_key   TEXT NOT NULL DEFAULT '',
+    session_id    TEXT NOT NULL DEFAULT '',
+    message_id    TEXT NOT NULL DEFAULT '',
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -2023,9 +2028,34 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         notify_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
         }
+        if "chat_type" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "chat_type",
+                "chat_type TEXT NOT NULL DEFAULT ''",
+            )
+        if "source_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "source_profile", "source_profile TEXT"
+            )
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
-                conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+                conn, "kanban_notify_subs", "notifier_profile",
+                "notifier_profile TEXT NOT NULL DEFAULT ''",
+            )
+        if "session_key" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "session_key",
+                "session_key TEXT NOT NULL DEFAULT ''",
+            )
+        if "session_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "session_id",
+                "session_id TEXT NOT NULL DEFAULT ''",
+            )
+        if "message_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "message_id",
+                "message_id TEXT NOT NULL DEFAULT ''",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -2149,8 +2179,11 @@ _REBUILD_SPECS = {
     "kanban_notify_subs": (
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
-        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " chat_type TEXT NOT NULL DEFAULT '',"
+        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, source_profile TEXT,"
+        " notifier_profile TEXT NOT NULL DEFAULT '',"
+        " session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',"
+        " message_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -2165,7 +2198,11 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
         lei = next((c for c in info if c["name"] == "last_event_id"), None)
-        return lei is not None and (lei["type"] or "").upper() != "INTEGER"
+        owner = next((c for c in info if c["name"] == "notifier_profile"), None)
+        return (
+            (lei is not None and (lei["type"] or "").upper() != "INTEGER")
+            or (owner is not None and not bool(owner["notnull"]))
+        )
     # task_events / task_comments / task_runs: id must be INTEGER and a PK.
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
@@ -2208,9 +2245,14 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
                 # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
                 shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
                 cols_csv = ", ".join(shared)
+                select_csv = ", ".join(
+                    "COALESCE(notifier_profile, '')"
+                    if c == "notifier_profile" else c
+                    for c in shared
+                )
                 conn.execute(
                     f"INSERT INTO {table} ({cols_csv}, last_event_id) "
-                    f"SELECT {cols_csv}, COALESCE(CAST(last_event_id AS INTEGER), 0) "
+                    f"SELECT {select_csv}, COALESCE(CAST(last_event_id AS INTEGER), 0) "
                     f"FROM {table}_legacy"
                 )
             else:
@@ -8762,34 +8804,84 @@ def add_notify_sub(
     task_id: str,
     platform: str,
     chat_id: str,
+    notifier_profile: str,
+    chat_type: str = "",
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
-    notifier_profile: Optional[str] = None,
+    source_profile: Optional[str] = None,
+    session_key: str = "",
+    session_id: str = "",
+    message_id: str = "",
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    ``notifier_profile`` is the gateway-process owner, not necessarily the
+    routed ``source_profile`` in a multiplex gateway. It is mandatory so two
+    live gateways cannot race to consume an ownerless subscription.
+
+    Agent-created subscriptions carry ``chat_type`` + ``session_key`` +
+    ``session_id`` as an exact continuation address. Manual CLI/dashboard
+    subscriptions may omit that trio; they receive the human-facing terminal
+    notification but do not wake an agent conversation.
+    """
+    owner = str(notifier_profile or "").strip()
+    if not owner:
+        raise ValueError("notifier_profile is required")
+    canonical_key = str(session_key or "").strip()
+    durable_session_id = str(session_id or "").strip()
+    source_chat_type = str(chat_type or "").strip()
+    if any((canonical_key, durable_session_id, source_chat_type)) and not all(
+        (canonical_key, durable_session_id, source_chat_type)
+    ):
+        raise ValueError(
+            "chat_type, session_key, and session_id must be provided together "
+            "for an agent-waking subscription"
+        )
     now = int(time.time())
     with write_txn(conn):
+        existing = conn.execute(
+            "SELECT notifier_profile FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if existing is not None:
+            existing_owner = str(existing["notifier_profile"] or "").strip()
+            if existing_owner and existing_owner != owner:
+                raise ValueError(
+                    f"subscription already belongs to notifier_profile={existing_owner}"
+                )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, chat_type, thread_id, user_id,
+                 source_profile, notifier_profile, session_key, session_id,
+                 message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, source_chat_type, thread_id or "",
+                user_id, source_profile, owner, canonical_key,
+                durable_session_id, str(message_id or ""), now,
+            ),
         )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
+        # Re-subscribing refreshes the exact continuation address and
+        # self-heals a legacy ownerless row. A conflicting non-empty owner was
+        # rejected above.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET chat_type = ?, user_id = ?, source_profile = ?,
+                   notifier_profile = ?, session_key = ?, session_id = ?,
+                   message_id = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (
+                source_chat_type, user_id, source_profile, owner, canonical_key,
+                durable_session_id, str(message_id or ""), task_id, platform,
+                chat_id, thread_id or "",
+            ),
+        )
 
 
 def list_notify_subs(

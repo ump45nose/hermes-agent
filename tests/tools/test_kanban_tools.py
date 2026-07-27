@@ -2178,11 +2178,29 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
-
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-42:thread-7")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-42")
+    monkeypatch.setenv("HERMES_SESSION_GATEWAY_PROFILE", "lingjun")
+    from gateway.session_context import reset_session_vars, set_session_vars
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        chat_type="dm",
+        thread_id="thread-7",
+        user_id="user-9",
+        session_key="agent:main:telegram:dm:chat-42:thread-7",
+        session_id="session-42",
+        gateway_profile="lingjun",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        del tokens
+        reset_session_vars()
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]
@@ -2195,6 +2213,10 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+    assert s["chat_type"] == "dm"
+    assert s["session_key"] == "agent:main:telegram:dm:chat-42:thread-7"
+    assert s["session_id"] == "session-42"
+    assert s["notifier_profile"] == "lingjun"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

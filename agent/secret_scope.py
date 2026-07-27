@@ -195,11 +195,22 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build the effective secret mapping for a Hermes home.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    A named profile at ``<root>/profiles/<name>`` inherits the shared secret
+    baseline from ``<root>/.env`` and then overlays its own ``.env``. The
+    profile layer is therefore able to carry identity-specific credentials
+    while shared provider credentials remain root-owned. A non-profile home
+    keeps the legacy behavior of loading only its own ``.env``.
+
+    Returns a fresh dict (safe to install via ``set_secret_scope``) without
+    mutating ``os.environ``. Genuinely global vars are intentionally NOT copied
+    in — ``get_secret`` reads those from ``os.environ`` directly.
     """
-    return load_env_file(Path(hermes_home) / ".env")
+    home = Path(hermes_home)
+    shared_home = home.parent.parent if home.parent.name == "profiles" else home
 
+    secrets = load_env_file(shared_home / ".env")
+    if shared_home != home:
+        secrets.update(load_env_file(home / ".env"))
+    return secrets

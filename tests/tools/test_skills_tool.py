@@ -342,6 +342,19 @@ class TestSkillsList:
         result = json.loads(raw)
         assert result["count"] == 2
 
+    def test_hides_user_invoked_only_skills_from_model_listing(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "automatic")
+            _make_skill(
+                tmp_path,
+                "manual",
+                frontmatter_extra="disable-model-invocation: true\n",
+            )
+            raw = skills_list()
+
+        result = json.loads(raw)
+        assert [skill["name"] for skill in result["skills"]] == ["automatic"]
+
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a", category="devops")
@@ -383,6 +396,25 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
+
+    def test_user_invoked_only_skill_requires_internal_explicit_bypass(
+        self, tmp_path
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "manual",
+                frontmatter_extra="disable-model-invocation: true\n",
+            )
+            blocked = json.loads(skill_view("manual"))
+            loaded = json.loads(
+                skill_view("manual", _explicit_user_invocation=True)
+            )
+
+        assert blocked["success"] is False
+        assert "user-invoked only" in blocked["error"]
+        assert loaded["success"] is True
+        assert loaded["name"] == "manual"
 
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's

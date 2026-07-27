@@ -7,6 +7,8 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -1278,6 +1280,132 @@ class TestToolsConfigEndpoints:
         body = r.json()
         assert body["has_category"] is True
         assert isinstance(body["providers"], list)
+
+    def test_custom_image_fields_are_scoped_and_secrets_never_returned(
+        self, monkeypatch
+    ):
+        import yaml
+        from agent import image_gen_registry
+        from hermes_constants import get_hermes_home
+        from plugins.image_gen.custom_image import CustomImageProvider
+
+        root = get_hermes_home()
+        profile = root / "profiles" / "companion"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root",
+            lambda: root,
+        )
+        disabled = [
+            "image_gen/openai",
+            "image_gen/openai-codex",
+            "image_gen/fal",
+            "image_gen/xai",
+            "image_gen/openrouter",
+            "image_gen/deepinfra",
+            "image_gen/krea",
+        ]
+        config = {
+            "plugins": {"disabled": disabled},
+            "image_gen": {
+                "provider": "custom-image-1",
+                "use_gateway": False,
+            },
+        }
+        for path in (root / "config.yaml", profile / "config.yaml"):
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        secret = "never-return-this-image-key"
+        (root / ".env").write_text(
+            "\n".join(
+                [
+                    f"IMAGE_API_KEY={secret}",
+                    "IMAGE_BASE_URL=https://images.example.test/v1",
+                    "IMAGE_MODEL=image-model-1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        features = SimpleNamespace(
+            account_info=None,
+            nous_auth_present=False,
+            features={},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.get_nous_subscription_features",
+            lambda *args, **kwargs: features,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features",
+            lambda *args, **kwargs: features,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._ensure_plugins_discovered",
+            lambda: None,
+        )
+        image_gen_registry._reset_for_tests()
+        for slot in range(1, 6):
+            image_gen_registry.register_provider(CustomImageProvider(slot))
+
+        try:
+            response = self.client.get(
+                "/api/tools/toolsets/image_gen/config",
+                params={"profile": "companion"},
+            )
+            assert response.status_code == 200, response.text
+            assert secret not in response.text
+            body = response.json()
+            assert [row["name"] for row in body["providers"]] == [
+                f"Custom Image {slot}" for slot in range(1, 6)
+            ]
+            slot_one = body["providers"][0]
+            fields = {field["key"]: field for field in slot_one["env_vars"]}
+            key_field = fields["IMAGE_API_KEY"]
+            assert key_field["scope"] == "global"
+            assert key_field["secret"] is True
+            assert key_field["is_set"] is True
+            assert "value" not in key_field
+            assert fields["IMAGE_BASE_URL"]["value"] == (
+                "https://images.example.test/v1"
+            )
+            assert fields["IMAGE_BASE_URL"]["secret"] is False
+            assert fields["IMAGE_MODEL"]["value"] == "image-model-1"
+
+            update = self.client.put(
+                "/api/tools/toolsets/image_gen/env",
+                json={
+                    "profile": "companion",
+                    "env": {
+                        "IMAGE_BASE_URL": "https://new.example.test/v1",
+                        "IMAGE_MODEL": "new-image-model",
+                    },
+                },
+            )
+            assert update.status_code == 200, update.text
+            root_env = (root / ".env").read_text(encoding="utf-8")
+            assert "IMAGE_BASE_URL=https://new.example.test/v1" in root_env
+            assert "IMAGE_MODEL=new-image-model" in root_env
+            assert not (profile / ".env").exists()
+
+            selected = self.client.put(
+                "/api/tools/toolsets/image_gen/provider",
+                json={
+                    "profile": "companion",
+                    "provider": "Custom Image 2",
+                },
+            )
+            assert selected.status_code == 200, selected.text
+            root_config = yaml.safe_load(
+                (root / "config.yaml").read_text(encoding="utf-8")
+            )
+            profile_config = yaml.safe_load(
+                (profile / "config.yaml").read_text(encoding="utf-8")
+            )
+            assert root_config["image_gen"]["provider"] == "custom-image-1"
+            assert profile_config["image_gen"]["provider"] == "custom-image-2"
+        finally:
+            image_gen_registry._reset_for_tests()
 
     def test_unknown_toolset_config_400(self):
         r = self.client.get("/api/tools/toolsets/not_a_toolset/config")

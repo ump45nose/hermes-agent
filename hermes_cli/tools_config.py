@@ -9,6 +9,8 @@ Saves per-platform tool configuration to ~/.hermes/config.yaml under
 the `platform_toolsets` key.
 """
 
+from contextlib import contextmanager
+
 import json as _json
 import logging
 import os
@@ -34,6 +36,42 @@ from tools.tool_backend_helpers import fal_key_is_configured
 from utils import base_url_hostname, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _provider_env_scope(env_var: dict):
+    """Apply an env-var schema's profile or machine-global storage scope."""
+    if env_var.get("scope") != "global":
+        yield
+        return
+
+    from hermes_constants import (
+        get_default_hermes_root,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def get_provider_env_value(env_var: dict) -> Optional[str]:
+    """Read one provider env field while honoring its declared scope."""
+    with _provider_env_scope(env_var):
+        if env_var.get("scope") == "global":
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            return get_env_value_prefer_dotenv(env_var["key"])
+        return get_env_value(env_var["key"])
+
+
+def save_provider_env_value(env_var: dict, value: str) -> None:
+    """Write one provider env field while honoring its declared scope."""
+    with _provider_env_scope(env_var):
+        save_env_value(env_var["key"], value)
 
 
 def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
@@ -2118,7 +2156,24 @@ def _toolset_has_keys(
         except Exception:
             return False
 
-    if ts_key in {"web", "image_gen", "video_gen", "tts", "browser"}:
+    plugins_cfg = config.get("plugins")
+    disabled_plugins = (
+        set(plugins_cfg.get("disabled", []))
+        if isinstance(plugins_cfg, dict)
+        and isinstance(plugins_cfg.get("disabled"), list)
+        else set()
+    )
+    fal_image_disabled = (
+        ts_key == "image_gen"
+        and (
+            "image_gen/fal" in disabled_plugins
+            or "fal" in disabled_plugins
+        )
+    )
+    if (
+        ts_key in {"web", "image_gen", "video_gen", "tts", "browser"}
+        and not fal_image_disabled
+    ):
         features = get_nous_subscription_features(config, force_fresh=force_fresh)
         feature = features.features.get(ts_key)
         if feature and (feature.available or feature.managed_by_nous):
@@ -2131,7 +2186,7 @@ def _toolset_has_keys(
             env_vars = provider.get("env_vars", [])
             if not env_vars:
                 return True  # No-key provider (e.g. Local Browser, Edge TTS)
-            if all(get_env_value(e["key"]) for e in env_vars):
+            if all(get_provider_env_value(e) for e in env_vars):
                 return True
         return False
 
@@ -2569,6 +2624,16 @@ def _visible_providers(
     login + entitlement check (see ``_configure_provider``); the row only
     *activates* the gateway once paid access is confirmed.
     """
+    plugins_cfg = config.get("plugins")
+    disabled_plugins = set()
+    if isinstance(plugins_cfg, dict) and isinstance(plugins_cfg.get("disabled"), list):
+        disabled_plugins = {
+            str(item).strip()
+            for item in plugins_cfg["disabled"]
+            if str(item).strip()
+        }
+    fal_disabled = "image_gen/fal" in disabled_plugins or "fal" in disabled_plugins
+
     features = get_nous_subscription_features(config, force_fresh=force_fresh)
     acct = features.account_info
     # Pool-only users (entitled to managed tools via the free tool pool but with
@@ -2584,6 +2649,9 @@ def _visible_providers(
     )
     visible = []
     for provider in cat.get("providers", []):
+        # The managed image row is another UI for the bundled FAL backend.
+        if fal_disabled and provider.get("managed_nous_feature") == "image_gen":
+            continue
         # Nous-managed Tool Gateway rows stay visible regardless of auth —
         # selecting one drives an inline Portal login. A `requires_nous_auth`
         # row that is NOT a managed gateway feature (pure pre-auth UX) is
@@ -2607,7 +2675,14 @@ def _visible_providers(
     # Inject plugin-registered image_gen backends (OpenAI today, more
     # later) so the picker lists them alongside FAL / Nous Subscription.
     if cat.get("name") == "Image Generation":
-        visible.extend(_plugin_image_gen_providers())
+        visible.extend(
+            row
+            for row in _plugin_image_gen_providers()
+            if (
+                row.get("image_gen_plugin_name") not in disabled_plugins
+                and f"image_gen/{row.get('image_gen_plugin_name')}" not in disabled_plugins
+            )
+        )
 
     # Inject plugin-registered video_gen backends. Unlike image_gen,
     # video_gen has NO hardcoded providers — every backend is a plugin.
@@ -2774,7 +2849,7 @@ def provider_readiness_status(
     """
     env_vars = provider.get("env_vars", [])
     if env_vars:
-        if all(get_env_value(e["key"]) for e in env_vars):
+        if all(get_provider_env_value(e) for e in env_vars):
             return "ready"
         return "needs_keys"
 
@@ -2967,7 +3042,7 @@ def _configure_tool_category(
             tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            if not env_vars or all(get_provider_env_value(v) for v in env_vars):
                 if _is_provider_active(p, config, force_fresh=force_fresh):
                     configured = " [active]"
                 elif not env_vars:
@@ -3094,7 +3169,7 @@ def _detect_active_provider_index(
             return i
         # Fallback: env vars present → likely configured
         env_vars = p.get("env_vars", [])
-        if env_vars and all(get_env_value(v["key"]) for v in env_vars):
+        if env_vars and all(get_provider_env_value(v) for v in env_vars):
             return i
     return 0
 
@@ -3672,7 +3747,7 @@ def _configure_provider(
         _print_info("  Available through Nous Portal subscription.")
 
     for var in env_vars:
-        existing = get_env_value(var["key"])
+        existing = get_provider_env_value(var)
         if existing:
             _print_success(f"  {var['key']}: already configured")
             # Don't ask to update - this is a new enable flow.
@@ -3686,10 +3761,13 @@ def _configure_provider(
             if default_val:
                 value = _prompt(f"    {var.get('prompt', var['key'])}", default_val)
             else:
-                value = _prompt(f"    {var.get('prompt', var['key'])}", password=True)
+                value = _prompt(
+                    f"    {var.get('prompt', var['key'])}",
+                    password=bool(var.get("secret", True)),
+                )
 
             if value:
-                save_env_value(var["key"], value)
+                save_provider_env_value(var, value)
                 _print_success("    Saved")
             else:
                 _print_warning("    Skipped")
@@ -4002,7 +4080,7 @@ def _configure_tool_category_for_reconfig(
             tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            if not env_vars or all(get_provider_env_value(v) for v in env_vars):
                 if _is_provider_active(p, config, force_fresh=force_fresh):
                     configured = " [active]"
                 elif not env_vars:
@@ -4134,16 +4212,19 @@ def _reconfigure_provider(
         return
 
     for var in env_vars:
-        existing = get_env_value(var["key"])
+        existing = get_provider_env_value(var)
         if existing:
             _print_info(f"  {var['key']}: configured ({existing[:8]}...)")
         url = var.get("url", "")
         if url:
             _print_info(f"  Get yours at: {url}")
         default_val = var.get("default", "")
-        value = _prompt(f"    {var.get('prompt', var['key'])} (Enter to keep current)", password=not default_val)
+        value = _prompt(
+            f"    {var.get('prompt', var['key'])} (Enter to keep current)",
+            password=bool(var.get("secret", True)),
+        )
         if value and value.strip():
-            save_env_value(var["key"], value.strip())
+            save_provider_env_value(var, value.strip())
             _print_success("    Updated")
         else:
             _print_info("    Kept current")

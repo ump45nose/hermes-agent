@@ -549,7 +549,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from a persistent gateway/TUI session, Hermes records the notifier-gateway owner plus the exact originating session identity. Only that gateway may claim terminal events; it delivers the human notification and wakes the same session so the orchestrator can call `kanban_show` and synthesize the handoff. Set to `false` to require explicit subscriptions. |
 
 And the two auxiliary LLM slots:
 
@@ -804,7 +804,7 @@ This is the whole point of the separation:
 
 ### Auto-subscribe on `/kanban create` (gateway only)
 
-When you create a task from the gateway with `/kanban create "…"`, the originating chat (platform + chat id + thread id) is automatically subscribed to that task's terminal events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`). You'll get one message back per terminal event — including the first line of the worker's result summary on `completed` — without having to poll or remember the task id.
+When you create a task from the gateway with `/kanban create "…"`, Hermes stores both the notification destination and the exact originating session (chat type, canonical session key/id, source profile, and notifier-gateway owner). Only the owner gateway may claim its terminal events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`). It sends the human notification and wakes that same session; an orchestrator should then call `kanban_show(task_id)` and synthesize the full run handoff rather than treating the notification preview as the result.
 
 ```
 you> /kanban create "transcribe today's podcast" --assignee transcriber
@@ -817,7 +817,7 @@ bot> ✓ t_9fc1a3 completed by transcriber
      transcribed 42 minutes, saved to podcast/2026-05-04.md
 ```
 
-Subscriptions auto-remove themselves once the task reaches `done` or `archived`. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
+Subscriptions auto-remove themselves once the task reaches `done` or `archived`. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`. An explicit CLI subscription without canonical session identity is notification-only and cannot wake an agent session.
 
 ### Output truncation in messaging
 
@@ -860,7 +860,7 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 
 ## Gateway notifications
 
-When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
+When you run `/kanban create …` from a gateway (Telegram, Discord, Slack, etc.), the subscription records the owner gateway and canonical originating session. The background notifier only claims subscriptions it owns, delivers one human message per terminal event, and injects an internal wake into that exact session. The human message includes a short preview; the awakened orchestrator must use `/kanban show` or `kanban_show` to collect the authoritative run summary, metadata, comments, and artifacts.
 
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
 
@@ -872,7 +872,7 @@ hermes kanban notify-unsubscribe t_abcd \
     --platform telegram --chat-id 12345678 --thread-id 7
 ```
 
-A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed. CLI-created subscriptions are notification-only unless a gateway created them with canonical session identity.
 
 ## Runs — one row per attempt
 

@@ -58,6 +58,21 @@ class TestScanSkillCommands:
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
 
+    def test_user_invoked_only_skill_keeps_slash_command_and_loads(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "manual",
+                frontmatter_extra="disable-model-invocation: true\n",
+                body="Only load after an explicit slash command.",
+            )
+            result = scan_skill_commands()
+            message = build_skill_invocation_message("/manual")
+
+        assert "/manual" in result
+        assert message is not None
+        assert "Only load after an explicit slash command." in message
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()

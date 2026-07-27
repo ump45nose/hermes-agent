@@ -530,12 +530,13 @@ def test_notify_sub_crud(kanban_home):
         # Duplicate add is a no-op.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
+            notifier_profile="default",
         )
         assert len(kb.list_notify_subs(conn, tid)) == 1
         # Distinct thread is a new row.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
-            thread_id="5",
+            thread_id="5", notifier_profile="default",
         )
         assert len(kb.list_notify_subs(conn, tid)) == 2
         # Remove one.
@@ -552,7 +553,10 @@ def test_notify_cursor_advances(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="w")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="123",
+            notifier_profile="default",
+        )
         # Initial: one "created" event but we only want terminal kinds.
         cursor, events = kb.unseen_events_for_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
@@ -586,7 +590,10 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn2 = kb.connect()
     try:
         tid = kb.create_task(conn1, title="x", assignee="w")
-        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        kb.add_notify_sub(
+            conn1, task_id=tid, platform="telegram", chat_id="123",
+            notifier_profile="default",
+        )
         kb.complete_task(conn1, tid, result="ok")
 
         old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
@@ -2205,6 +2212,7 @@ def test_unseen_events_for_sub_includes_run_id(kanban_home):
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram",
             chat_id="12345", thread_id="",
+            notifier_profile="default",
         )
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id

@@ -24,6 +24,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    is_model_invocation_disabled,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1391,6 +1392,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "model_invocation_disabled": is_model_invocation_disabled(frontmatter),
     }
 
 
@@ -1541,6 +1543,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if entry.get("model_invocation_disabled"):
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1565,6 +1569,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if entry.get("model_invocation_disabled"):
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1620,6 +1626,8 @@ def build_skills_system_prompt(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if entry.get("model_invocation_disabled"):
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),

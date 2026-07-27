@@ -11933,6 +11933,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        pinned_session_key = str(
+            (getattr(event, "metadata", None) or {}).get("gateway_session_key")
+            or ""
+        ).strip()
+        if pinned_session_key and pinned_session_key != session_key:
+            logger.warning(
+                "Async completion canonical session-key mismatch: expected %s, "
+                "resolved %s — dropping injection instead of waking a fresh "
+                "conversation.",
+                pinned_session_key,
+                session_key,
+            )
+            return
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -16325,12 +16338,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
+            chat_type=context.source.chat_type or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            gateway_profile=self._active_profile_name(),
             async_delivery=_async_delivery,
         )
 

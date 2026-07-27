@@ -38,7 +38,10 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="test task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="default",
+        )
         kb.complete_task(conn, tid, result="completed by agent")
     finally:
         conn.close()
@@ -98,7 +101,10 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     try:
         tid = kb.create_task(conn, title=f"test {kind} task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="default",
+        )
         kb._append_event(conn, tid, kind=kind)
     finally:
         conn.close()
@@ -184,7 +190,10 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="test task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="default",
+        )
 
         # Cycle 1: blocked for one reason
         kb.block_task(conn, tid, reason="first block", kind="needs_input")
@@ -518,7 +527,10 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="render q3 chart", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="default",
+        )
     finally:
         conn.close()
 
@@ -606,7 +618,10 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="default",
+        )
     finally:
         conn.close()
 

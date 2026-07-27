@@ -202,6 +202,13 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    for profile_adapters in (
+                        getattr(self, "_profile_adapters", {}) or {}
+                    ).values():
+                        active_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in profile_adapters.keys()
+                        )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -252,15 +259,22 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
-                                        )
-                                        continue
+                                owner_profile = str(
+                                    sub.get("notifier_profile") or ""
+                                ).strip()
+                                # Strict single-owner claim. An ownerless
+                                # legacy row is intentionally fail-closed:
+                                # allowing every live gateway to race for it
+                                # recreates the cross-profile misdelivery this
+                                # identity stamp is designed to prevent.
+                                if not owner_profile or owner_profile != notifier_profile:
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s owned by %s; current gateway owner is %s, skipping",
+                                        sub.get("task_id"),
+                                        owner_profile or "<missing>",
+                                        notifier_profile,
+                                    )
+                                    continue
                                 platform = (sub.get("platform") or "").lower()
                                 if platform not in active_platforms:
                                     logger.debug(
@@ -310,17 +324,20 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
-                    sub_profile = sub.get("notifier_profile") or ""
-                    # Route via the SAME chokepoint the authorization path uses
-                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
-                    # profile with its own adapter-registry entry must be served
-                    # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
-                    # secondary profile's task notification is delivered by the
-                    # wrong bot (the cross-profile mis-delivery this whole change
-                    # exists to fix). The helper returns None only when the profile
-                    # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    owner_profile = str(
+                        sub.get("notifier_profile") or ""
+                    ).strip()
+                    source_profile = str(
+                        sub.get("source_profile") or ""
+                    ).strip()
+                    # Gateway ownership and routed adapter identity are
+                    # deliberately separate. A multiplex "default" gateway
+                    # may own delivery for a source routed to "research";
+                    # a single-profile "lingjun" gateway owns delivery while
+                    # its primary adapter still has source.profile=None.
+                    adapter = self._authorization_adapter(
+                        plat, source_profile or None
+                    )
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -334,6 +351,30 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    wake_source = None
+                    expected_session_key = str(
+                        sub.get("session_key") or ""
+                    ).strip()
+                    expected_session_id = str(
+                        sub.get("session_id") or ""
+                    ).strip()
+                    if expected_session_key or expected_session_id:
+                        wake_source, wake_error = self._kanban_wake_source(
+                            sub, plat
+                        )
+                        if wake_source is None:
+                            logger.warning(
+                                "kanban notifier: exact-session validation failed for %s: %s",
+                                sub["task_id"], wake_error,
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
@@ -491,65 +532,43 @@ class GatewayKanbanWatchersMixin:
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                        if _wake_kinds:
+                        if _wake_kinds and wake_source is not None:
                             try:
-                                _session_key = getattr(task, "session_id", None) or ""
-                                if _session_key:
-                                    _title = (task.title if task else sub["task_id"])[:120]
-                                    _assignee = task.assignee if task else ""
-                                    _parts = []
-                                    if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                                    if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                                    if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                                    if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                                    if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                                    _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                                    _synth = t(
-                                        "gateway.kanban.wake.message",
-                                        task_id=sub["task_id"],
-                                        status=_status,
-                                        title=_title,
-                                        assignee=_assignee,
-                                        board=board_slug,
-                                    )
-                                    from gateway.session import SessionSource
-                                    from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
-                                    _source = SessionSource(
-                                        platform=plat,
-                                        chat_id=sub["chat_id"],
-                                        chat_type="group",
-                                        thread_id=sub.get("thread_id") or None,
-                                        user_id=sub.get("user_id"),
-                                        profile=sub_profile or None,
-                                    )
-                                    _synth_event = MessageEvent(
-                                        text=_synth,
-                                        message_type=MessageType.TEXT,
-                                        source=_source,
-                                        internal=True,
-                                    )
-                                    await adapter.handle_message(_synth_event)
-                                    logger.info(
-                                        "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                        sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
-                                    )
+                                _title = (task.title if task else sub["task_id"])[:120]
+                                _assignee = task.assignee if task else ""
+                                _parts = []
+                                if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                                if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
+                                if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
+                                if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                                if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                                _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                                _synth = t(
+                                    "gateway.kanban.wake.message",
+                                    task_id=sub["task_id"],
+                                    status=_status,
+                                    title=_title,
+                                    assignee=_assignee,
+                                    board=board_slug,
+                                )
+                                from gateway.platforms.base import MessageEvent, MessageType
+                                _synth_event = MessageEvent(
+                                    text=_synth,
+                                    message_type=MessageType.TEXT,
+                                    source=wake_source,
+                                    internal=True,
+                                    metadata={
+                                        "gateway_session_id": expected_session_id,
+                                        "gateway_session_key": expected_session_key,
+                                    },
+                                )
+                                await adapter.handle_message(_synth_event)
+                                logger.info(
+                                    "kanban notifier: woke agent for %s on %s/%s owner=%s source_profile=%s session=%s events=%s",
+                                    sub["task_id"], platform_str, sub["chat_id"],
+                                    owner_profile, source_profile or "<primary>",
+                                    expected_session_key, _wake_kinds,
+                                )
                             except Exception as _wk_err:
                                 # Best-effort: the notification itself already
                                 # delivered and the cursor has advanced, so a
@@ -561,6 +580,14 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                continue
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
@@ -572,6 +599,48 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_wake_source(self, sub: dict, platform: Any) -> tuple[Any, str]:
+        """Resolve and validate the exact originating conversation source.
+
+        Prefer the live gateway's cached source because it preserves
+        platform-specific details beyond the durable subscription columns.
+        After a restart, reconstruct from the persisted canonical identity.
+        In both cases the derived key must exactly match ``session_key``;
+        mismatches fail closed instead of waking a fresh conversation.
+        """
+        expected_key = str(sub.get("session_key") or "").strip()
+        expected_id = str(sub.get("session_id") or "").strip()
+        chat_type = str(sub.get("chat_type") or "").strip()
+        if not expected_key or not expected_id or not chat_type:
+            return None, "missing session_key/session_id/chat_type"
+
+        source = None
+        try:
+            source = self._get_cached_session_source(expected_key)
+        except Exception:
+            source = None
+        if source is None:
+            from gateway.session import SessionSource
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(sub.get("chat_id") or ""),
+                chat_type=chat_type,
+                thread_id=str(sub.get("thread_id") or "") or None,
+                user_id=str(sub.get("user_id") or "") or None,
+                message_id=str(sub.get("message_id") or "") or None,
+                profile=str(sub.get("source_profile") or "") or None,
+            )
+        try:
+            actual_key = self._session_key_for_source(source)
+        except Exception as exc:
+            return None, f"cannot derive session key: {exc}"
+        if actual_key != expected_key:
+            return None, (
+                f"canonical key mismatch expected={expected_key!r} "
+                f"actual={actual_key!r}"
+            )
+        return source, ""
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

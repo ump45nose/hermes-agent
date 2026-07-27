@@ -68,10 +68,17 @@ export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Pr
         setConfig(cfg);
         setActiveProvider(cfg.active_provider);
         const seed: Record<string, boolean> = {};
+        const visibleDrafts: Record<string, string> = {};
         for (const p of cfg.providers) {
-          for (const e of p.env_vars) seed[e.key] = e.is_set;
+          for (const e of p.env_vars) {
+            seed[e.key] = e.is_set;
+            if (!e.secret && e.value !== undefined) {
+              visibleDrafts[e.key] = e.value;
+            }
+          }
         }
         setIsSet(seed);
+        setDrafts(visibleDrafts);
       })
       .catch(() => showToast("Failed to load toolset config", "error"))
       .finally(() => setLoading(false));
@@ -169,22 +176,26 @@ export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Pr
     try {
       const res = await api.saveToolsetEnv(toolset.name, env, profile);
       setIsSet((prev) => ({ ...prev, ...res.is_set }));
-      // Clear saved drafts so the inputs reset to the "saved" placeholder.
+      // Clear secret drafts; visible fields are repopulated by loadConfig.
       setDrafts((prev) => {
         const next = { ...prev };
-        for (const k of res.saved) delete next[k];
+        for (const k of res.saved) {
+          const field = provider.env_vars.find((item) => item.key === k);
+          if (field?.secret !== false) delete next[k];
+        }
         return next;
       });
+      await loadConfig();
       showToast(
         res.saved.length
-          ? `Saved ${res.saved.length} key${res.saved.length > 1 ? "s" : ""}`
+          ? `Saved ${res.saved.length} field${res.saved.length > 1 ? "s" : ""}`
           : "Nothing to save",
         "success",
       );
       onChanged();
     } catch (e) {
       showToast(
-        e instanceof Error ? e.message : "Failed to save keys",
+        e instanceof Error ? e.message : "Failed to save fields",
         "error",
       );
     } finally {
@@ -351,10 +362,10 @@ export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Pr
                           </div>
                           <Input
                             id={`env-${ev.key}`}
-                            type="password"
+                            type={ev.secret ? "password" : "text"}
                             className="h-8 rounded-none text-xs font-mono"
                             placeholder={
-                              isSet[ev.key]
+                              ev.secret && isSet[ev.key]
                                 ? "•••••••• (saved — leave blank to keep)"
                                 : ev.prompt || ev.key
                             }

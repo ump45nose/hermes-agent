@@ -169,6 +169,19 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return frontmatter, body
 
 
+def is_model_invocation_disabled(frontmatter: Dict[str, Any]) -> bool:
+    """Return whether a skill is available only through explicit user loading.
+
+    ``disable-model-invocation`` is the Agent Skills/Codex frontmatter field.
+    Accept a YAML boolean or a conservative string form so malformed-but-common
+    community frontmatter does not accidentally expose a user-only skill.
+    """
+    value = frontmatter.get("disable-model-invocation", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── Platform matching ─────────────────────────────────────────────────────
 
 

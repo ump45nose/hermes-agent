@@ -82,6 +82,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    is_model_invocation_disabled as _is_model_invocation_disabled,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -772,6 +773,9 @@ def _find_all_skills(
                     "name": name,
                     "description": description,
                     "category": category,
+                    "model_invocation_disabled": _is_model_invocation_disabled(
+                        frontmatter
+                    ),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -825,7 +829,11 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             )
 
         # Find all skills
-        all_skills = _find_all_skills()
+        all_skills = [
+            skill
+            for skill in _find_all_skills()
+            if not skill.get("model_invocation_disabled")
+        ]
 
         if not all_skills:
             return json.dumps(
@@ -875,6 +883,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    explicit_user_invocation: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -904,6 +913,21 @@ def _serve_plugin_skill(
         parsed_frontmatter, _ = _parse_frontmatter(content)
     except Exception:
         pass
+
+    if (
+        _is_model_invocation_disabled(parsed_frontmatter)
+        and not explicit_user_invocation
+    ):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{namespace}:{bare}' is user-invoked only. "
+                    f"The user must load it explicitly with /{bare}."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
@@ -978,6 +1002,7 @@ def skill_view(
     task_id: str = None,
     preprocess: bool = True,
     platform: str = None,
+    _explicit_user_invocation: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -992,6 +1017,9 @@ def skill_view(
             because they render the skill message themselves.
         platform: Internal platform override used by scheduled jobs so
             ``skills.cron_only`` remains hidden from interactive sessions.
+        _explicit_user_invocation: Internal slash/preload bypass for skills
+            declaring ``disable-model-invocation: true``. This parameter is
+            intentionally absent from the public tool schema.
 
     Returns:
         JSON string with skill content or error message
@@ -1059,6 +1087,7 @@ def skill_view(
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    explicit_user_invocation=_explicit_user_invocation,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1297,6 +1326,20 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        if (
+            _is_model_invocation_disabled(parsed_frontmatter)
+            and not _explicit_user_invocation
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{resolved_name}' is user-invoked only. "
+                        f"The user must load it explicitly with /{resolved_name}."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         if _is_skill_disabled(resolved_name, platform=platform):
             return json.dumps(
                 {

@@ -1,0 +1,5 @@
+name: custom-image
+version: 1.0.0
+description: "Five globally configured OpenAI Images-compatible backends."
+author: Local
+kind: backend

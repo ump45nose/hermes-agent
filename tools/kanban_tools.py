@@ -1089,10 +1089,16 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    # Stamp the originating session id when the agent loop runs under
-    # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
-    # CLI / dashboard paths and on legacy hosts that don't set the env.
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    # Stamp the task-local originating session id. The gateway is concurrent,
+    # so process-global os.environ may hold a stale cron/other-session value.
+    try:
+        from gateway.session_context import get_session_env
+        _current_session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        def get_session_env(name: str, default: str = "") -> str:
+            return os.environ.get(name, default)
+        _current_session_id = os.environ.get("HERMES_SESSION_ID", "")
+    session_id = args.get("session_id") or _current_session_id or None
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
@@ -1171,7 +1177,12 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                    or "worker"
+                ),
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -1267,18 +1278,37 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        source_profile = get_session_env("HERMES_SESSION_PROFILE", "") or None
+        notifier_profile = get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+        if platform == "tui":
+            chat_type = chat_type or "local"
+            session_id = session_id or session_key
+            notifier_profile = (
+                notifier_profile
+                or os.environ.get("HERMES_PROFILE")
+                or "default"
+            )
+        if not notifier_profile:
+            return False
+        if not chat_type or not session_key or not session_id:
+            return False
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
+            chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
+            source_profile=source_profile,
             notifier_profile=notifier_profile,
+            session_key=session_key,
+            session_id=session_id,
+            message_id=message_id,
         )
         return True
     except Exception as _exc:

@@ -1548,6 +1548,24 @@ class TestBuildSkillsSystemPromptConditional:
         )
         assert "notes" in result
 
+    def test_user_invoked_only_skill_is_hidden_from_system_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "productivity" / "teach"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: teach\n"
+            "description: Teach a topic\n"
+            "disable-model-invocation: true\n"
+            "---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "teach" not in result
+
     def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
         """Backward compat: calling with no args shows everything."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1705,4 +1723,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
