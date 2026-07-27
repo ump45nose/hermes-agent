@@ -47,7 +47,11 @@ def _body_only(kwargs: dict[str, Any]) -> dict[str, Any]:
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: ("[REDACTED]" if _SECRET_KEY.search(str(key)) else _redact(item))
+            key: (
+                "[REDACTED]"
+                if _SECRET_KEY.search(str(key)) and isinstance(item, str)
+                else _redact(item)
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):

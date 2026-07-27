@@ -187,6 +187,7 @@ def test_request_snapshot_once_writes_body_without_headers(tmp_path, monkeypatch
         agent,
         {
             "model": "test",
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": "hello"}],
             "extra_headers": {"Authorization": "Bearer secret"},
         },
@@ -195,6 +196,10 @@ def test_request_snapshot_once_writes_body_without_headers(tmp_path, monkeypatch
     assert path is not None
     payload = json.loads(path.read_text())
     assert "extra_headers" not in payload["body"]
+    display = json.loads(
+        path.with_name("req-1.redacted.json").read_text(encoding="utf-8")
+    )
+    assert display["body"]["max_tokens"] == 4096
     config = yaml.safe_load((tmp_path / "config.yaml").read_text())
     assert config["observability"]["request_snapshot"] == "off"
 
