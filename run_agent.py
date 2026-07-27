@@ -493,6 +493,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        runtime_role: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -569,6 +570,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            runtime_role=runtime_role,
         )
 
     def _get_session_db_for_recall(self):
@@ -2046,6 +2048,8 @@ class AIAgent:
                     tool_name=_durable_msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=_durable_msg.get("tool_call_id"),
+                    effect_disposition=_durable_msg.get("effect_disposition"),
+                    tool_receipt=_durable_msg.get("_tool_receipt"),
                     finish_reason=_durable_msg.get("finish_reason"),
                     reasoning=_durable_msg.get("reasoning") if role == "assistant" else None,
                     reasoning_content=_durable_msg.get("reasoning_content") if role == "assistant" else None,
@@ -6248,13 +6252,21 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _is_research_parent = (
+            (getattr(self, "_prompt_lock", {}) or {}).get("preset") == "research"
+        )
+        _must_join = (
+            _is_research_parent
+            or getattr(self, "runtime_role", "interactive")
+            in {"kanban_worker", "cron"}
+        )
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(not _is_subagent and not _must_join),
             parent_agent=self,
         )
 

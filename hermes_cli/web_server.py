@@ -13994,6 +13994,9 @@ class ProfileCreate(BaseModel):
     description: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
+    prompt_preset: Optional[str] = None
+    prompt_modules: List[str] = []
+    prompt_model_family: str = "generic"
     # Profile-builder additions — all optional, all applied best-effort AFTER
     # the profile directory exists, so a hiccup in any of them never 500s the
     # create (the user can fix it from the relevant dashboard page afterward).
@@ -14278,6 +14281,9 @@ async def create_profile_endpoint(body: ProfileCreate):
             clone_config=clone_config,
             no_skills=body.no_skills,
             description=body.description,
+            prompt_preset=body.prompt_preset,
+            prompt_modules=body.prompt_modules,
+            prompt_model_family=body.prompt_model_family,
         )
         # Match the CLI's profile-create flow: fresh named profiles get the
         # bundled skills installed. When cloning from default, create_profile()

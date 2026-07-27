@@ -1008,6 +1008,34 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
+        # Clear already-consumed, provably useless tool bodies before provider
+        # adaptation. Internal receipts never leave the process.
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "report_only")
+        try:
+            from agent.tool_context_editor import (
+                edit_tool_context,
+                strip_internal_tool_metadata,
+            )
+            if _editor_mode != "off":
+                api_messages, _tool_edit_report = edit_tool_context(
+                    api_messages,
+                    report_only=_editor_mode == "report_only",
+                    phase=(
+                        _editor_mode
+                        if _editor_mode in {"readonly", "failures", "active"}
+                        else "active"
+                    ),
+                )
+                if _tool_edit_report:
+                    request_logger.info(
+                        "Tool Context Editor mode=%s actions=%s",
+                        _editor_mode,
+                        _tool_edit_report,
+                    )
+            strip_internal_tool_metadata(api_messages)
+        except Exception as exc:
+            request_logger.warning("Tool Context Editor skipped: %s", exc)
+
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
@@ -1382,6 +1410,17 @@ def run_conversation(
                 except Exception:
                     pass
 
+                try:
+                    from agent.request_snapshot import capture_request_snapshot
+
+                    capture_request_snapshot(
+                        agent,
+                        api_kwargs,
+                        request_id=api_request_id,
+                    )
+                except Exception as exc:
+                    request_logger.warning("request snapshot capture failed: %s", exc)
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -1469,6 +1508,14 @@ def run_conversation(
                     api_mode=agent.api_mode,
                     api_call_count=api_call_count,
                     middleware_trace=list(_llm_middleware_trace),
+                )
+                from agent.tool_context_editor import mark_tool_results_consumed
+
+                mark_tool_results_consumed(
+                    messages,
+                    consumed_turn=api_call_count,
+                    session_db=getattr(agent, "_session_db", None),
+                    session_id=agent.session_id or "",
                 )
                 
                 api_duration = time.time() - api_start_time

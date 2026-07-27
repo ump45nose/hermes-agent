@@ -1859,8 +1859,10 @@ def _get_platform_tool_exposure(config: dict, platform: str) -> PlatformToolExpo
     # Worker-only Kanban is an explicit profile policy. It augments reachability
     # only in a dispatcher worker, never in normal chat.
     kanban_cfg = ((config.get("tools") or {}).get("kanban") or {})
+    from agent.runtime_role import _verified_worker_from_env
+    _worker_verified = _verified_worker_from_env().verified
     if (
-        os.environ.get("HERMES_KANBAN_TASK")
+        _worker_verified
         and isinstance(kanban_cfg, dict)
         and kanban_cfg.get("worker_only") is True
     ):

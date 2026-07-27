@@ -62,6 +62,49 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
              "Used by the kanban decomposer to route tasks based on role instead "
              "of profile name alone. Skip and add later via `hermes profile describe`.",
     )
+    profile_create.add_argument(
+        "--prompt-preset",
+        default=None,
+        help="Creation-time fixed prompt preset",
+    )
+    profile_create.add_argument(
+        "--prompt-module",
+        action="append",
+        default=[],
+        help="Additional creation-time prompt module; may be repeated",
+    )
+    profile_create.add_argument(
+        "--prompt-model-family",
+        choices=["generic", "openai", "anthropic", "google"],
+        default="generic",
+        help="Short model-family adapter compiled into the fixed prompt",
+    )
+
+    profile_prompt = profile_subparsers.add_parser(
+        "prompt", help="Verify, diff, or explicitly upgrade a fixed prompt"
+    )
+    profile_prompt.add_argument("profile_name", help="Profile to inspect")
+    profile_prompt.add_argument(
+        "prompt_action", choices=["verify", "diff", "upgrade"]
+    )
+    profile_prompt.add_argument("--prompt-preset", default=None)
+    profile_prompt.add_argument(
+        "--prompt-module", action="append", default=[]
+    )
+    profile_prompt.add_argument(
+        "--prompt-model-family",
+        choices=["generic", "openai", "anthropic", "google"],
+        default=None,
+    )
+    profile_prompt.add_argument(
+        "-y", "--yes", action="store_true", help="Confirm prompt upgrade"
+    )
+
+    profile_snapshot = profile_subparsers.add_parser(
+        "request-snapshot", help="List or inspect captured provider-bound requests"
+    )
+    profile_snapshot.add_argument("profile_name")
+    profile_snapshot.add_argument("request_id", nargs="?", default=None)
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")

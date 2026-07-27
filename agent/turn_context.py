@@ -45,6 +45,7 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    scenario_context: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -71,6 +72,8 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if scenario_context:
+        injections.append(scenario_context)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -801,6 +804,18 @@ def build_turn_context(
         except Exception:
             pass
 
+    scenario_context = ""
+    if isinstance(original_user_message, str):
+        try:
+            from agent.local_context import scenario_context_for_turn
+
+            scenario_context = scenario_context_for_turn(
+                agent, original_user_message
+            )
+        except Exception:
+            scenario_context = ""
+    agent._last_scenario_context = scenario_context
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next
@@ -826,7 +841,10 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            scenario_context,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

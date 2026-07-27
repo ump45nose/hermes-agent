@@ -51,8 +51,24 @@ def test_unlisted_v2_platform_has_no_functional_capabilities():
     assert _get_platform_tools(cfg, "unlisted") == set()
 
 
-def test_worker_only_kanban_is_dynamic(monkeypatch):
+def test_worker_only_kanban_requires_verified_lease(monkeypatch, tmp_path):
+    import sqlite3
+    import time
+
+    db = tmp_path / "kanban.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT, status TEXT, current_run_id INTEGER, "
+            "claim_lock TEXT, claim_expires REAL)"
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+            ("task-1", "running", 9, "claim", time.time() + 300),
+        )
     cfg = _config({"direct": [], "deferred": ["file"]})
     cfg["tools"]["kanban"] = {"worker_only": True}
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "9")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
     assert "kanban" in _get_platform_tools(cfg, "telegram")

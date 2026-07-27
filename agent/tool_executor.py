@@ -32,6 +32,10 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    tool_may_have_side_effect,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -406,6 +410,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
                 tc.id,
                 effect_disposition="none",
+                result_status="cancelled",
             ))
             _flush_session_db_after_tool_progress(
                 agent,
@@ -894,10 +899,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
+        result_status = "unknown"
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
+            result_status = "error"
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,
@@ -915,6 +922,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
+                result_status = "cancelled"
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -929,6 +937,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             else:
                 function_result = f"Error executing tool '{name}': thread did not return a result"
+                result_status = "error"
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -944,8 +953,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            result_status = "error" if is_error else "success"
             if blocked:
                 effect_disposition = "none"
+            elif not tool_may_have_side_effect(function_name):
+                effect_disposition = "none"
+            elif file_mutation_result_landed(function_name, function_result):
+                effect_disposition = "landed"
+            else:
+                effect_disposition = "unknown"
 
             if not blocked:
                 function_result = agent._append_guardrail_observation(
@@ -1015,6 +1031,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_use_id=tc.id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            artifact_dir=getattr(agent, "_tool_artifact_dir", None),
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
@@ -1035,11 +1052,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
+        from agent.tool_context_editor import artifact_ref_from_content
         tool_message = make_tool_result_message(
             name,
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            result_status=result_status,
+            artifact_ref=artifact_ref_from_content(function_result),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -1074,7 +1094,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            turn_tool_msgs,
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            artifact_dir=getattr(agent, "_tool_artifact_dir", None),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -1109,6 +1134,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
                     skipped_tc.id,
                     effect_disposition="none",
+                    result_status="cancelled",
                 ))
                 _flush_session_db_after_tool_progress(
                     agent,
@@ -1128,6 +1154,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name,
                     malformed_args_result,
                     tool_call.id,
+                    effect_disposition="none",
+                    result_status="error",
                 )
             )
             _flush_session_db_after_tool_progress(
@@ -1728,6 +1756,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_use_id=tool_call.id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            artifact_dir=getattr(agent, "_tool_artifact_dir", None),
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
@@ -1741,7 +1770,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        from agent.tool_context_editor import artifact_ref_from_content
+        _effect = "none"
+        if tool_may_have_side_effect(function_name):
+            _effect = "unknown"
+        if file_mutation_result_landed(function_name, function_result):
+            _effect = "landed"
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            effect_disposition=_effect,
+            result_status="error" if _is_error_result else "success",
+            artifact_ref=artifact_ref_from_content(function_result),
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
@@ -1791,6 +1833,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
                     skipped_tc.id,
                     effect_disposition="none",
+                    result_status="cancelled",
                 ))
                 _flush_session_db_after_tool_progress(
                     agent,
@@ -1805,7 +1848,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            messages[-num_tools_seq:],
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            artifact_dir=getattr(agent, "_tool_artifact_dir", None),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -1867,6 +1915,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             messages[-total_tools:],
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            artifact_dir=getattr(agent, "_tool_artifact_dir", None),
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

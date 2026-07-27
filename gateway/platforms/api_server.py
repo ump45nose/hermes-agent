@@ -1870,6 +1870,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
+            skip_context_files=True,
+            load_soul_identity=True,
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,

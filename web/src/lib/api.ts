@@ -624,6 +624,9 @@ export const api = {
     description?: string;
     provider?: string;
     model?: string;
+    prompt_preset?: string;
+    prompt_modules?: string[];
+    prompt_model_family?: "generic" | "openai" | "anthropic" | "google";
     mcp_servers?: McpServerCreate[];
     keep_skills?: string[];
     hub_skills?: string[];

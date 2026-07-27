@@ -374,9 +374,10 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
+        from agent.runtime_role import _verified_worker_from_env
         if (
             not progressive_disclosure
-            and os.environ.get("HERMES_KANBAN_TASK")
+            and _verified_worker_from_env().verified
             and "kanban" not in effective_enabled_toolsets
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and

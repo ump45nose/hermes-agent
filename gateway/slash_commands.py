@@ -3472,6 +3472,8 @@ class GatewaySlashCommandsMixin:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
+                skip_context_files=True,
+                load_soul_identity=True,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None

@@ -28,6 +28,7 @@ import logging
 import os
 import tempfile
 import time
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -78,6 +79,29 @@ from tools.threat_patterns import first_threat_message as _first_threat_message
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
+
+
+_DYNAMIC_INFRA_PATTERNS = (
+    re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    re.compile(r"\b(?:port|端口)\s*[:=]?\s*\d{2,5}\b", re.I),
+    re.compile(
+        r"\b(?:docker|container|tailscale|dns|cron|systemd)\b.*"
+        r"\b(?:running|stopped|up|down|enabled|disabled|地址|状态|运行|停止)\b",
+        re.I,
+    ),
+    re.compile(r"(?:容器|服务|网关|代理).{0,20}(?:运行中|已停止|端口|地址|状态)"),
+)
+
+
+def _dynamic_infra_error(target: str, content: Optional[str]) -> Optional[str]:
+    if target != "memory" or not isinstance(content, str):
+        return None
+    if any(pattern.search(content) for pattern in _DYNAMIC_INFRA_PATTERNS):
+        return (
+            "Dynamic infrastructure observations do not belong in MEMORY.md. "
+            "Read or write the verified value through shared-state instead."
+        )
+    return None
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -990,6 +1014,10 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        for operation in operations:
+            error = _dynamic_infra_error(target, operation.get("content"))
+            if error:
+                return tool_error(error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1012,6 +1040,9 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+    dynamic_error = _dynamic_infra_error(target, content)
+    if dynamic_error:
+        return tool_error(dynamic_error, success=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
@@ -1146,7 +1177,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

@@ -818,6 +818,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls TEXT,
     tool_name TEXT,
     effect_disposition TEXT,
+    tool_receipt TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,
@@ -4167,6 +4168,7 @@ class SessionDB:
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
+        tool_receipt: Any = None,
         timestamp: Any = None,
         api_content: Optional[str] = None,
     ) -> int:
@@ -4204,6 +4206,7 @@ class SessionDB:
             if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        tool_receipt_json = json.dumps(tool_receipt) if tool_receipt else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -4226,10 +4229,10 @@ class SessionDB:
         def _do(conn):
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, tool_receipt, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4238,6 +4241,7 @@ class SessionDB:
                     tool_calls_json,
                     _scrub_surrogates(tool_name),
                     effect_disposition,
+                    tool_receipt_json,
                     message_timestamp,
                     token_count,
                     finish_reason,
@@ -4269,6 +4273,23 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def update_tool_receipt(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        receipt: Dict[str, Any],
+    ) -> None:
+        payload = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE messages SET tool_receipt=? "
+                "WHERE session_id=? AND role='tool' AND tool_call_id=?",
+                (payload, session_id, tool_call_id),
+            )
+
+        self._execute_write(_do)
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
@@ -4312,6 +4333,11 @@ class SessionDB:
                 json.dumps(codex_message_items) if codex_message_items else None
             )
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            tool_receipt_json = (
+                json.dumps(msg.get("_tool_receipt"))
+                if msg.get("_tool_receipt")
+                else None
+            )
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -4322,10 +4348,10 @@ class SessionDB:
 
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, tool_receipt, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4334,6 +4360,7 @@ class SessionDB:
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
                     msg.get("effect_disposition"),
+                    tool_receipt_json,
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
@@ -4872,7 +4899,7 @@ class SessionDB:
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, tool_receipt, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
                 "api_content "
@@ -4900,7 +4927,7 @@ class SessionDB:
     # get_messages_as_conversation and get_resume_conversations so a single
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
-        "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+        "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, tool_receipt, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content"
@@ -4943,6 +4970,11 @@ class SessionDB:
                 msg["tool_name"] = row["tool_name"]
             if row["effect_disposition"]:
                 msg["effect_disposition"] = row["effect_disposition"]
+            if row["tool_receipt"]:
+                try:
+                    msg["_tool_receipt"] = json.loads(row["tool_receipt"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize tool receipt")
             if row["tool_calls"]:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])

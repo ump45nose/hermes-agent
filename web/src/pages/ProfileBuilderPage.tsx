@@ -27,10 +27,11 @@ import { cn } from "@/lib/utils";
 // Profile name rule mirrors the backend (`^[a-z0-9][a-z0-9_-]{0,63}$`).
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-type StepId = "identity" | "model" | "skills" | "mcp" | "review";
+type StepId = "identity" | "prompt" | "model" | "skills" | "mcp" | "review";
 
 const STEPS: { id: StepId; label: string }[] = [
   { id: "identity", label: "Identity" },
+  { id: "prompt", label: "Prompt" },
   { id: "model", label: "Model" },
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCPs" },
@@ -66,6 +67,11 @@ export default function ProfileBuilderPage() {
   // ── Step 1: identity ──────────────────────────────────────────────
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [promptPreset, setPromptPreset] = useState("default");
+  const [promptModules, setPromptModules] = useState("");
+  const [promptModelFamily, setPromptModelFamily] = useState<
+    "generic" | "openai" | "anthropic" | "google"
+  >("generic");
 
   // ── Step 2: model ─────────────────────────────────────────────────
   const [modelChoices, setModelChoices] = useState<ModelChoice[] | null>(null);
@@ -255,6 +261,12 @@ export default function ProfileBuilderPage() {
         description: description.trim() || undefined,
         provider: pickedModel?.provider,
         model: pickedModel?.model,
+        prompt_preset: promptPreset,
+        prompt_modules: promptModules
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+        prompt_model_family: promptModelFamily,
         mcp_servers: mcpServers.length ? mcpServers : undefined,
         keep_skills: keepAll ? undefined : Array.from(keptSkills),
         hub_skills: hubSkills.length
@@ -342,6 +354,67 @@ export default function ProfileBuilderPage() {
                     setDescription(e.target.value)
                   }
                 />
+              </div>
+            </div>
+          )}
+          {step === "prompt" && (
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="pb-prompt-preset">Fixed prompt preset</Label>
+                <select
+                  id="pb-prompt-preset"
+                  className="flex h-10 w-full border border-border bg-background px-3 text-sm"
+                  value={promptPreset}
+                  onChange={(event) => setPromptPreset(event.target.value)}
+                >
+                  {["default", "lingjun", "companion", "ops", "research", "xp"].map(
+                    (preset) => (
+                      <option key={preset} value={preset}>
+                        {preset}
+                      </option>
+                    ),
+                  )}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  Compiled once at creation. Later template updates do not
+                  silently rewrite this profile.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="pb-prompt-modules">
+                  Additional modules (comma separated)
+                </Label>
+                <Input
+                  id="pb-prompt-modules"
+                  placeholder="citation-rigor"
+                  value={promptModules}
+                  onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+                    setPromptModules(event.target.value)
+                  }
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="pb-prompt-family">Model-family adapter</Label>
+                <select
+                  id="pb-prompt-family"
+                  className="flex h-10 w-full border border-border bg-background px-3 text-sm"
+                  value={promptModelFamily}
+                  onChange={(event) =>
+                    setPromptModelFamily(
+                      event.target.value as
+                        | "generic"
+                        | "openai"
+                        | "anthropic"
+                        | "google",
+                    )
+                  }
+                >
+                  {["generic", "openai", "anthropic", "google"].map((family) => (
+                    <option key={family} value={family}>
+                      {family}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
           )}
@@ -755,6 +828,12 @@ export default function ProfileBuilderPage() {
               <ReviewRow
                 label="Description"
                 value={description.trim() || "—"}
+              />
+              <ReviewRow
+                label="Prompt"
+                value={`${promptPreset} · ${promptModelFamily}${
+                  promptModules.trim() ? ` · ${promptModules}` : ""
+                }`}
               />
               <ReviewRow
                 label="Model"
