@@ -191,8 +191,24 @@ def _build_fixed_profile_prompt_parts(
             manifest.append({"kind": "runtime_overlay", "id": "cron"})
 
     platform_key = (getattr(agent, "platform", "") or "").lower().strip()
-    default_hint = PLATFORM_HINTS.get(platform_key, "")
-    platform_hint = _resolve_platform_hint(agent, platform_key, default_hint)
+    # Fixed-profile prompts use deliberately short surface facts. The legacy
+    # PLATFORM_HINTS blocks mix delivery, cron, UI and coding-era guidance and
+    # are far too broad to append to every request.
+    platform_hint = {
+        "cli": (
+            "当前界面为 CLI：只返回终端可见文本；文件用绝对路径说明，"
+            "不输出 MEDIA 标签。"
+        ),
+        "tui": (
+            "当前界面为 TUI：只返回界面可见文本；文件用绝对路径说明，"
+            "不输出 MEDIA 标签。"
+        ),
+        "telegram": (
+            "当前界面为 Telegram：媒体请求必须通过真实媒体交付完成，"
+            "不能用角色文字代替。"
+        ),
+        "api": "当前界面为 API：返回可由调用方直接消费的结果。",
+    }.get(platform_key, "")
     if platform_hint:
         stable_parts.append(platform_hint)
         manifest.append({"kind": "runtime_overlay", "id": f"platform:{platform_key}"})
