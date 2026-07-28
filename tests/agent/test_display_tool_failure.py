@@ -77,6 +77,12 @@ class TestDetectToolFailureTerminal:
     def test_none_result_returns_no_suffix(self):
         assert _detect_tool_failure("terminal", None) == (False, "")
 
+    def test_nested_mcp_failure_does_not_override_terminal_exit_rule(self):
+        result = json.dumps({
+            "result": json.dumps({"ok": False, "error": "remote failed"}),
+        })
+        assert _detect_tool_failure("terminal", result) == (False, "")
+
 
 class TestDetectToolFailureMemory:
     """memory: 'full' is distinct from real errors."""
@@ -134,6 +140,36 @@ class TestDetectToolFailureStructured:
         )
         assert is_failure is True
         assert "network_error" in suffix
+
+    def test_mcp_result_json_string_ok_false_is_failure(self):
+        result = json.dumps({
+            "result": json.dumps({
+                "ok": False,
+                "error": "upstream timeout",
+            }),
+        })
+        is_failure, suffix = _detect_tool_failure(
+            "mcp__smart_search__smart_fetch",
+            result,
+        )
+        assert is_failure is True
+        assert suffix == " [upstream timeout]"
+
+    def test_mcp_result_dict_error_is_failure(self):
+        result = {"result": {"error": "provider unavailable"}}
+        is_failure, suffix = _detect_tool_failure(
+            "mcp__smart_search__smart_search",
+            result,
+        )
+        assert is_failure is True
+        assert suffix == " [provider unavailable]"
+
+    def test_mcp_result_nested_success_is_not_failure(self):
+        result = {"result": json.dumps({"ok": True, "data": "hello"})}
+        assert _detect_tool_failure(
+            "mcp__smart_search__smart_search",
+            result,
+        ) == (False, "")
 
     def test_dict_without_error_or_success_uses_generic_heuristic(self):
         # Plain successful dict — should pass through the generic
