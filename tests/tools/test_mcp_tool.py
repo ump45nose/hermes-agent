@@ -757,6 +757,395 @@ class TestRunOnMcpLoop:
 # Tool handler
 # ---------------------------------------------------------------------------
 
+class TestLazyMCPConnectionSingleFlight:
+    @staticmethod
+    def _clear_server_state(mcp_tool, server_name):
+        with mcp_tool._lock:
+            mcp_tool._servers.pop(server_name, None)
+            flight = mcp_tool._lazy_connect_flights.pop(server_name, None)
+            if flight is not None:
+                flight.event.set()
+
+    def test_concurrent_same_server_prepare_connects_once(self):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = "lazy-single-flight-success"
+        server = SimpleNamespace(session=object())
+        calls = []
+        calls_lock = threading.Lock()
+        entered = threading.Event()
+        release = threading.Event()
+        start = threading.Barrier(2)
+
+        def fake_register(_servers):
+            with calls_lock:
+                calls.append(1)
+            entered.set()
+            assert release.wait(timeout=5)
+            with mcp_tool._lock:
+                mcp_tool._servers[server_name] = server
+            return []
+
+        self._clear_server_state(mcp_tool, server_name)
+        try:
+            with patch.object(
+                mcp_tool,
+                "_load_mcp_config",
+                return_value={server_name: {"connect_timeout": 1}},
+            ), patch.object(
+                mcp_tool,
+                "register_mcp_servers",
+                side_effect=fake_register,
+            ):
+                def connect():
+                    start.wait(timeout=5)
+                    return mcp_tool._ensure_lazy_mcp_server_connected(server_name)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(connect) for _ in range(2)]
+                    assert entered.wait(timeout=5)
+                    release.set()
+                    results = [future.result(timeout=5) for future in futures]
+
+            assert results == [server, server]
+            assert calls == [1]
+        finally:
+            self._clear_server_state(mcp_tool, server_name)
+
+    def test_owner_failure_releases_waiter_for_one_retry(self):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = "lazy-single-flight-retry"
+        server = SimpleNamespace(session=object())
+        calls = []
+        calls_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        start = threading.Barrier(2)
+
+        def fake_register(_servers):
+            with calls_lock:
+                calls.append(1)
+                attempt = len(calls)
+            if attempt == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=5)
+                raise RuntimeError("first connect failed")
+            with mcp_tool._lock:
+                mcp_tool._servers[server_name] = server
+            return []
+
+        self._clear_server_state(mcp_tool, server_name)
+        try:
+            with patch.object(
+                mcp_tool,
+                "_load_mcp_config",
+                return_value={server_name: {"connect_timeout": 1}},
+            ), patch.object(
+                mcp_tool,
+                "register_mcp_servers",
+                side_effect=fake_register,
+            ):
+                def connect():
+                    start.wait(timeout=5)
+                    return mcp_tool._ensure_lazy_mcp_server_connected(server_name)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(connect) for _ in range(2)]
+                    assert first_entered.wait(timeout=5)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        with mcp_tool._lock:
+                            flight = mcp_tool._lazy_connect_flights.get(
+                                server_name
+                            )
+                            if flight is not None and flight.waiters == 1:
+                                break
+                        time.sleep(0.001)
+                    else:
+                        pytest.fail("second caller did not become a waiter")
+                    release_first.set()
+                    results = [future.result(timeout=5) for future in futures]
+
+            assert calls == [1]
+            assert results == [None, None]
+
+            with patch.object(
+                mcp_tool,
+                "_load_mcp_config",
+                return_value={server_name: {"connect_timeout": 1}},
+            ), patch.object(
+                mcp_tool,
+                "register_mcp_servers",
+                side_effect=fake_register,
+            ):
+                retried = mcp_tool._ensure_lazy_mcp_server_connected(
+                    server_name
+                )
+
+            assert retried is server
+            assert calls == [1, 1]
+        finally:
+            self._clear_server_state(mcp_tool, server_name)
+
+    def test_explicit_registration_flight_makes_lazy_prepare_wait(self):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = "explicit-register-lazy-wait"
+        server = SimpleNamespace(session=object(), _registered_tool_names=[])
+        run_entered = threading.Event()
+        release_run = threading.Event()
+        run_calls = []
+
+        def fake_run(_coro_or_factory, timeout=30):
+            run_calls.append(timeout)
+            run_entered.set()
+            assert release_run.wait(timeout=5)
+            with mcp_tool._lock:
+                mcp_tool._servers[server_name] = server
+
+        self._clear_server_state(mcp_tool, server_name)
+        with mcp_tool._lock:
+            mcp_tool._server_connecting.discard(server_name)
+        try:
+            config = {server_name: {"connect_timeout": 1}}
+            with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
+                mcp_tool,
+                "_ensure_mcp_loop",
+                return_value=None,
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=fake_run,
+            ), patch.object(
+                mcp_tool,
+                "_load_mcp_config",
+                return_value=config,
+            ):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    explicit = pool.submit(
+                        mcp_tool.register_mcp_servers,
+                        config,
+                    )
+                    assert run_entered.wait(timeout=5)
+                    lazy = pool.submit(
+                        mcp_tool._ensure_lazy_mcp_server_connected,
+                        server_name,
+                    )
+                    release_run.set()
+
+                    explicit.result(timeout=5)
+                    assert lazy.result(timeout=5) is server
+
+            assert run_calls == [120]
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._server_connecting.discard(server_name)
+            self._clear_server_state(mcp_tool, server_name)
+
+    def test_live_reconciliation_removes_missing_and_quarantined_cached_tools(
+        self,
+        monkeypatch,
+    ):
+        import tools.mcp_tool as mcp_tool
+        from tools.registry import ToolRegistry
+
+        isolated_registry = ToolRegistry()
+        monkeypatch.setattr("tools.registry.registry", isolated_registry)
+        server_name = "smart-search"
+        kept = "mcp__smart_search__smart_fetch"
+        missing = "mcp__smart_search__removed_tool"
+        quarantined = "mcp__smart_search__quarantined_tool"
+        old_names = {kept, missing, quarantined}
+
+        try:
+            for name in old_names:
+                isolated_registry.register(
+                    name=name,
+                    toolset="mcp-smart-search",
+                    schema={"name": name, "parameters": {"type": "object"}},
+                    handler=lambda _args, **_kwargs: "{}",
+                )
+                mcp_tool._track_mcp_tool_server(name, server_name)
+            missing_generation = isolated_registry.get_tool_generation(missing)
+            quarantined_generation = isolated_registry.get_tool_generation(
+                quarantined
+            )
+
+            mcp_tool._reconcile_mcp_server_tool_names(
+                server_name,
+                old_names,
+                [kept],
+            )
+
+            assert isolated_registry.get_entry(kept) is not None
+            assert isolated_registry.get_entry(missing) is None
+            assert isolated_registry.get_entry(quarantined) is None
+            assert (
+                isolated_registry.get_tool_generation(missing)
+                == missing_generation + 1
+            )
+            assert (
+                isolated_registry.get_tool_generation(quarantined)
+                == quarantined_generation + 1
+            )
+            assert (
+                mcp_tool._registered_mcp_tool_names_for_server(server_name)
+                == {kept}
+            )
+        finally:
+            for name in old_names:
+                mcp_tool._forget_mcp_tool_server(name)
+
+    @pytest.mark.asyncio
+    async def test_registration_failure_removes_partial_handlers_and_transport(
+        self,
+        monkeypatch,
+    ):
+        import tools.mcp_tool as mcp_tool
+        from tools.registry import ToolRegistry
+
+        server_name = "failed-live-registration"
+        cached_name = "mcp__failed_live_registration__cached"
+        partial_name = "mcp__failed_live_registration__partial"
+        isolated_registry = ToolRegistry()
+        server = SimpleNamespace(
+            session=object(),
+            shutdown=AsyncMock(),
+        )
+        partial_check = mcp_tool._make_check_fn(server_name)
+        monkeypatch.setattr("tools.registry.registry", isolated_registry)
+        isolated_registry.register(
+            name=cached_name,
+            toolset="mcp-failed-live-registration",
+            schema={"name": cached_name, "parameters": {"type": "object"}},
+            handler=lambda _args, **_kwargs: "{}",
+        )
+        mcp_tool._track_mcp_tool_server(cached_name, server_name)
+
+        def fail_after_partial_registration(_name, _server, _config):
+            isolated_registry.register(
+                name=partial_name,
+                toolset="mcp-failed-live-registration",
+                schema={
+                    "name": partial_name,
+                    "parameters": {"type": "object"},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+                check_fn=partial_check,
+            )
+            mcp_tool._track_mcp_tool_server(partial_name, server_name)
+            raise RuntimeError("live registration failed")
+
+        self._clear_server_state(mcp_tool, server_name)
+        with mcp_tool._lock:
+            mcp_tool._server_connecting.add(server_name)
+        try:
+            with patch.object(
+                mcp_tool,
+                "_connect_server",
+                AsyncMock(return_value=server),
+            ), patch.object(
+                mcp_tool,
+                "_register_server_tools",
+                side_effect=fail_after_partial_registration,
+            ):
+                with pytest.raises(RuntimeError, match="live registration failed"):
+                    await mcp_tool._discover_and_register_server(
+                        server_name,
+                        {"connect_timeout": 1},
+                    )
+
+            assert isolated_registry.get_entry(cached_name) is None
+            assert isolated_registry.get_entry(partial_name) is None
+            assert (
+                mcp_tool._registered_mcp_tool_names_for_server(server_name)
+                == set()
+            )
+            with mcp_tool._lock:
+                assert server_name not in mcp_tool._servers
+                mcp_tool._server_connecting.discard(server_name)
+            assert partial_check() is False
+            server.shutdown.assert_awaited_once()
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._server_connecting.discard(server_name)
+            for name in (cached_name, partial_name):
+                mcp_tool._forget_mcp_tool_server(name)
+            self._clear_server_state(mcp_tool, server_name)
+
+    @pytest.mark.asyncio
+    async def test_check_is_available_during_prepare_and_after_publish(
+        self,
+        monkeypatch,
+    ):
+        import tools.mcp_tool as mcp_tool
+        from tools.registry import ToolRegistry
+
+        server_name = "publish-check-cache"
+        tool_name = "mcp__publish_check_cache__search"
+        isolated_registry = ToolRegistry()
+        server = SimpleNamespace(
+            session=object(),
+            _tools=[],
+            _registered_tool_names=[],
+            shutdown=AsyncMock(),
+        )
+        monkeypatch.setattr("tools.registry.registry", isolated_registry)
+
+        def register_before_publish(_name, _server, _config):
+            isolated_registry.register(
+                name=tool_name,
+                toolset="mcp-publish-check-cache",
+                schema={
+                    "name": tool_name,
+                    "parameters": {"type": "object"},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+                check_fn=mcp_tool._make_check_fn(server_name),
+            )
+            mcp_tool._track_mcp_tool_server(tool_name, server_name)
+            # The transport is not published yet, but the same MCP lock
+            # protects the preparing -> live transition.
+            definitions = isolated_registry.get_definitions({tool_name})
+            assert [item["function"]["name"] for item in definitions] == [
+                tool_name
+            ]
+            return [tool_name]
+
+        self._clear_server_state(mcp_tool, server_name)
+        with mcp_tool._lock:
+            mcp_tool._server_connecting.add(server_name)
+        try:
+            with patch.object(
+                mcp_tool,
+                "_connect_server",
+                AsyncMock(return_value=server),
+            ), patch.object(
+                mcp_tool,
+                "_register_server_tools",
+                side_effect=register_before_publish,
+            ), patch.object(
+                mcp_tool,
+                "_write_mcp_schema_cache",
+            ):
+                await mcp_tool._discover_and_register_server(
+                    server_name,
+                    {"connect_timeout": 1},
+                )
+
+            definitions = isolated_registry.get_definitions({tool_name})
+            assert [item["function"]["name"] for item in definitions] == [
+                tool_name
+            ]
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._server_connecting.discard(server_name)
+            isolated_registry.deregister(tool_name)
+            mcp_tool._forget_mcp_tool_server(tool_name)
+            self._clear_server_state(mcp_tool, server_name)
+
+
 class TestToolHandler:
     """Tool handlers are sync functions that schedule work on the MCP loop."""
 

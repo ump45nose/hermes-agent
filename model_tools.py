@@ -1361,17 +1361,47 @@ def handle_function_call(
                     try:
                         from agent.research_tool_dedupe import (
                             begin_research_leaf_smart_search,
+                            is_research_leaf_smart_search_dedupe_eligible,
                         )
 
-                        decision = begin_research_leaf_smart_search(
-                            runtime_role=runtime_role or "",
-                            session_id=session_id or "",
-                            tool_name=function_name,
-                            arguments=next_args,
-                            registry_generation=registry.get_generation(),
-                        )
-                        if decision.duplicate_result is not None:
-                            return decision.duplicate_result
+                        dedupe_ready = True
+                        if is_research_leaf_smart_search_dedupe_eligible(
+                            runtime_role or "",
+                            session_id or "",
+                            function_name,
+                        ):
+                            entry = registry.get_entry(function_name)
+                            prepare = getattr(
+                                getattr(entry, "handler", None),
+                                "_hermes_prepare_for_dispatch",
+                                None,
+                            )
+                            if callable(prepare):
+                                try:
+                                    dedupe_ready = prepare() is True
+                                except Exception as _prepare_error:
+                                    # Lazy connection is an optimization here;
+                                    # the real dispatch must still run and
+                                    # surface its own result/error.
+                                    dedupe_ready = False
+                                    logger.debug(
+                                        "research SmartSearch lazy prepare "
+                                        "failed open: %s",
+                                        _prepare_error,
+                                    )
+
+                        if dedupe_ready:
+                            decision = begin_research_leaf_smart_search(
+                                runtime_role=runtime_role or "",
+                                session_id=session_id or "",
+                                tool_name=function_name,
+                                arguments=next_args,
+                                tool_generation=registry.get_tool_generation(
+                                    function_name
+                                ),
+                            )
+                            if decision.duplicate_result is not None:
+                                return decision.duplicate_result
                     except Exception as _dedupe_begin_error:
                         # Deduplication is an optimization and must never make
                         # an otherwise valid retrieval unavailable.

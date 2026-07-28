@@ -20,6 +20,30 @@ _FAILURE_STATUSES = frozenset(
 _DEFAULT_SINGLE_FLIGHT_WAIT_SECONDS = 180.0
 _DEFAULT_MAX_INFLIGHT = 512
 _DedupeKey = tuple[str, str, str, int]
+_SMART_SEARCH_DEDUPE_TOOL_NAMES = frozenset(
+    {
+        f"{_SMART_SEARCH_PREFIX}smart_search",
+        f"{_SMART_SEARCH_PREFIX}smart_fetch",
+        f"{_SMART_SEARCH_PREFIX}smart_research",
+        f"{_SMART_SEARCH_PREFIX}smart_map",
+    }
+)
+
+
+def is_research_leaf_smart_search_dedupe_eligible(
+    runtime_role: str,
+    session_id: str,
+    tool_name: str,
+) -> bool:
+    """Return whether a call is eligible for exact retrieval deduplication."""
+    from agent.tool_result_classification import tool_may_have_side_effect
+
+    return (
+        runtime_role == "research_leaf"
+        and bool(session_id)
+        and tool_name in _SMART_SEARCH_DEDUPE_TOOL_NAMES
+        and not tool_may_have_side_effect(tool_name)
+    )
 
 
 def _canonical_args(arguments: dict[str, Any]) -> str:
@@ -177,13 +201,10 @@ class ResearchToolDeduper:
 
     @staticmethod
     def _eligible(runtime_role: str, session_id: str, tool_name: str) -> bool:
-        from agent.tool_result_classification import tool_may_have_side_effect
-
-        return (
-            runtime_role == "research_leaf"
-            and bool(session_id)
-            and tool_name.startswith(_SMART_SEARCH_PREFIX)
-            and not tool_may_have_side_effect(tool_name)
+        return is_research_leaf_smart_search_dedupe_eligible(
+            runtime_role,
+            session_id,
+            tool_name,
         )
 
     @staticmethod
@@ -232,7 +253,7 @@ class ResearchToolDeduper:
         session_id: str,
         tool_name: str,
         arguments: dict[str, Any],
-        registry_generation: int = 0,
+        tool_generation: int = 0,
     ) -> DedupeDecision:
         if not self._eligible(runtime_role, session_id, tool_name):
             return DedupeDecision()
@@ -243,7 +264,7 @@ class ResearchToolDeduper:
             session_sha256,
             tool_name,
             args_sha256,
-            int(registry_generation),
+            int(tool_generation),
         )
         while True:
             with self._lock:
@@ -342,14 +363,14 @@ def begin_research_leaf_smart_search(
     session_id: str,
     tool_name: str,
     arguments: dict[str, Any],
-    registry_generation: int,
+    tool_generation: int,
 ) -> DedupeDecision:
     return _GLOBAL_DEDUPER.begin(
         runtime_role=runtime_role,
         session_id=session_id,
         tool_name=tool_name,
         arguments=arguments,
-        registry_generation=registry_generation,
+        tool_generation=tool_generation,
     )
 
 
