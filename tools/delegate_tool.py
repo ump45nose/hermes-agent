@@ -1489,6 +1489,8 @@ def _build_child_agent(
             _research_root,
             getattr(parent_agent, "session_id", "session"),
         )
+        _parent_artifact_dir.mkdir(parents=True, exist_ok=True)
+        _parent_artifact_dir.chmod(0o700)
         child._research_artifact_dir = contained_session_path(
             _parent_artifact_dir,
             subagent_id,

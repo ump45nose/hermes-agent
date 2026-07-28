@@ -584,6 +584,8 @@ def test_smart_search_and_context7_mcp_tools_are_explicitly_read_only():
 
 
 def test_research_leaf_prompt_has_short_dedupe_and_partial_handoff_protocol():
+    assert "运行时会自动" in RESEARCH_LEAF_PROMPT
+    assert "不要自行创建、写入或选择 evidence 文件路径" in RESEARCH_LEAF_PROMPT
     assert "canonical 参数不得重复检索" in RESEARCH_LEAF_PROMPT
     assert "duplicate receipt" in RESEARCH_LEAF_PROMPT
     assert "预留最终 handoff" in RESEARCH_LEAF_PROMPT
