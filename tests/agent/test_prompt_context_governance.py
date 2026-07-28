@@ -12,6 +12,7 @@ from agent.local_context import LocalContextStore
 from agent.episode_policy import eligible_session, episode_input_messages
 from agent.request_snapshot import capture_request_snapshot
 from agent.runtime_role import (
+    RESEARCH_LEAF_PROMPT,
     resolve_runtime_role,
     runtime_capability_overlay,
     scope_runtime_toolsets,
@@ -166,6 +167,30 @@ def test_research_leaf_spills_large_smart_search_before_first_injection():
         == 16_000
     )
 
+    failures_parent = SimpleNamespace(
+        runtime_role="interactive",
+        _tool_context_editor_mode="failures",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    assert (
+        _budget_for_agent(failures_parent).resolve_threshold(
+            "mcp__smart_search__smart_fetch"
+        )
+        == 16_000
+    )
+
+    active_parent = SimpleNamespace(
+        runtime_role="interactive",
+        _tool_context_editor_mode="active",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    assert (
+        _budget_for_agent(active_parent).resolve_threshold(
+            "mcp__smart_search__smart_fetch"
+        )
+        == 16_000
+    )
+
     report_only_interactive = SimpleNamespace(
         runtime_role="interactive",
         _tool_context_editor_mode="report_only",
@@ -179,7 +204,11 @@ def test_research_leaf_spills_large_smart_search_before_first_injection():
     )
 
 
-def _assistant(call_id: str, name: str = "web_search"):
+def _assistant(
+    call_id: str,
+    name: str = "web_search",
+    arguments: dict | None = None,
+):
     return {
         "role": "assistant",
         "content": None,
@@ -187,7 +216,10 @@ def _assistant(call_id: str, name: str = "web_search"):
             {
                 "id": call_id,
                 "type": "function",
-                "function": {"name": name, "arguments": "{}"},
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments or {}),
+                },
             }
         ],
     }
@@ -301,6 +333,46 @@ def test_smart_search_receipt_keeps_source_index_not_result_body():
     assert report[0]["action"] == "read_receipt"
 
 
+def test_smart_search_receipt_keeps_owner_request_ledger_after_pre_spill():
+    content = (
+        "Preview only; original body is not present.\n"
+        "Full output saved to: /owner/session/fetch.txt"
+    )
+    message = _tool("fetch", content)
+    message["name"] = message["tool_name"] = "mcp__smart_search__smart_fetch"
+    message["_tool_receipt"].update(
+        {
+            "tool_name": "mcp__smart_search__smart_fetch",
+            "artifact_ref": "/owner/session/fetch.txt",
+        }
+    )
+    edited, report = edit_tool_context(
+        [
+            _assistant(
+                "fetch",
+                "mcp__smart_search__smart_fetch",
+                {
+                    "url": "https://example.test/article",
+                    "query": "rss reader comparison",
+                    "question": "Which claims are verified?",
+                    "raw_body": "must-not-enter-ledger",
+                },
+            ),
+            message,
+            {"role": "assistant", "content": "Evidence consumed."},
+        ],
+        phase="readonly",
+    )
+    receipt = edited[1]["content"]
+    assert "REQUEST LEDGER" in receipt
+    assert "https://example.test/article" in receipt
+    assert "rss reader comparison" in receipt
+    assert "Which claims are verified?" in receipt
+    assert "must-not-enter-ledger" not in receipt
+    assert "Full output saved to" not in receipt
+    assert report[0]["action"] == "read_receipt"
+
+
 def test_tool_editor_report_only_reports_read_receipt_without_mutation():
     messages = [
         _assistant("old"),
@@ -391,6 +463,45 @@ def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
     assert artifact.stat().st_mode & 0o777 == 0o600
 
 
+def test_mark_consumed_persists_smart_search_request_ledger_to_session_db(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("research-session", source="subagent")
+    assistant = _assistant(
+        "fetch-db",
+        "mcp__smart_search__smart_fetch",
+        {"url": "https://example.test/db", "question": "What changed?"},
+    )
+    message = _tool("fetch-db", "pre-spilled preview")
+    message["name"] = message["tool_name"] = "mcp__smart_search__smart_fetch"
+    message["_tool_receipt"]["tool_name"] = "mcp__smart_search__smart_fetch"
+    db.append_message(
+        "research-session",
+        "tool",
+        "pre-spilled preview",
+        tool_name="mcp__smart_search__smart_fetch",
+        tool_call_id="fetch-db",
+        effect_disposition="none",
+        tool_receipt=message["_tool_receipt"],
+    )
+
+    mark_tool_results_consumed(
+        [assistant, message],
+        consumed_turn=3,
+        session_db=db,
+        session_id="research-session",
+    )
+
+    assert message["_tool_receipt"]["request_ledger"] == {
+        "url": "https://example.test/db",
+        "question": "What changed?",
+    }
+    loaded = db.get_messages_as_conversation("research-session")
+    assert loaded[0]["_tool_receipt"]["request_ledger"] == {
+        "url": "https://example.test/db",
+        "question": "What changed?",
+    }
+
+
 def test_mark_consumed_does_not_persist_artifact_unless_enabled(tmp_path):
     content = "interactive evidence\n" * 400
     message = _tool("read-interactive", content)
@@ -438,6 +549,13 @@ def test_smart_search_and_context7_mcp_tools_are_explicitly_read_only():
     assert not tool_may_have_side_effect("mcp__smart_search__smart_fetch")
     assert not tool_may_have_side_effect("mcp__context7__query_docs")
     assert tool_may_have_side_effect("mcp__mixed_server__update_record")
+
+
+def test_research_leaf_prompt_has_short_dedupe_and_partial_handoff_protocol():
+    assert "canonical 参数不得重复检索" in RESEARCH_LEAF_PROMPT
+    assert "duplicate receipt" in RESEARCH_LEAF_PROMPT
+    assert "预留最终 handoff" in RESEARCH_LEAF_PROMPT
+    assert "max_iterations 只能标记 partial/unresolved" in RESEARCH_LEAF_PROMPT
 
 
 def test_read_receipt_remains_provider_paired_across_wire_adapters():
@@ -526,6 +644,30 @@ def test_tool_editor_active_replaces_consumed_side_effect_with_receipt():
     )
     assert "tool action receipt" in edited[1]["content"]
     assert report[0]["action"] == "action_receipt"
+
+
+def test_tool_editor_failures_receiptizes_success_and_drops_superseded_failure():
+    failed = _tool("failed", '{"error":"temporary"}', status="error")
+    succeeded = _tool("succeeded", '{"ok":true,"content":"evidence"}')
+    edited, report = edit_tool_context(
+        [
+            _assistant("failed", "mcp__smart_search__smart_fetch"),
+            failed,
+            _assistant("succeeded", "mcp__smart_search__smart_fetch"),
+            succeeded,
+            {"role": "assistant", "content": "Evidence used."},
+        ],
+        phase="failures",
+    )
+
+    assert all(message.get("tool_call_id") != "failed" for message in edited)
+    success_message = next(
+        message for message in edited
+        if message.get("tool_call_id") == "succeeded"
+    )
+    assert "tool read result consumed" in success_message["content"]
+    assert {item["action"] for item in report} == {"remove_pair", "read_receipt"}
+    assert all(item["action"] != "action_receipt" for item in report)
 
 
 def test_local_scenario_keyword_scope_cap_and_session_dedupe(tmp_path):

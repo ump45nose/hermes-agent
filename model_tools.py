@@ -1328,12 +1328,22 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        runtime_role=runtime_role,
-                        user_task=user_task,
+                    from agent.research_tool_dedupe import (
+                        execute_research_leaf_smart_search,
+                    )
+
+                    return execute_research_leaf_smart_search(
+                        runtime_role=runtime_role or "",
+                        session_id=session_id or "",
+                        tool_name=function_name,
+                        arguments=next_args,
+                        invoke=lambda: registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            runtime_role=runtime_role,
+                            user_task=user_task,
+                        ),
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

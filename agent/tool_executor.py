@@ -110,9 +110,11 @@ def _budget_for_agent(agent) -> BudgetConfig:
     except Exception:
         base = DEFAULT_BUDGET
     is_research_leaf = getattr(agent, "runtime_role", "") == "research_leaf"
-    is_readonly_parent = (
-        getattr(agent, "_tool_context_editor_mode", "") == "readonly"
-    )
+    is_readonly_parent = getattr(agent, "_tool_context_editor_mode", "") in {
+        "readonly",
+        "failures",
+        "active",
+    }
     if not (is_research_leaf or is_readonly_parent):
         return base
 

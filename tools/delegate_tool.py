@@ -1786,6 +1786,10 @@ def _write_research_evidence_bundle(
         contradictions = []
         unexpected = []
         unresolved = [] if status == "completed" else [status]
+    if status != "completed":
+        unresolved = list(unresolved) if isinstance(unresolved, list) else [unresolved]
+        if status not in unresolved:
+            unresolved.append(status)
 
     def _bounded_items(
         value: Any,
@@ -2367,6 +2371,7 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+        is_research_leaf = getattr(child, "runtime_role", "") == "research_leaf"
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
@@ -2375,13 +2380,24 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        # Determine exit reason before status: a research leaf can return a
+        # usable handoff while still exhausting its budget. That is partial
+        # evidence, never a completed research branch.
+        if interrupted:
+            exit_reason = "interrupted"
+        elif completed:
+            exit_reason = "completed"
+        else:
+            exit_reason = "max_iterations"
+
         if interrupted:
             status = "interrupted"
         elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
+            status = (
+                "partial"
+                if is_research_leaf and exit_reason == "max_iterations"
+                else "completed"
+            )
         else:
             status = "failed"
 
@@ -2397,9 +2413,17 @@ def _run_single_child(
                 if msg.get("role") == "assistant":
                     for tc in msg.get("tool_calls") or []:
                         fn = tc.get("function", {})
+                        arguments = fn.get("arguments", "")
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            )
                         entry_t = {
                             "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(fn.get("arguments", "")),
+                            "args_bytes": len(arguments.encode("utf-8")),
                         }
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
@@ -2409,7 +2433,7 @@ def _run_single_child(
                     content = _stringify_tool_content(msg.get("content", ""))
                     is_error = _looks_like_error_output(content)
                     result_meta = {
-                        "result_bytes": len(content),
+                        "result_bytes": len(content.encode("utf-8")),
                         "status": "error" if is_error else "ok",
                     }
                     # Match by tool_call_id for parallel calls
@@ -2421,19 +2445,30 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
-        if interrupted:
-            exit_reason = "interrupted"
-        elif completed:
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
+        tool_trace_summary = {
+            "calls": len(tool_trace),
+            "errors": sum(
+                1 for trace_entry in tool_trace
+                if trace_entry.get("status") == "error"
+            ),
+            "unique_tools": sorted(
+                {
+                    str(trace_entry.get("tool") or "unknown")
+                    for trace_entry in tool_trace
+                }
+            ),
+            "bytes": sum(
+                int(trace_entry.get("args_bytes") or 0)
+                + int(trace_entry.get("result_bytes") or 0)
+                for trace_entry in tool_trace
+            ),
+        }
 
         research_artifact_path = ""
         research_artifact_sha256 = ""
         research_handoff_path = ""
         research_handoff_sha256 = ""
-        if getattr(child, "runtime_role", "") == "research_leaf":
+        if is_research_leaf:
             (
                 summary,
                 research_artifact_path,
@@ -2471,7 +2506,6 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
-            "tool_trace": tool_trace,
             "handoff_path": research_handoff_path or None,
             "handoff_sha256": research_handoff_sha256 or None,
             "evidence_bundle_path": research_artifact_path or None,
@@ -2495,6 +2529,10 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if is_research_leaf:
+            entry["tool_trace_summary"] = tool_trace_summary
+        else:
+            entry["tool_trace"] = tool_trace
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
