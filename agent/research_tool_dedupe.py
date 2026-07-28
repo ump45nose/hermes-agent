@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -17,6 +18,8 @@ _FAILURE_STATUSES = frozenset(
     {"error", "failed", "failure", "timeout", "cancelled", "blocked"}
 )
 _DEFAULT_SINGLE_FLIGHT_WAIT_SECONDS = 180.0
+_DEFAULT_MAX_INFLIGHT = 512
+_DedupeKey = tuple[str, str, str, int]
 
 
 def _canonical_args(arguments: dict[str, Any]) -> str:
@@ -121,6 +124,7 @@ def _result_text(result: Any) -> str:
 @dataclass
 class _Flight:
     event: threading.Event
+    started_at: float
 
 
 @dataclass(frozen=True)
@@ -132,7 +136,7 @@ class _Success:
 
 @dataclass(frozen=True)
 class DedupeDecision:
-    key: tuple[str, str, str] | None = None
+    key: _DedupeKey | None = None
     flight: _Flight | None = None
     duplicate_result: str | None = None
 
@@ -150,15 +154,26 @@ class ResearchToolDeduper:
         max_entries: int = 512,
         max_entries_per_session: int = 128,
         single_flight_wait_seconds: float = _DEFAULT_SINGLE_FLIGHT_WAIT_SECONDS,
+        single_flight_lease_seconds: float | None = None,
+        max_inflight: int = _DEFAULT_MAX_INFLIGHT,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._max_entries = max(1, int(max_entries))
         self._max_entries_per_session = max(1, int(max_entries_per_session))
         self._single_flight_wait_seconds = max(
             0.01, float(single_flight_wait_seconds)
         )
+        lease_seconds = (
+            single_flight_wait_seconds
+            if single_flight_lease_seconds is None
+            else single_flight_lease_seconds
+        )
+        self._single_flight_lease_seconds = max(0.01, float(lease_seconds))
+        self._max_inflight = max(1, int(max_inflight))
+        self._clock = clock
         self._lock = threading.Lock()
-        self._successes: OrderedDict[tuple[str, str, str], _Success] = OrderedDict()
-        self._inflight: dict[tuple[str, str, str], _Flight] = {}
+        self._successes: OrderedDict[_DedupeKey, _Success] = OrderedDict()
+        self._inflight: dict[_DedupeKey, _Flight] = {}
 
     @staticmethod
     def _eligible(runtime_role: str, session_id: str, tool_name: str) -> bool:
@@ -199,6 +214,17 @@ class ResearchToolDeduper:
             separators=(",", ":"),
         )
 
+    def _evict_stale_inflight_locked(self, now: float) -> None:
+        stale = [
+            (key, flight)
+            for key, flight in self._inflight.items()
+            if now - flight.started_at >= self._single_flight_lease_seconds
+        ]
+        for key, flight in stale:
+            if self._inflight.get(key) is flight:
+                self._inflight.pop(key, None)
+                flight.event.set()
+
     def begin(
         self,
         *,
@@ -206,15 +232,23 @@ class ResearchToolDeduper:
         session_id: str,
         tool_name: str,
         arguments: dict[str, Any],
+        registry_generation: int = 0,
     ) -> DedupeDecision:
         if not self._eligible(runtime_role, session_id, tool_name):
             return DedupeDecision()
         canonical = _canonical_args(arguments)
         args_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
         session_sha256 = hashlib.sha256(session_id.encode()).hexdigest()
-        key = (session_sha256, tool_name, args_sha256)
+        key = (
+            session_sha256,
+            tool_name,
+            args_sha256,
+            int(registry_generation),
+        )
         while True:
             with self._lock:
+                now = self._clock()
+                self._evict_stale_inflight_locked(now)
                 success = self._successes.get(key)
                 if success is not None:
                     self._successes.move_to_end(key)
@@ -225,29 +259,25 @@ class ResearchToolDeduper:
                     )
                 flight = self._inflight.get(key)
                 if flight is None:
-                    flight = _Flight(threading.Event())
+                    if len(self._inflight) >= self._max_inflight:
+                        # Coordination is bounded, but dedupe is fail-open:
+                        # execute this read without tracking it rather than
+                        # reject or delay a valid retrieval.
+                        return DedupeDecision()
+                    flight = _Flight(threading.Event(), started_at=now)
                     self._inflight[key] = flight
                     return DedupeDecision(key=key, flight=flight)
-            if not flight.event.wait(timeout=self._single_flight_wait_seconds):
-                return DedupeDecision(
-                    duplicate_result=json.dumps(
-                        {
-                            "ok": False,
-                            "kind": "smart_search_inflight_timeout_receipt",
-                            "duplicate": True,
-                            "tool_name": tool_name,
-                            "canonical_args_sha256": args_sha256,
-                            "request": request_ledger(arguments),
-                            "status": "timeout",
-                            "error": (
-                                "The identical request is still running; choose "
-                                "a new source or continue with other evidence."
-                            ),
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
+                lease_remaining = max(
+                    0.01,
+                    self._single_flight_lease_seconds
+                    - (now - flight.started_at),
                 )
+            flight.event.wait(
+                timeout=min(
+                    self._single_flight_wait_seconds,
+                    lease_remaining,
+                )
+            )
 
     def abort(self, decision: DedupeDecision) -> None:
         if not decision.owner:
@@ -258,31 +288,6 @@ class ResearchToolDeduper:
                 self._inflight.pop(decision.key, None)
                 flight.event.set()
 
-    def execute(
-        self,
-        *,
-        runtime_role: str,
-        session_id: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-        invoke: Callable[[], Any],
-    ) -> Any:
-        decision = self.begin(
-            runtime_role=runtime_role,
-            session_id=session_id,
-            tool_name=tool_name,
-            arguments=arguments,
-        )
-        if decision.duplicate_result is not None:
-            return decision.duplicate_result
-        try:
-            result = invoke()
-        except BaseException:
-            self.abort(decision)
-            raise
-        self.finish(decision, result, arguments)
-        return result
-
     def finish(
         self,
         decision: DedupeDecision,
@@ -291,46 +296,70 @@ class ResearchToolDeduper:
     ) -> None:
         if not decision.owner:
             return
-        text = _result_text(result)
-        success = _successful_result(result)
-        with self._lock:
-            flight = self._inflight.get(decision.key)
-            if flight is not decision.flight:
-                return
-            self._inflight.pop(decision.key, None)
-            if success:
-                session_id, _tool_name, _args_sha256 = decision.key
-                self._successes[decision.key] = _Success(
-                    chars=len(text),
-                    sha256=hashlib.sha256(text.encode()).hexdigest(),
-                    request=request_ledger(arguments),
-                )
-                self._successes.move_to_end(decision.key)
-                session_keys = [
-                    key for key in self._successes if key[0] == session_id
-                ]
-                for key in session_keys[: -self._max_entries_per_session]:
-                    self._successes.pop(key, None)
-                while len(self._successes) > self._max_entries:
-                    self._successes.popitem(last=False)
-            flight.event.set()
+        try:
+            text = _result_text(result)
+            success = _successful_result(result)
+            ledger = request_ledger(arguments)
+            with self._lock:
+                flight = self._inflight.get(decision.key)
+                if flight is not decision.flight:
+                    return
+                try:
+                    if success:
+                        (
+                            session_id,
+                            _tool_name,
+                            _args_sha256,
+                            _generation,
+                        ) = decision.key
+                        self._successes[decision.key] = _Success(
+                            chars=len(text),
+                            sha256=hashlib.sha256(text.encode()).hexdigest(),
+                            request=ledger,
+                        )
+                        self._successes.move_to_end(decision.key)
+                        session_keys = [
+                            key for key in self._successes if key[0] == session_id
+                        ]
+                        for key in session_keys[: -self._max_entries_per_session]:
+                            self._successes.pop(key, None)
+                        while len(self._successes) > self._max_entries:
+                            self._successes.popitem(last=False)
+                finally:
+                    self._inflight.pop(decision.key, None)
+                    flight.event.set()
+        except BaseException:
+            self.abort(decision)
+            raise
 
 
 _GLOBAL_DEDUPER = ResearchToolDeduper()
 
 
-def execute_research_leaf_smart_search(
+def begin_research_leaf_smart_search(
     *,
     runtime_role: str,
     session_id: str,
     tool_name: str,
     arguments: dict[str, Any],
-    invoke: Callable[[], Any],
-) -> Any:
-    return _GLOBAL_DEDUPER.execute(
+    registry_generation: int,
+) -> DedupeDecision:
+    return _GLOBAL_DEDUPER.begin(
         runtime_role=runtime_role,
         session_id=session_id,
         tool_name=tool_name,
         arguments=arguments,
-        invoke=invoke,
+        registry_generation=registry_generation,
     )
+
+
+def finish_research_leaf_smart_search(
+    decision: DedupeDecision,
+    result: Any,
+    arguments: dict[str, Any],
+) -> None:
+    _GLOBAL_DEDUPER.finish(decision, result, arguments)
+
+
+def abort_research_leaf_smart_search(decision: DedupeDecision) -> None:
+    _GLOBAL_DEDUPER.abort(decision)

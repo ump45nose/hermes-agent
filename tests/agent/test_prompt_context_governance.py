@@ -20,6 +20,7 @@ from agent.runtime_role import (
 from agent.tool_context_editor import (
     edit_tool_context,
     mark_tool_results_consumed,
+    receipt_from_message,
     strip_internal_tool_metadata,
 )
 from agent.tool_result_classification import tool_may_have_side_effect
@@ -256,6 +257,33 @@ def test_tool_editor_preserves_current_and_removes_consumed_duplicate_pair():
     assert all(msg.get("tool_call_id") != "old" for msg in edited)
     assert any(msg.get("tool_call_id") == "new" for msg in edited)
     assert any(item["action"] == "remove_pair" for item in report)
+
+
+def test_tool_receipt_is_backward_and_forward_compatible():
+    old_receipt = receipt_from_message(
+        {
+            "role": "tool",
+            "content": "legacy",
+            "_tool_receipt": {"tool_name": "web_search"},
+        }
+    )
+    assert old_receipt.tool_name == "web_search"
+    assert old_receipt.request_ledger is None
+    assert old_receipt.result_status == "unknown"
+
+    future_receipt = receipt_from_message(
+        {
+            "role": "tool",
+            "content": "future",
+            "_tool_receipt": {
+                "tool_name": "web_search",
+                "request_ledger": {"query": "kept"},
+                "future_field": {"ignored": True},
+            },
+        }
+    )
+    assert future_receipt.request_ledger == {"query": "kept"}
+    assert "future_field" not in future_receipt.to_dict()
 
 
 def test_tool_editor_receiptizes_unique_consumed_read_result():
