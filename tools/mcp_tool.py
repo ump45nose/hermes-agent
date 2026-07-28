@@ -3196,19 +3196,37 @@ _current_server_connect_attempt: contextvars.ContextVar[object | None] = (
 )
 
 
-def _complete_lazy_connect_flight(
+def _retire_connect_attempt(
     server_name: str,
+    attempt_token: object,
     flight: SimpleNamespace,
     *,
     success: bool,
+    error: str | None = None,
 ) -> None:
-    """Publish one connection-flight outcome and wake all current waiters."""
+    """Atomically retire attempt state and its token-bound waiter flight."""
     with _lock:
-        flight.success = bool(success)
-        current = _lazy_connect_flights.get(server_name)
-        if current is flight:
-            _lazy_connect_flights.pop(server_name, None)
-        flight.event.set()
+        if _server_connect_attempts.get(server_name) is attempt_token:
+            _server_connect_attempts.pop(server_name, None)
+            _server_connecting.discard(server_name)
+            if success:
+                _server_connect_errors.pop(server_name, None)
+            elif error:
+                _server_connect_errors[server_name] = error
+            else:
+                _server_connect_errors.setdefault(
+                    server_name,
+                    "MCP connection attempt ended before publication",
+                )
+        if getattr(flight, "attempt_token", None) is attempt_token:
+            flight.success = bool(success)
+            current = _lazy_connect_flights.get(server_name)
+            if (
+                current is flight
+                and getattr(current, "attempt_token", None) is attempt_token
+            ):
+                _lazy_connect_flights.pop(server_name, None)
+            flight.event.set()
 
 
 def _server_registration_lock(server_name: str) -> threading.Lock:
@@ -3243,7 +3261,6 @@ def _record_connect_attempt_result(
         with _lock:
             if _server_connect_attempts.get(server_name) is not attempt_token:
                 return
-            _server_connecting.discard(server_name)
             _server_connect_errors[server_name] = message
         command = config.get("command")
         logger.warning(
@@ -3254,10 +3271,9 @@ def _record_connect_attempt_result(
         )
         return
 
-    with _lock:
-        if _server_connect_attempts.get(server_name) is attempt_token:
-            _server_connecting.discard(server_name)
-            _server_connect_errors.pop(server_name, None)
+    # Successful discovery publishes the server and clears its attempt token
+    # inside _discover_and_register_server. The outer finally retires only the
+    # matching flight, so there is no state/flight gap for a retry to enter.
 
 
 # Circuit breaker: consecutive error counts per server.  After
@@ -5573,16 +5589,8 @@ def _ensure_lazy_mcp_server_connected(server_name: str) -> Optional[MCPServerTas
         if existing is not None and existing.session is not None:
             return existing
         flight = _lazy_connect_flights.get(server_name)
-        owner = flight is None
-        if owner:
-            flight = SimpleNamespace(
-                event=threading.Event(),
-                success=False,
-                waiters=0,
-            )
-            _lazy_connect_flights[server_name] = flight
 
-    if not owner:
+    if flight is not None:
         with _lock:
             flight.waiters += 1
         if not flight.event.wait(timeout=wait_timeout):
@@ -5607,18 +5615,31 @@ def _ensure_lazy_mcp_server_connected(server_name: str) -> Optional[MCPServerTas
             server_name,
             exc,
         )
-    finally:
+
+    with _lock:
+        connected = _servers.get(server_name)
+        if connected is not None and connected.session is not None:
+            return connected
+        flight = _lazy_connect_flights.get(server_name)
+
+    # Another caller may have won the register_mcp_servers claim after our
+    # initial snapshot. Join its token-bound flight instead of launching a
+    # second attempt or manufacturing an unowned placeholder flight.
+    if flight is not None:
         with _lock:
-            connected = _servers.get(server_name)
-            success = bool(
-                connected is not None and connected.session is not None
+            flight.waiters += 1
+        if not flight.event.wait(timeout=wait_timeout):
+            logger.warning(
+                "Timed out waiting for lazy MCP connection owner for '%s'",
+                server_name,
             )
-        _complete_lazy_connect_flight(
-            server_name,
-            flight,
-            success=success,
-        )
-    return connected if success else None
+            return None
+        if flight.success:
+            with _lock:
+                connected = _servers.get(server_name)
+                if connected is not None and connected.session is not None:
+                    return connected
+    return None
 
 
 def _make_lazy_cached_handler(
@@ -5902,14 +5923,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             attempt_token = object()
             _server_connect_attempts[srv_name] = attempt_token
             connection_attempts[srv_name] = attempt_token
-            flight = _lazy_connect_flights.get(srv_name)
-            if flight is None:
-                flight = SimpleNamespace(
-                    event=threading.Event(),
-                    success=False,
-                    waiters=0,
-                )
-                _lazy_connect_flights[srv_name] = flight
+            flight = SimpleNamespace(
+                event=threading.Event(),
+                success=False,
+                waiters=0,
+                attempt_token=attempt_token,
+            )
+            _lazy_connect_flights[srv_name] = flight
             connection_flights[srv_name] = flight
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
@@ -5931,17 +5951,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _ensure_mcp_loop()
     except BaseException as exc:
         message = _format_connect_error(exc)
-        with _lock:
-            for srv_name, attempt_token in connection_attempts.items():
-                if _server_connect_attempts.get(srv_name) is attempt_token:
-                    _server_connect_attempts.pop(srv_name, None)
-                    _server_connecting.discard(srv_name)
-                    _server_connect_errors[srv_name] = message
         for srv_name, flight in connection_flights.items():
-            _complete_lazy_connect_flight(
+            _retire_connect_attempt(
                 srv_name,
+                connection_attempts[srv_name],
                 flight,
                 success=False,
+                error=message,
             )
         raise
 
@@ -5985,8 +6001,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         with _lock:
             for srv_name, attempt_token in connection_attempts.items():
                 if _server_connect_attempts.get(srv_name) is attempt_token:
-                    _server_connect_attempts.pop(srv_name, None)
-                    _server_connecting.discard(srv_name)
                     _server_connect_errors[srv_name] = message
         raise
     finally:
@@ -5997,18 +6011,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     server is not None and server.session is not None
                 )
                 attempt_token = connection_attempts[srv_name]
-                if _server_connect_attempts.get(srv_name) is attempt_token:
-                    _server_connect_attempts.pop(srv_name, None)
-                    _server_connecting.discard(srv_name)
-                    if not success:
-                        _server_connect_errors.setdefault(
-                            srv_name,
-                            "MCP connection attempt ended before publication",
-                        )
-            _complete_lazy_connect_flight(
+                error = _server_connect_errors.get(srv_name)
+            _retire_connect_attempt(
                 srv_name,
+                attempt_token,
                 flight,
                 success=success,
+                error=error,
             )
         if _was_interrupted:
             _set_interrupt(True)
