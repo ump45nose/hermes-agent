@@ -765,6 +765,9 @@ class TestLazyMCPConnectionSingleFlight:
             flight = mcp_tool._lazy_connect_flights.pop(server_name, None)
             if flight is not None:
                 flight.event.set()
+            mcp_tool._server_connect_attempts.pop(server_name, None)
+            mcp_tool._server_connecting.discard(server_name)
+            mcp_tool._server_connect_errors.pop(server_name, None)
 
     def test_concurrent_same_server_prepare_connects_once(self):
         import tools.mcp_tool as mcp_tool
@@ -941,6 +944,151 @@ class TestLazyMCPConnectionSingleFlight:
         finally:
             with mcp_tool._lock:
                 mcp_tool._server_connecting.discard(server_name)
+            self._clear_server_state(mcp_tool, server_name)
+
+    @pytest.mark.parametrize(
+        "abort_error",
+        [TimeoutError("outer timeout"), InterruptedError("user interrupted")],
+        ids=["timeout", "interrupted"],
+    )
+    def test_outer_abort_clears_attempt_and_allows_lazy_retry(
+        self,
+        abort_error,
+    ):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = f"lazy-retry-after-{type(abort_error).__name__}"
+        server = SimpleNamespace(session=object(), _registered_tool_names=[])
+        run_calls = []
+        first_run_entered = threading.Event()
+        release_first_run = threading.Event()
+
+        def fake_run(_coro_or_factory, timeout=30):
+            run_calls.append(timeout)
+            if len(run_calls) == 1:
+                first_run_entered.set()
+                assert release_first_run.wait(timeout=5)
+                raise abort_error
+            with mcp_tool._lock:
+                mcp_tool._servers[server_name] = server
+
+        self._clear_server_state(mcp_tool, server_name)
+        try:
+            config = {server_name: {"connect_timeout": 1}}
+            with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
+                mcp_tool,
+                "_ensure_mcp_loop",
+                return_value=None,
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=fake_run,
+            ), patch.object(
+                mcp_tool,
+                "_load_mcp_config",
+                return_value=config,
+            ):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    owner = pool.submit(
+                        mcp_tool._ensure_lazy_mcp_server_connected,
+                        server_name,
+                    )
+                    assert first_run_entered.wait(timeout=5)
+                    waiter = pool.submit(
+                        mcp_tool._ensure_lazy_mcp_server_connected,
+                        server_name,
+                    )
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        with mcp_tool._lock:
+                            flight = mcp_tool._lazy_connect_flights.get(
+                                server_name
+                            )
+                            if flight is not None and flight.waiters == 1:
+                                break
+                        time.sleep(0.001)
+                    else:
+                        pytest.fail("outer-abort waiter did not join flight")
+                    release_first_run.set()
+                    first = owner.result(timeout=5)
+                    waited = waiter.result(timeout=5)
+
+                assert first is None
+                assert waited is None
+                with mcp_tool._lock:
+                    assert server_name not in mcp_tool._server_connecting
+                    assert server_name not in mcp_tool._server_connect_attempts
+                    assert server_name not in mcp_tool._lazy_connect_flights
+                    assert server_name in mcp_tool._server_connect_errors
+
+                retried = mcp_tool._ensure_lazy_mcp_server_connected(
+                    server_name
+                )
+
+            assert retried is server
+            assert run_calls == [120, 120]
+        finally:
+            self._clear_server_state(mcp_tool, server_name)
+
+    @pytest.mark.asyncio
+    async def test_late_stale_attempt_cannot_remove_newer_published_handlers(
+        self,
+        monkeypatch,
+    ):
+        import tools.mcp_tool as mcp_tool
+        from tools.registry import ToolRegistry
+
+        server_name = "late-stale-attempt"
+        tool_name = "mcp__late_stale_attempt__search"
+        isolated_registry = ToolRegistry()
+        newer_server = SimpleNamespace(
+            session=object(),
+            _registered_tool_names=[tool_name],
+        )
+        old_server = SimpleNamespace(
+            session=object(),
+            shutdown=AsyncMock(),
+        )
+        old_token = object()
+        monkeypatch.setattr("tools.registry.registry", isolated_registry)
+        isolated_registry.register(
+            name=tool_name,
+            toolset="mcp-late-stale-attempt",
+            schema={"name": tool_name, "parameters": {"type": "object"}},
+            handler=lambda _args, **_kwargs: '{"newer":true}',
+        )
+        mcp_tool._track_mcp_tool_server(tool_name, server_name)
+        self._clear_server_state(mcp_tool, server_name)
+        with mcp_tool._lock:
+            mcp_tool._servers[server_name] = newer_server
+
+        try:
+            with patch.object(
+                mcp_tool,
+                "_connect_server",
+                AsyncMock(return_value=old_server),
+            ):
+                token = mcp_tool._current_server_connect_attempt.set(old_token)
+                try:
+                    with pytest.raises(
+                        RuntimeError,
+                        match="stale MCP connection",
+                    ):
+                        await mcp_tool._discover_and_register_server(
+                            server_name,
+                            {"connect_timeout": 1},
+                        )
+                finally:
+                    mcp_tool._current_server_connect_attempt.reset(token)
+
+            with mcp_tool._lock:
+                assert mcp_tool._servers[server_name] is newer_server
+            assert isolated_registry.get_entry(tool_name) is not None
+            assert isolated_registry.dispatch(tool_name, {}) == '{"newer":true}'
+            old_server.shutdown.assert_awaited_once()
+        finally:
+            isolated_registry.deregister(tool_name)
+            mcp_tool._forget_mcp_tool_server(tool_name)
             self._clear_server_state(mcp_tool, server_name)
 
     def test_live_reconciliation_removes_missing_and_quarantined_cached_tools(
