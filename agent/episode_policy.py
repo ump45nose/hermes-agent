@@ -79,6 +79,13 @@ def episode_input_messages(rows: Iterable[Any]) -> list[dict[str, Any]]:
         if role not in {"user", "assistant"}:
             continue
         content = getter("content", "")
+        try:
+            from agent.controller_protocol import is_controller_receipt_text
+
+            if is_controller_receipt_text(content):
+                continue
+        except Exception:
+            pass
         if isinstance(content, str) and content.strip():
             rendered.append({"role": role, "content": content})
     return rendered

@@ -232,6 +232,131 @@ def test_kanban_notifier_wakes_exact_originating_dm_session(
     assert event.metadata["gateway_session_id"] == expected_id
 
 
+def test_controller_subscription_injects_receipt_without_raw_notification(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "controller-receipt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    expected_key = "agent:main:telegram:dm:chat-1"
+    expected_id = "controller-session-1"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="delegated research",
+            assignee="research",
+            session_id=expected_id,
+            controller_batch_id="batch-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            source_profile=None,
+            notifier_profile="lingjun",
+            session_key=expected_key,
+            session_id=expected_id,
+        )
+        kb.complete_task(
+            conn,
+            tid,
+            summary="verified result",
+        )
+    finally:
+        conn.close()
+
+    import agent.controller_protocol as controller_protocol
+
+    monkeypatch.setattr(
+        controller_protocol,
+        "profile_controller_protocol_enabled",
+        lambda profile: profile == "lingjun",
+    )
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "lingjun"
+    runner._profile_adapters = {}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.wake_events) == 1
+    event = adapter.wake_events[0]
+    assert event.text.startswith("[[HERMES_CONTROLLER_RECEIPT_V1]]")
+    payload = __import__("json").loads(event.text.split("\n", 1)[1])
+    assert payload["protocol"] == "kanban-controller@1"
+    assert payload["task_id"] == tid
+    assert payload["artifacts"] == []
+    assert payload["remaining_tasks"] == []
+    assert payload["controller_batch_id"] == "batch-1"
+    assert event.metadata["controller_receipt"] is True
+
+
+def test_controller_receipt_queues_until_batch_barrier(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "controller-barrier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        done_tid = kb.create_task(
+            conn,
+            title="done child",
+            assignee="research",
+            controller_batch_id="batch-2",
+        )
+        pending_tid = kb.create_task(
+            conn,
+            title="pending child",
+            assignee="ops",
+            controller_batch_id="batch-2",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=done_tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            source_profile="lingjun",
+            notifier_profile="lingjun",
+            session_key="agent:main:telegram:dm:chat-1",
+            session_id="controller-session-2",
+        )
+        kb.complete_task(conn, done_tid, summary="first done")
+    finally:
+        conn.close()
+
+    import agent.controller_protocol as controller_protocol
+
+    monkeypatch.setattr(
+        controller_protocol,
+        "profile_controller_protocol_enabled",
+        lambda _profile: True,
+    )
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "lingjun"
+    queued = []
+    runner._queue_controller_receipt = lambda sub, content: queued.append(content)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.wake_events == []
+    assert len(queued) == 1
+    payload = __import__("json").loads(queued[0].split("\n", 1)[1])
+    assert payload["remaining_tasks"] == [
+        {
+            "task_id": pending_tid,
+            "status": "ready",
+            "assignee": "ops",
+        }
+    ]
+
+
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
     db_path = tmp_path / "adapter-disconnect.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

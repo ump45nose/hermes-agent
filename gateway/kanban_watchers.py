@@ -24,6 +24,58 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+_CONTROLLER_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+
+
+def _controller_receipt_for_event(
+    *,
+    task: Any,
+    event: Any,
+    batch_tasks: list[Any],
+) -> dict[str, Any]:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    summary = str(
+        payload.get("summary")
+        or (getattr(task, "result", "") if task is not None else "")
+        or ""
+    ).strip()
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = []
+    unresolved = payload.get("unresolved")
+    if not isinstance(unresolved, list):
+        reason = payload.get("reason") or payload.get("error")
+        unresolved = [str(reason)] if reason else []
+    remaining = [
+        {
+            "task_id": item.id,
+            "status": item.status,
+            "assignee": item.assignee or "",
+        }
+        for item in batch_tasks
+        if item.id != getattr(task, "id", "")
+        and item.status not in _CONTROLLER_TERMINAL_STATUSES
+    ]
+    retry_expected = bool(
+        event.kind in {"crashed", "timed_out", "gave_up"}
+        and task is not None
+        and task.status not in _CONTROLLER_TERMINAL_STATUSES
+    )
+    return {
+        "protocol": "kanban-controller@1",
+        "task_id": getattr(task, "id", "") or "",
+        "status": getattr(task, "status", "") or event.kind,
+        "assignee": getattr(task, "assignee", "") or "",
+        "summary": summary,
+        "artifacts": [str(value) for value in artifacts if value],
+        "unresolved": [str(value) for value in unresolved if value],
+        "retry_expected": retry_expected,
+        "remaining_tasks": remaining,
+        "controller_batch_id": (
+            getattr(task, "controller_batch_id", "") or ""
+        ),
+    }
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -276,7 +328,10 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     continue
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
+                                if (
+                                    platform != "session"
+                                    and platform not in active_platforms
+                                ):
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
@@ -293,6 +348,18 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                batch_tasks = []
+                                if task and task.controller_batch_id:
+                                    batch_tasks = [
+                                        item
+                                        for item in _kb.list_tasks(
+                                            conn,
+                                            include_archived=True,
+                                            limit=500,
+                                        )
+                                        if item.controller_batch_id
+                                        == task.controller_batch_id
+                                    ]
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -303,6 +370,7 @@ class GatewayKanbanWatchersMixin:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "batch_tasks": batch_tasks,
                                     "board": slug,
                                 })
                         finally:
@@ -315,6 +383,85 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
+                    source_profile = str(
+                        sub.get("source_profile") or ""
+                    ).strip()
+                    controller_profile = (
+                        source_profile
+                        or str(sub.get("notifier_profile") or "").strip()
+                    )
+                    try:
+                        from agent.controller_protocol import (
+                            profile_controller_protocol_enabled,
+                        )
+
+                        _controller_sub = (
+                            bool(controller_profile)
+                            and profile_controller_protocol_enabled(
+                                controller_profile
+                            )
+                        )
+                    except Exception:
+                        _controller_sub = False
+                    if _controller_sub:
+                        _events = [
+                            event
+                            for event in d["events"]
+                            if event.kind
+                            in {
+                                "completed",
+                                "blocked",
+                                "gave_up",
+                                "crashed",
+                                "timed_out",
+                            }
+                        ]
+                        _receipts = [
+                            _controller_receipt_for_event(
+                                task=d["task"],
+                                event=event,
+                                batch_tasks=d.get("batch_tasks") or [],
+                            )
+                            for event in _events
+                        ]
+                        if _receipts:
+                            try:
+                                await self._deliver_controller_receipts(
+                                    sub=sub,
+                                    receipts=_receipts,
+                                    platform_str=platform_str,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "controller receipt delivery failed for %s: %s",
+                                    sub["task_id"],
+                                    exc,
+                                    exc_info=True,
+                                )
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    d.get("board"),
+                                )
+                                continue
+                        await asyncio.to_thread(
+                            self._kanban_advance,
+                            sub,
+                            d["cursor"],
+                            d.get("board"),
+                        )
+                        if d["task"] and d["task"].status in {
+                            "done",
+                            "archived",
+                        }:
+                            await asyncio.to_thread(
+                                self._kanban_unsub,
+                                sub,
+                                d.get("board"),
+                            )
+                        continue
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
@@ -326,9 +473,6 @@ class GatewayKanbanWatchersMixin:
                         continue
                     owner_profile = str(
                         sub.get("notifier_profile") or ""
-                    ).strip()
-                    source_profile = str(
-                        sub.get("source_profile") or ""
                     ).strip()
                     # Gateway ownership and routed adapter identity are
                     # deliberately separate. A multiplex "default" gateway
@@ -599,6 +743,93 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _deliver_controller_receipts(
+        self,
+        *,
+        sub: dict,
+        receipts: list[dict[str, Any]],
+        platform_str: str,
+    ) -> None:
+        """Queue receipts and wake only when the real batch barrier is clear."""
+        from agent.controller_protocol import encode_controller_receipt
+
+        barrier_index = None
+        for index, receipt in enumerate(receipts):
+            if (
+                not receipt.get("remaining_tasks")
+                and not receipt.get("retry_expected")
+            ):
+                barrier_index = index
+
+        async def _queue(receipt: dict[str, Any]) -> None:
+            await asyncio.to_thread(
+                self._queue_controller_receipt,
+                sub,
+                encode_controller_receipt(receipt),
+            )
+
+        if platform_str == "session" or barrier_index is None:
+            for receipt in receipts:
+                await _queue(receipt)
+            return
+
+        for index, receipt in enumerate(receipts):
+            if index != barrier_index:
+                await _queue(receipt)
+
+        from gateway.config import Platform as _Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        platform = _Platform(platform_str)
+        source_profile = str(sub.get("source_profile") or "").strip()
+        adapter = self._authorization_adapter(
+            platform, source_profile or None
+        )
+        if adapter is None:
+            raise RuntimeError(f"controller adapter unavailable: {platform_str}")
+        source, wake_error = self._kanban_wake_source(sub, platform)
+        if source is None:
+            raise RuntimeError(wake_error)
+        event = MessageEvent(
+            text=encode_controller_receipt(receipts[barrier_index]),
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            metadata={
+                "gateway_session_id": str(sub.get("session_id") or ""),
+                "gateway_session_key": str(sub.get("session_key") or ""),
+                "controller_receipt": True,
+                "controller_batch_id": str(
+                    receipts[barrier_index].get("controller_batch_id") or ""
+                ),
+            },
+        )
+        await adapter.handle_message(event)
+
+    @staticmethod
+    def _queue_controller_receipt(sub: dict, content: str) -> None:
+        """Persist an internal receipt into the exact canonical session."""
+        from hermes_constants import get_canonical_hermes_root, get_profile_home
+        from hermes_state import SessionDB
+
+        profile = str(sub.get("source_profile") or "default")
+        session_id = str(sub.get("session_id") or "")
+        if not session_id:
+            raise RuntimeError("controller subscription missing session_id")
+        home = get_profile_home(
+            profile, root=get_canonical_hermes_root()
+        )
+        db = SessionDB(home / "state.db")
+        try:
+            db.append_message(
+                session_id,
+                "user",
+                content,
+                observed=True,
+            )
+        finally:
+            db.close()
 
     def _kanban_wake_source(self, sub: dict, platform: Any) -> tuple[Any, str]:
         """Resolve and validate the exact originating conversation source.

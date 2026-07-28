@@ -1674,6 +1674,7 @@ def init_agent(
         from hermes_cli.prompt_compiler import (
             infer_model_family,
             load_compiled_prompt,
+            validate_runtime_prompt_protocols,
         )
 
         _compiled = load_compiled_prompt(get_hermes_home())
@@ -1691,6 +1692,21 @@ def init_agent(
                     _created_family,
                     _runtime_family,
                 )
+            _protocol_check = validate_runtime_prompt_protocols(
+                agent._prompt_lock,
+                platform=str(agent.platform or "cli"),
+                runtime_role=str(agent.runtime_role or "interactive"),
+                reachable_toolsets=agent.reachable_toolsets,
+            )
+            agent._prompt_protocol_validation = _protocol_check
+            if not _protocol_check["ok"]:
+                raise RuntimeError(
+                    "compiled prompt protocol requirements unavailable: "
+                    + ", ".join(_protocol_check["missing"])
+                    + f" (surface={_protocol_check['platform']})"
+                )
+    except RuntimeError:
+        raise
     except Exception as exc:
         _ra().logger.warning("could not load compiled profile prompt: %s", exc)
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of

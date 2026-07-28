@@ -607,6 +607,26 @@ export const api = {
   // Profiles
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
+  getProfilePromptCatalog: () =>
+    fetchJSON<{
+      schema_version: number;
+      presets: Array<{
+        id: string;
+        modules: string[];
+        allowed_runtime_overlays: string[];
+      }>;
+      modules: Array<{
+        id: string;
+        version: number;
+        description: string;
+        protocols: string[];
+        required_capabilities: string[];
+        allowed_runtime_overlays: string[];
+      }>;
+      model_families: Array<
+        "generic" | "openai" | "anthropic" | "google"
+      >;
+    }>("/api/profile-prompt-catalog"),
   getActiveProfile: () =>
     fetchJSON<ActiveProfileInfo>("/api/profiles/active"),
   setActiveProfile: (name: string) =>

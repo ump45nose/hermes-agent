@@ -27,7 +27,10 @@ from agent.tool_result_classification import tool_may_have_side_effect
 from agent.prompt_builder import format_steer_marker
 from hermes_cli.prompt_compiler import (
     compile_profile_prompt,
+    extra_modules_from_lock,
     load_compiled_prompt,
+    render_prompt_diff,
+    validate_runtime_prompt_protocols,
     verify_compiled_prompt,
     write_compiled_prompt,
 )
@@ -55,6 +58,81 @@ def test_compiled_prompt_is_fixed_and_verifiable(tmp_path):
     assert verify_compiled_prompt(tmp_path)["ok"]
     assert "Git" not in text
     assert "依赖安装" not in text
+
+
+def test_controller_lock_v2_provisions_protocol_capabilities(tmp_path):
+    lock = write_compiled_prompt(
+        tmp_path,
+        preset="lingjun",
+        model_family="openai",
+    )
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+    assert lock["schema_version"] == 2
+    assert lock["protocols"] == ["kanban-controller@1"]
+    assert lock["runtime_overlays"] == ["platform", "cron"]
+    for surface in ("cli", "telegram", "weixin", "api_server"):
+        assert "kanban" in config["platform_toolsets"][surface]["deferred"]
+    assert verify_compiled_prompt(tmp_path)["ok"]
+
+    runtime = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="interactive",
+        reachable_toolsets={"kanban"},
+    )
+    assert runtime["ok"]
+    assert runtime["protocols"] == ["kanban-controller@1"]
+
+    missing = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="interactive",
+        reachable_toolsets=set(),
+    )
+    assert not missing["ok"]
+    assert missing["missing"] == ["kanban.create", "kanban.roster"]
+
+
+def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path):
+    lock = write_compiled_prompt(tmp_path, preset="research")
+    assert lock["protocols"] == ["research-parent@1"]
+    runtime = validate_runtime_prompt_protocols(
+        lock,
+        platform="cron",
+        runtime_role="cron",
+        reachable_toolsets={"delegation"},
+    )
+    assert runtime["ok"]
+
+    forbidden = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="subagent",
+        reachable_toolsets={"delegation"},
+    )
+    # A generic subagent overlay is not declared by this fixed Profile.
+    assert not forbidden["ok"]
+    assert forbidden["missing"] == ["runtime_overlay:subagent"]
+
+
+def test_prompt_upgrade_preserves_locked_extra_modules_and_shows_config_diff(
+    tmp_path,
+):
+    write_compiled_prompt(
+        tmp_path,
+        preset="lingjun",
+        extra_modules=("citation-rigor",),
+    )
+    loaded = load_compiled_prompt(tmp_path)
+    assert loaded is not None
+    assert extra_modules_from_lock(loaded[1]) == ("citation-rigor",)
+
+    # Simulate an old config which has lost the protocol dependency.
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    diff = render_prompt_diff(tmp_path)
+    assert "config.yaml.new" in diff
+    assert "kanban" in diff
 
 
 def test_fixed_prompt_runtime_shell_carries_capability_version(monkeypatch):

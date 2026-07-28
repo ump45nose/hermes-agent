@@ -14253,6 +14253,14 @@ async def list_profiles_endpoint():
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
 
 
+@app.get("/api/profile-prompt-catalog")
+async def profile_prompt_catalog_endpoint():
+    """Expose the authoritative module registry to the Profile Builder."""
+    from hermes_cli.prompt_compiler import prompt_module_catalog
+
+    return prompt_module_catalog()
+
+
 @app.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
     from hermes_cli import profiles as profiles_mod

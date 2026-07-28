@@ -63,6 +63,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         # worker owns the handoff; children return results through delegation.
         "kanban_show",
         "kanban_list",
+        "kanban_roster",
         "kanban_complete",
         "kanban_block",
         "kanban_heartbeat",

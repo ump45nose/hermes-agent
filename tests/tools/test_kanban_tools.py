@@ -56,16 +56,14 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
-def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
-    """Dispatcher-spawned workers must get lifecycle tools even when the
-    assignee profile restricts enabled toolsets and does not list kanban.
-    """
+def test_unverified_worker_marker_does_not_override_toolset_filter(monkeypatch, tmp_path):
+    """A task id without a verified dispatcher lease must fail closed."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -82,9 +80,9 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
         quiet_mode=True,
     )
     names = {s["function"].get("name") for s in schema if "function" in s}
-    assert "kanban_show" in names
-    assert "kanban_complete" in names
-    assert "kanban_block" in names
+    assert "kanban_show" not in names
+    assert "kanban_complete" not in names
+    assert "kanban_block" not in names
     assert "kanban_list" not in names
 
 
@@ -136,6 +134,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
+        "kanban_roster",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
@@ -1296,7 +1295,7 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
-def test_link_happy_path(worker_env):
+def test_link_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -1304,6 +1303,7 @@ def test_link_happy_path(worker_env):
         b = kb.create_task(conn, title="B", assignee="x")
     finally:
         conn.close()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from tools import kanban_tools as kt
     out = kt._handle_link({"parent_id": a, "child_id": b})
     d = json.loads(out)
@@ -1491,9 +1491,8 @@ def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
     assert "kanban_show()" not in prompt
 
 
-def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
-    """A worker session (HERMES_KANBAN_TASK set) MUST have the full
-    lifecycle guidance in its system prompt."""
+def test_unverified_worker_marker_has_no_worker_prompt(monkeypatch, tmp_path):
+    """A task id without run/lease markers must not inject worker guidance."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1515,15 +1514,7 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
         skip_memory=True,
     )
     prompt = a._build_system_prompt()
-    # Header phrase (identity-free — SOUL.md owns identity, layer 3 is protocol)
-    assert "Kanban task execution protocol" in prompt
-    # Lifecycle signals
-    assert "kanban_show()" in prompt
-    assert "kanban_complete" in prompt
-    assert "kanban_block" in prompt
-    assert "kanban_create" in prompt
-    # Anti-shell guidance
-    assert "Do not shell out" in prompt or "tools — they work" in prompt
+    assert "Kanban task execution protocol" not in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
@@ -1559,8 +1550,8 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
 # kanban_unblock) must refuse to operate
 # on any OTHER task id, even if the caller supplies an explicit `task_id`
 # argument. Workers legitimately call kanban_show / kanban_list /
-# kanban_comment / kanban_create / kanban_link on other tasks, so those
-# are unrestricted.
+# kanban_comment on other tasks, so it is unrestricted. Creation and graph
+# mutation are orchestrator-only and are absent from a verified worker schema.
 #
 # Orchestrator profiles (no HERMES_KANBAN_TASK in env) are intentionally
 # exempt — their job is routing, and they sometimes close out child
@@ -2265,6 +2256,45 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert d["subscribed"] is False, d
 
     assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_controller_cli_session_gets_durable_receipt_subscription(
+    monkeypatch, worker_env,
+):
+    """A fixed Controller CLI/API session queues receipts for next resume."""
+    from agent import controller_protocol
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        controller_protocol,
+        "profile_controller_protocol_enabled",
+        lambda profile: profile == "lingjun",
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="controller child", assignee="peer")
+        tokens = set_session_vars(
+            session_id="cli-session-1",
+            profile="lingjun",
+            gateway_profile="lingjun",
+            async_delivery=False,
+        )
+        try:
+            assert kt._maybe_auto_subscribe(conn, tid) is True
+        finally:
+            clear_session_vars(tokens)
+    finally:
+        conn.close()
+
+    subs = _sub_index(_list_subs_for_task(tid))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "session"
+    assert subs[0]["chat_id"] == "cli-session-1"
+    assert subs[0]["session_key"] == "session:cli-session-1"
+    assert subs[0]["session_id"] == "cli-session-1"
+    assert subs[0]["source_profile"] == "lingjun"
 
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):

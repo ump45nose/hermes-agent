@@ -13,22 +13,37 @@ from typing import Any, Iterable
 import yaml
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MODULES: dict[str, dict[str, Any]] = {
     "core-minimal": {
         "version": 1,
+        "description": "Minimal truthfulness, completion, and safety boundary.",
         "text": (
             "如实区分已观察事实、推断和未知项。完成用户要求的实际结果；"
             "受阻时说明阻塞点，不伪造执行、来源或成功状态。"
         ),
     },
     "controller": {
-        "version": 1,
+        "version": 2,
+        "description": "Own the user goal, route cross-profile work, and judge results.",
         "text": (
-            "你负责理解目标、拆解跨职责工作、选择合适执行者并判断最终结果。"
-            "只有确需跨 Profile 或并行独立工作时才分发；读取全部终态和证据后再汇总。"
+            "你是当前用户会话的控制器，对目标拆解、跨 Profile 调度和最终结果判断负责。\n"
+            "收到任务后：\n"
+            "- 能在当前职责和能力内直接完成的，直接处理。\n"
+            "- 明确属于某个专业能力的，从当前 Profile 能力名册选择执行者并交给 Kanban。\n"
+            "- 目标模糊、跨多个领域或无法可靠选择执行者的，进入 Triage。\n"
+            "- 收到运行时注入的任务结果后，判断它是否满足原目标；不足时补充任务、"
+            "调整执行者或向用户说明阻塞。\n"
+            "- 只有所有相关工作均已结束并获得足够证据后，才综合回答用户。"
         ),
+        "protocols": ["kanban-controller@1"],
+        "required_capabilities": [
+            "kanban.roster",
+            "kanban.create",
+            "kanban.controller_receipt",
+        ],
+        "allowed_runtime_overlays": ["platform", "cron"],
     },
     "direct-action-minimal": {
         "version": 1,
@@ -49,10 +64,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "operations": {
-        "version": 1,
+        "version": 2,
+        "description": "Evidence-led operations diagnosis and authorized delivery.",
         "text": (
-            "先诊断并读取当前运行证据，再实施获授权的变更。"
-            "分别验证配置、进程、链路和业务可见结果。"
+            "你负责运维诊断与获授权的变更：以当前运行证据为准，明确权限和变更边界，"
+            "交付时分别验证配置、进程、实际链路和用户可见结果。"
         ),
     },
     "change-boundaries": {
@@ -63,7 +79,8 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "research-parent": {
-        "version": 3,
+        "version": 4,
+        "description": "Fan out to up to three deep research leaves and synthesize evidence.",
         "text": (
             "你是研究父 Agent：建立独立假设，最多并行三个研究 leaf，"
             "等待全部终态后综合证据、冲突、失败和未解决项。"
@@ -73,6 +90,17 @@ MODULES: dict[str, dict[str, Any]] = {
             "正常综合只使用 leaf 返回的结构化 handoff；Evidence bundle 仅在"
             "某个具体结论、冲突或来源缺失时按需钻取，不整包重复读取。"
         ),
+        "protocols": ["research-parent@1"],
+        "required_capabilities": [
+            "research.delegate",
+            "research.handoff",
+        ],
+        "allowed_runtime_overlays": [
+            "platform",
+            "kanban-worker",
+            "cron",
+            "research-leaf",
+        ],
     },
     "citation-rigor": {
         "version": 1,
@@ -81,10 +109,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "resource-curation": {
-        "version": 1,
+        "version": 2,
+        "description": "Curate and retrieve resources only inside the XP domain.",
         "text": (
-            "你负责隔离范围内的资源整理、检索和复用，不向其他 Agent 分发任务，"
-            "不跨 Profile 发布。"
+            "你只在 XP domain 内整理、检索和复用资源；不向其他 Agent 分发任务，"
+            "不跨 Profile 发布或写入其他职责域。"
         ),
     },
     "active-retrieval": {
@@ -96,6 +125,12 @@ MODULES: dict[str, dict[str, Any]] = {
     },
 }
 
+for _module in MODULES.values():
+    _module.setdefault("description", "")
+    _module.setdefault("protocols", [])
+    _module.setdefault("required_capabilities", [])
+    _module.setdefault("allowed_runtime_overlays", [])
+
 PRESETS: dict[str, tuple[str, ...]] = {
     "default": ("core-minimal",),
     "lingjun": ("core-minimal", "controller", "direct-action-minimal"),
@@ -103,6 +138,15 @@ PRESETS: dict[str, tuple[str, ...]] = {
     "ops": ("core-minimal", "operations", "change-boundaries"),
     "research": ("core-minimal", "research-parent", "citation-rigor"),
     "xp": ("core-minimal", "resource-curation", "active-retrieval"),
+}
+
+PRESET_OVERLAYS: dict[str, tuple[str, ...]] = {
+    "default": ("platform",),
+    "lingjun": ("platform", "cron"),
+    "companion": ("platform", "cron"),
+    "ops": ("platform", "kanban-worker", "cron"),
+    "research": ("platform", "kanban-worker", "cron", "research-leaf"),
+    "xp": ("platform", "kanban-worker", "cron"),
 }
 
 MODEL_ADAPTERS: dict[str, dict[str, Any]] = {
@@ -124,7 +168,22 @@ MODEL_ADAPTERS: dict[str, dict[str, Any]] = {
     },
 }
 
-DEFAULT_OVERLAYS = ("platform", "kanban-worker", "cron", "research-leaf")
+PROTOCOL_SURFACES: dict[str, tuple[str, ...]] = {
+    "kanban-controller@1": ("cli", "telegram", "weixin", "api_server"),
+    "research-parent@1": ("cli", "telegram", "weixin", "api_server", "cron"),
+}
+
+CAPABILITY_TOOLSETS: dict[str, str | None] = {
+    "kanban.roster": "kanban",
+    "kanban.create": "kanban",
+    "kanban.controller_receipt": None,
+    "research.delegate": "delegation",
+    "research.handoff": None,
+}
+
+INTERNAL_PROTOCOL_CAPABILITIES = frozenset(
+    {"kanban.controller_receipt", "research.handoff"}
+)
 
 
 def _sha256_text(text: str) -> str:
@@ -153,7 +212,60 @@ def _module_record(module_id: str) -> dict[str, Any]:
         "version": int(spec["version"]),
         "sha256": _sha256_text(text),
         "text": text,
+        "protocols": list(spec.get("protocols") or []),
+        "required_capabilities": list(spec.get("required_capabilities") or []),
+        "allowed_runtime_overlays": list(
+            spec.get("allowed_runtime_overlays") or []
+        ),
     }
+
+
+def prompt_module_catalog() -> dict[str, Any]:
+    """Return the authoritative registry consumed by CLI and Web Builder."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "presets": [
+            {
+                "id": preset,
+                "modules": list(modules),
+                "allowed_runtime_overlays": list(PRESET_OVERLAYS[preset]),
+            }
+            for preset, modules in PRESETS.items()
+        ],
+        "modules": [
+            {
+                "id": module_id,
+                "version": int(spec["version"]),
+                "description": str(spec.get("description") or ""),
+                "protocols": list(spec.get("protocols") or []),
+                "required_capabilities": list(
+                    spec.get("required_capabilities") or []
+                ),
+                "allowed_runtime_overlays": list(
+                    spec.get("allowed_runtime_overlays") or []
+                ),
+            }
+            for module_id, spec in MODULES.items()
+        ],
+        "model_families": list(MODEL_ADAPTERS),
+    }
+
+
+def extra_modules_from_lock(
+    lock: dict[str, Any],
+    *,
+    preset: str | None = None,
+) -> tuple[str, ...]:
+    """Preserve lock modules not supplied by the selected preset."""
+    preset_id = str(preset or lock.get("preset") or "default")
+    base = set(PRESETS.get(preset_id, ()))
+    return tuple(
+        str(record.get("id"))
+        for record in lock.get("modules") or []
+        if isinstance(record, dict)
+        and record.get("id")
+        and str(record["id"]) not in base
+    )
 
 
 def compile_profile_prompt(
@@ -173,6 +285,37 @@ def compile_profile_prompt(
         if module_id not in module_ids:
             module_ids.append(module_id)
     records = [_module_record(module_id) for module_id in module_ids]
+    protocols = list(
+        dict.fromkeys(
+            protocol
+            for record in records
+            for protocol in record["protocols"]
+        )
+    )
+    required_capabilities = list(
+        dict.fromkeys(
+            capability
+            for record in records
+            for capability in record["required_capabilities"]
+        )
+    )
+    unknown_capabilities = [
+        capability
+        for capability in required_capabilities
+        if capability not in CAPABILITY_TOOLSETS
+    ]
+    if unknown_capabilities:
+        raise ValueError(
+            "prompt modules require unsupported capabilities: "
+            + ", ".join(unknown_capabilities)
+        )
+    protocol_requirements: dict[str, list[str]] = {}
+    for record in records:
+        for protocol in record["protocols"]:
+            values = protocol_requirements.setdefault(protocol, [])
+            for capability in record["required_capabilities"]:
+                if capability not in values:
+                    values.append(capability)
     adapter = MODEL_ADAPTERS[family]
     adapter_text = str(adapter["text"]).strip()
     sections = [record["text"] for record in records] + [adapter_text]
@@ -181,7 +324,17 @@ def compile_profile_prompt(
         "schema_version": SCHEMA_VERSION,
         "preset": preset_id,
         "modules": [
-            {key: record[key] for key in ("id", "version", "sha256")}
+            {
+                key: record[key]
+                for key in (
+                    "id",
+                    "version",
+                    "sha256",
+                    "protocols",
+                    "required_capabilities",
+                    "allowed_runtime_overlays",
+                )
+            }
             for record in records
         ],
         "model_adapter": {
@@ -190,10 +343,186 @@ def compile_profile_prompt(
             "sha256": _sha256_text(adapter_text),
         },
         "compiled_sha256": _sha256_text(compiled),
-        "runtime_overlays": list(DEFAULT_OVERLAYS),
+        "protocols": protocols,
+        "required_capabilities": required_capabilities,
+        "protocol_requirements": protocol_requirements,
+        "protocol_surfaces": {
+            protocol: list(PROTOCOL_SURFACES.get(protocol, ()))
+            for protocol in protocols
+        },
+        "runtime_overlays": list(PRESET_OVERLAYS[preset_id]),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return compiled, lock
+
+
+def _exposure_toolsets(raw: Any) -> set[str]:
+    if isinstance(raw, dict):
+        return {
+            str(value)
+            for group in ("direct", "deferred")
+            for value in (raw.get(group) or [])
+            if value
+        }
+    if isinstance(raw, (list, tuple, set)):
+        return {str(value) for value in raw if value}
+    return set()
+
+
+def _planned_capability_config(
+    config: dict[str, Any],
+    lock: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    import copy
+
+    planned = copy.deepcopy(config)
+    platform_map = planned.setdefault("platform_toolsets", {})
+    if not isinstance(platform_map, dict):
+        raise ValueError("platform_toolsets must be a mapping")
+    changes: list[dict[str, str]] = []
+    for protocol in lock.get("protocols") or []:
+        requirements = (lock.get("protocol_requirements") or {}).get(
+            protocol, lock.get("required_capabilities") or []
+        )
+        for surface in (lock.get("protocol_surfaces") or {}).get(protocol, []):
+            raw = platform_map.get(surface)
+            if isinstance(raw, dict):
+                exposure = raw
+                direct = exposure.setdefault("direct", [])
+                deferred = exposure.setdefault("deferred", [])
+            else:
+                direct = []
+                deferred = list(raw or []) if isinstance(raw, list) else []
+                exposure = {"direct": direct, "deferred": deferred}
+                platform_map[surface] = exposure
+            if not isinstance(direct, list) or not isinstance(deferred, list):
+                raise ValueError(
+                    f"platform_toolsets.{surface} direct/deferred must be lists"
+                )
+            for capability in requirements:
+                toolset = CAPABILITY_TOOLSETS.get(str(capability))
+                if toolset and toolset not in direct and toolset not in deferred:
+                    deferred.append(toolset)
+                    changes.append(
+                        {
+                            "surface": str(surface),
+                            "capability": str(capability),
+                            "toolset": toolset,
+                        }
+                    )
+    return planned, changes
+
+
+def provision_prompt_capabilities(
+    profile_home: str | Path,
+    lock: dict[str, Any],
+    *,
+    write: bool = True,
+) -> dict[str, Any]:
+    path = Path(profile_home) / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError(f"config root must be a mapping: {path}")
+    planned, changes = _planned_capability_config(config, lock)
+    if write and planned != config:
+        path.write_text(
+            yaml.safe_dump(planned, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+    return {"config": planned, "changes": changes}
+
+
+def verify_protocol_capabilities(
+    profile_home: str | Path,
+    lock: dict[str, Any],
+) -> dict[str, Any]:
+    path = Path(profile_home) / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(config, dict):
+        config = {}
+    platform_map = config.get("platform_toolsets") or {}
+    surfaces: dict[str, Any] = {}
+    all_ok = True
+    for protocol in lock.get("protocols") or []:
+        requirements = (lock.get("protocol_requirements") or {}).get(
+            protocol, lock.get("required_capabilities") or []
+        )
+        for surface in (lock.get("protocol_surfaces") or {}).get(protocol, []):
+            available = _exposure_toolsets(
+                platform_map.get(surface) if isinstance(platform_map, dict) else None
+            )
+            missing = []
+            for capability in requirements:
+                toolset = CAPABILITY_TOOLSETS.get(str(capability))
+                if capability in INTERNAL_PROTOCOL_CAPABILITIES:
+                    continue
+                if toolset and toolset not in available:
+                    missing.append(str(capability))
+            key = f"{protocol}:{surface}"
+            surfaces[key] = {
+                "ok": not missing,
+                "missing": missing,
+                "toolsets": sorted(available),
+            }
+            all_ok = all_ok and not missing
+    return {"ok": all_ok, "surfaces": surfaces}
+
+
+def validate_runtime_prompt_protocols(
+    lock: dict[str, Any],
+    *,
+    platform: str,
+    runtime_role: str,
+    reachable_toolsets: Iterable[str],
+) -> dict[str, Any]:
+    """Validate the active runtime surface before an Agent can start."""
+    surface = {
+        "api": "api_server",
+        "api-server": "api_server",
+    }.get(str(platform or "").lower(), str(platform or "").lower())
+    overlay = {
+        "kanban_worker": "kanban-worker",
+        "research_leaf": "research-leaf",
+        "cron": "cron",
+        "subagent": "subagent",
+    }.get(str(runtime_role or "interactive"))
+    allowed_overlays = set(lock.get("runtime_overlays") or [])
+    missing: list[str] = []
+    if "platform" not in allowed_overlays:
+        missing.append("runtime_overlay:platform")
+    if overlay and overlay not in allowed_overlays:
+        missing.append(f"runtime_overlay:{overlay}")
+
+    available = set(reachable_toolsets or [])
+    active_protocols: list[str] = []
+    for protocol in lock.get("protocols") or []:
+        surfaces = set(
+            (lock.get("protocol_surfaces") or {}).get(protocol, [])
+        )
+        if surface not in surfaces:
+            continue
+        active_protocols.append(str(protocol))
+        requirements = (lock.get("protocol_requirements") or {}).get(
+            protocol, lock.get("required_capabilities") or []
+        )
+        for capability in requirements:
+            capability = str(capability)
+            if capability in INTERNAL_PROTOCOL_CAPABILITIES:
+                continue
+            toolset = CAPABILITY_TOOLSETS.get(capability)
+            if toolset and toolset not in available:
+                missing.append(capability)
+    return {
+        "ok": not missing,
+        "platform": surface,
+        "runtime_role": runtime_role,
+        "protocols": active_protocols,
+        "missing": sorted(set(missing)),
+        "reachable_toolsets": sorted(available),
+    }
 
 
 def prompt_paths(profile_home: str | Path) -> tuple[Path, Path]:
@@ -213,6 +542,7 @@ def write_compiled_prompt(
     compiled, lock = compile_profile_prompt(
         preset, extra_modules=extra_modules, model_family=model_family
     )
+    provision_prompt_capabilities(profile_home, lock, write=False)
     system_path.parent.mkdir(parents=True, exist_ok=True)
     system_path.parent.chmod(0o700)
     if backup and (system_path.exists() or lock_path.exists()):
@@ -230,6 +560,7 @@ def write_compiled_prompt(
     )
     os.chmod(system_path, 0o600)
     os.chmod(lock_path, 0o600)
+    provision_prompt_capabilities(profile_home, lock, write=True)
     return lock
 
 
@@ -273,12 +604,41 @@ def verify_compiled_prompt(profile_home: str | Path) -> dict[str, Any]:
     text, lock = loaded
     actual = _sha256_text(text)
     expected = str(lock.get("compiled_sha256") or "")
+    module_checks = []
+    for record in lock.get("modules") or []:
+        module_id = str(record.get("id") or "")
+        try:
+            current = _module_record(module_id)
+        except ValueError:
+            module_checks.append({"id": module_id, "ok": False, "reason": "unknown"})
+            continue
+        module_checks.append(
+            {
+                "id": module_id,
+                "ok": (
+                    int(record.get("version") or 0) == current["version"]
+                    and str(record.get("sha256") or "") == current["sha256"]
+                ),
+                "locked_version": record.get("version"),
+                "registry_version": current["version"],
+            }
+        )
+    protocol_check = verify_protocol_capabilities(profile_home, lock)
+    hash_ok = bool(expected) and actual == expected
+    schema_ok = int(lock.get("schema_version") or 0) == SCHEMA_VERSION
+    modules_ok = all(item["ok"] for item in module_checks)
     return {
-        "ok": bool(expected) and actual == expected,
+        "ok": hash_ok and schema_ok and modules_ok and protocol_check["ok"],
+        "schema_version": lock.get("schema_version"),
+        "schema_ok": schema_ok,
+        "hash_ok": hash_ok,
         "expected": expected,
         "actual": actual,
         "preset": lock.get("preset"),
         "model_family": (lock.get("model_adapter") or {}).get("family"),
+        "modules": module_checks,
+        "protocols": protocol_check,
+        "runtime_overlays": lock.get("runtime_overlays") or [],
     }
 
 
@@ -298,12 +658,17 @@ def render_prompt_diff(
         or (old_lock.get("model_adapter") or {}).get("family")
         or "generic"
     )
-    new_text, _ = compile_profile_prompt(
+    selected_extras = tuple(extra_modules)
+    if not selected_extras:
+        selected_extras = extra_modules_from_lock(
+            old_lock, preset=str(target_preset)
+        )
+    new_text, new_lock = compile_profile_prompt(
         target_preset,
-        extra_modules=extra_modules,
+        extra_modules=selected_extras,
         model_family=target_family,
     )
-    return "".join(
+    prompt_diff = "".join(
         difflib.unified_diff(
             old_text.splitlines(keepends=True),
             new_text.splitlines(keepends=True),
@@ -311,3 +676,21 @@ def render_prompt_diff(
             tofile="prompt/system.md.new",
         )
     )
+    config_path = Path(profile_home) / "config.yaml"
+    old_config_text = (
+        config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    )
+    old_config = yaml.safe_load(old_config_text) or {}
+    planned, _changes = _planned_capability_config(old_config, new_lock)
+    new_config_text = yaml.safe_dump(
+        planned, sort_keys=False, allow_unicode=True
+    )
+    config_diff = "".join(
+        difflib.unified_diff(
+            old_config_text.splitlines(keepends=True),
+            new_config_text.splitlines(keepends=True),
+            fromfile="config.yaml",
+            tofile="config.yaml.new",
+        )
+    )
+    return prompt_diff + config_diff

@@ -5151,7 +5151,37 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                from agent.controller_protocol import (
+                    CONTROLLER_DISPATCH_ACK,
+                    controller_create_call_ids,
+                    controller_dispatch_outcome,
+                    new_controller_batch_id,
+                )
+
+                _controller_call_ids = controller_create_call_ids(
+                    agent, assistant_message
+                )
+                _controller_batch_token = None
+                if _controller_call_ids:
+                    from gateway.session_context import set_controller_batch_id
+
+                    _controller_batch_token = set_controller_batch_id(
+                        new_controller_batch_id(agent)
+                    )
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    if _controller_batch_token is not None:
+                        from gateway.session_context import (
+                            reset_controller_batch_id,
+                        )
+
+                        reset_controller_batch_id(_controller_batch_token)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -5174,6 +5204,28 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                _controller_outcome = controller_dispatch_outcome(
+                    _controller_call_ids, messages
+                )
+                if _controller_outcome.parked:
+                    # Dispatch success is a Harness state transition, not
+                    # another language-model judgment. End this user turn with
+                    # a deterministic acknowledgement; the watcher later
+                    # injects authoritative terminal receipts into this exact
+                    # canonical session.
+                    _turn_exit_reason = "controller_parked"
+                    final_response = CONTROLLER_DISPATCH_ACK
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": final_response,
+                        }
+                    )
+                    agent._controller_parked = True
+                    agent._controller_batch_id = _controller_outcome.batch_id
+                    agent._session_messages = messages
                     break
 
                 # Reset per-turn retry counters after successful tool

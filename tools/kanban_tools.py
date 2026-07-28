@@ -1080,12 +1080,7 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
-    assignee = args.get("assignee")
-    if not assignee:
-        return tool_error(
-            "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
-        )
+    assignee = _normalize_profile(args.get("assignee"))
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1116,6 +1111,52 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    current_profile = (
+        get_session_env("HERMES_SESSION_PROFILE", "")
+        or get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+        or os.environ.get("HERMES_PROFILE", "")
+    )
+    try:
+        from agent.controller_protocol import (
+            profile_controller_protocol_enabled,
+        )
+
+        controller_mode = bool(
+            current_profile
+            and profile_controller_protocol_enabled(current_profile)
+        )
+    except Exception:
+        controller_mode = False
+    if controller_mode:
+        try:
+            from hermes_cli.kanban_decompose import _build_roster
+
+            _roster, valid_assignees = _build_roster()
+        except Exception as exc:
+            return tool_error(f"kanban_create: roster unavailable: {exc}")
+        if not triage and not assignee:
+            return tool_error(
+                "assignee is required unless triage=true; call kanban_roster "
+                "and choose a current profile"
+            )
+        if assignee and assignee not in valid_assignees:
+            return tool_error(
+                f"unknown assignee {assignee!r}; call kanban_roster for current profiles"
+            )
+        if assignee == current_profile:
+            return tool_error(
+                f"controller profile {current_profile!r} cannot recursively assign itself"
+            )
+    elif not assignee:
+        return tool_error(
+            "assignee is required — name the profile that should execute this task"
+        )
+    try:
+        from gateway.session_context import get_controller_batch_id
+
+        controller_batch_id = get_controller_batch_id("") or None
+    except Exception:
+        controller_batch_id = None
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -1158,7 +1199,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=str(assignee) if assignee else None,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1184,6 +1225,7 @@ def _handle_create(args: dict, **kw) -> str:
                     or "worker"
                 ),
                 session_id=session_id,
+                controller_batch_id=controller_batch_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1191,6 +1233,7 @@ def _handle_create(args: dict, **kw) -> str:
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                controller_batch_id=controller_batch_id,
             )
         finally:
             conn.close()
@@ -1199,6 +1242,21 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_roster(args: dict, **kw) -> str:
+    """Return the live, read-only Profile capability roster."""
+    guard = _require_orchestrator_tool("kanban_roster")
+    if guard:
+        return guard
+    try:
+        from hermes_cli.kanban_decompose import _build_roster
+
+        roster, _valid = _build_roster()
+        return _ok(profiles=roster)
+    except Exception as exc:
+        logger.exception("kanban_roster failed")
+        return tool_error(f"kanban_roster: {exc}")
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1231,8 +1289,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **Controller CLI / API**: create a durable ``platform=session``
+      subscription. The watcher queues the structured receipt directly into
+      the canonical session for the next resume.
+
+    - **cron / test / unattached**: no persistent delivery channel, no-op.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
@@ -1250,6 +1311,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     platform = ""
     chat_id = ""
+    session_key = ""
+    pending_session_id = ""
+    pending_profile = ""
     try:
         from gateway.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -1272,19 +1336,46 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+            pending_session_id = (
+                get_session_env("HERMES_SESSION_ID", "")
+                or os.environ.get("HERMES_SESSION_ID", "")
+            )
+            pending_profile = (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+                or os.environ.get("HERMES_PROFILE", "")
+            )
+            if session_key:
+                platform = "tui"
+                chat_id = session_key
+            elif pending_session_id and pending_profile:
+                from agent.controller_protocol import (
+                    profile_controller_protocol_enabled,
+                )
+
+                if not profile_controller_protocol_enabled(pending_profile):
+                    return False
+                platform = "session"
+                chat_id = pending_session_id
+                session_key = f"session:{pending_session_id}"
+            else:
+                return False  # cron / test / unattached
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "")
-        session_key = get_session_env("HERMES_SESSION_KEY", "")
-        session_id = get_session_env("HERMES_SESSION_ID", "")
+        # Preserve the deterministic CLI/API fallback identity established
+        # above. Empty ContextVars must not erase it, otherwise the durable
+        # subscription is silently rejected and the Controller cannot Park.
+        session_key = (
+            get_session_env("HERMES_SESSION_KEY", "") or session_key
+        )
+        session_id = (
+            get_session_env("HERMES_SESSION_ID", "") or pending_session_id
+        )
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
         source_profile = get_session_env("HERMES_SESSION_PROFILE", "") or None
         notifier_profile = get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
-        if platform == "tui":
+        if platform in {"tui", "session"}:
             chat_type = chat_type or "local"
             session_id = session_id or session_key
             notifier_profile = (
@@ -1292,6 +1383,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_PROFILE")
                 or "default"
             )
+        if platform == "session":
+            source_profile = source_profile or pending_profile
         if not notifier_profile:
             return False
         if not chat_type or not session_key or not session_id:
@@ -1350,6 +1443,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
+    guard = _require_orchestrator_tool("kanban_link")
+    if guard:
+        return guard
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1776,10 +1872,9 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Current Profile name that should execute this task. "
+                    "Required unless triage=true; use kanban_roster instead "
+                    "of guessing or hard-coding names."
                 ),
             },
             "body": {
@@ -1912,7 +2007,22 @@ KANBAN_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title"],
+    },
+}
+
+KANBAN_ROSTER_SCHEMA = {
+    "name": "kanban_roster",
+    "description": (
+        "Return the current read-only Profile roster with name and description. "
+        "Use it before assigning specialized work; newly created Profiles appear "
+        "without recompiling the Controller prompt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
     },
 }
 
@@ -2042,11 +2152,20 @@ registry.register(
 )
 
 registry.register(
+    name="kanban_roster",
+    toolset="kanban",
+    schema=KANBAN_ROSTER_SCHEMA,
+    handler=_handle_roster,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="👥",
+)
+
+registry.register(
     name="kanban_create",
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="➕",
 )
 
@@ -2064,6 +2183,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="🔗",
 )

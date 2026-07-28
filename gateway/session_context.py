@@ -100,6 +100,9 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 _SESSION_GATEWAY_PROFILE: ContextVar = ContextVar(
     "HERMES_SESSION_GATEWAY_PROFILE", default=_UNSET
 )
+_CONTROLLER_BATCH_ID: ContextVar = ContextVar(
+    "HERMES_CONTROLLER_BATCH_ID", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -162,6 +165,22 @@ def set_current_session_id(session_id: str) -> None:
 
     os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
+
+
+def set_controller_batch_id(batch_id: str):
+    """Bind one controller dispatch batch around a tool-execution phase."""
+    return _CONTROLLER_BATCH_ID.set(str(batch_id or ""))
+
+
+def reset_controller_batch_id(token) -> None:
+    _CONTROLLER_BATCH_ID.reset(token)
+
+
+def get_controller_batch_id(default: str = "") -> str:
+    value = _CONTROLLER_BATCH_ID.get()
+    if value is _UNSET:
+        return default
+    return str(value or default)
 
 
 def set_session_vars(
