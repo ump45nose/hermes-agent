@@ -276,6 +276,11 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    def get_generation(self) -> int:
+        """Return the current mutation generation under the registry lock."""
+        with self._lock:
+            return self._generation
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})

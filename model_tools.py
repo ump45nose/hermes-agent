@@ -1220,6 +1220,28 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    _research_dedupe_pending: List[Tuple[Any, Dict[str, Any]]] = []
+
+    def _abort_research_dedupe_pending() -> None:
+        if not _research_dedupe_pending:
+            return
+        try:
+            from agent.research_tool_dedupe import (
+                abort_research_leaf_smart_search,
+            )
+        except Exception:
+            _research_dedupe_pending.clear()
+            return
+        while _research_dedupe_pending:
+            decision, _arguments = _research_dedupe_pending.pop()
+            try:
+                abort_research_leaf_smart_search(decision)
+            except Exception as _dedupe_abort_error:
+                logger.debug(
+                    "research SmartSearch dedupe abort failed: %s",
+                    _dedupe_abort_error,
+                )
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
@@ -1328,23 +1350,65 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    from agent.research_tool_dedupe import (
-                        execute_research_leaf_smart_search,
-                    )
+                    # Execution middleware is expected to be single-use, but
+                    # custom/legacy middleware can retry the terminal call.
+                    # Only the last real dispatch may remain pending for the
+                    # final model-visible result; otherwise an exact retry
+                    # waits on its own lease and different retries cache one
+                    # aggregate result under multiple argument keys.
+                    _abort_research_dedupe_pending()
+                    decision = None
+                    try:
+                        from agent.research_tool_dedupe import (
+                            begin_research_leaf_smart_search,
+                        )
 
-                    return execute_research_leaf_smart_search(
-                        runtime_role=runtime_role or "",
-                        session_id=session_id or "",
-                        tool_name=function_name,
-                        arguments=next_args,
-                        invoke=lambda: registry.dispatch(
+                        decision = begin_research_leaf_smart_search(
+                            runtime_role=runtime_role or "",
+                            session_id=session_id or "",
+                            tool_name=function_name,
+                            arguments=next_args,
+                            registry_generation=registry.get_generation(),
+                        )
+                        if decision.duplicate_result is not None:
+                            return decision.duplicate_result
+                    except Exception as _dedupe_begin_error:
+                        # Deduplication is an optimization and must never make
+                        # an otherwise valid retrieval unavailable.
+                        logger.debug(
+                            "research SmartSearch dedupe begin failed: %s",
+                            _dedupe_begin_error,
+                        )
+                        decision = None
+
+                    try:
+                        raw_result = registry.dispatch(
                             function_name, next_args,
                             task_id=task_id,
                             session_id=session_id,
                             runtime_role=runtime_role,
                             user_task=user_task,
-                        ),
-                    )
+                        )
+                        if decision is not None and decision.owner:
+                            _research_dedupe_pending.append(
+                                (decision, dict(next_args))
+                            )
+                        return raw_result
+                    except BaseException:
+                        if decision is not None and decision.owner:
+                            try:
+                                from agent.research_tool_dedupe import (
+                                    abort_research_leaf_smart_search,
+                                )
+
+                                abort_research_leaf_smart_search(decision)
+                            except Exception as _dedupe_abort_error:
+                                logger.debug(
+                                    "research SmartSearch dedupe dispatch abort "
+                                    "failed: %s",
+                                    _dedupe_abort_error,
+                                )
+                        raise
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
@@ -1413,12 +1477,46 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
+        if _research_dedupe_pending:
+            try:
+                from agent.research_tool_dedupe import (
+                    abort_research_leaf_smart_search,
+                    finish_research_leaf_smart_search,
+                )
+
+                pending = list(_research_dedupe_pending)
+                for decision, effective_args in pending:
+                    try:
+                        finish_research_leaf_smart_search(
+                            decision,
+                            result,
+                            effective_args,
+                        )
+                    except Exception as _dedupe_finish_error:
+                        # The model-visible tool result remains authoritative.
+                        # A cache bookkeeping failure only forfeits dedupe.
+                        try:
+                            abort_research_leaf_smart_search(decision)
+                        except Exception:
+                            pass
+                        logger.debug(
+                            "research SmartSearch dedupe finish failed: %s",
+                            _dedupe_finish_error,
+                        )
+            except BaseException:
+                _abort_research_dedupe_pending()
+                raise
+            else:
+                _research_dedupe_pending.clear()
+
         return result
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+    finally:
+        _abort_research_dedupe_pending()
 
 
 # =============================================================================
