@@ -114,6 +114,13 @@ logger = logging.getLogger(__name__)
 
 _MCP_SCHEMA_CACHE_VERSION = 1
 
+# MCP arguments in this map are transport-private. They are never exposed to
+# the model and are populated only from trusted registry dispatch metadata.
+_INTERNAL_MCP_SESSION_ARGUMENTS: Dict[tuple[str, str], str] = {
+    ("smart-search", "smart_research"): "hermes_session_id",
+}
+_SAFE_HERMES_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -4237,6 +4244,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        rpc_args = _prepare_mcp_rpc_arguments(
+            server_name,
+            tool_name,
+            args,
+            session_id=kwargs.get("session_id"),
+        )
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4313,7 +4326,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(
+                        tool_name,
+                        arguments=rpc_args,
+                    )
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
@@ -4903,6 +4919,60 @@ def mcp_prefixed_tool_name(server_name: str, tool_name: str) -> str:
     return f"{MCP_TOOL_NAME_PREFIX}{safe_server}{_MCP_NAME_DELIM}{safe_tool}"
 
 
+def _prepare_mcp_public_parameters(
+    server_name: str,
+    tool_name: str,
+    parameters: dict,
+) -> dict:
+    """Remove transport-private arguments from a model-visible MCP schema."""
+    internal_name = _INTERNAL_MCP_SESSION_ARGUMENTS.get((server_name, tool_name))
+    if not internal_name:
+        return parameters
+
+    public = dict(parameters)
+    properties = public.get("properties")
+    if isinstance(properties, dict):
+        public["properties"] = {
+            name: schema
+            for name, schema in properties.items()
+            if name != internal_name
+        }
+    required = public.get("required")
+    if isinstance(required, list):
+        public_required = [name for name in required if name != internal_name]
+        if public_required:
+            public["required"] = public_required
+        else:
+            public.pop("required", None)
+    return public
+
+
+def _prepare_mcp_rpc_arguments(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+    *,
+    session_id: Any = None,
+) -> dict:
+    """Inject trusted dispatch metadata into selected MCP RPC arguments.
+
+    A model-supplied value for an internal argument is always discarded. Only
+    a short ASCII identifier safe for use as one filesystem path component is
+    forwarded from the registry's trusted ``session_id`` dispatch kwarg.
+    """
+    internal_name = _INTERNAL_MCP_SESSION_ARGUMENTS.get((server_name, tool_name))
+    if not internal_name:
+        return args
+
+    rpc_args = dict(args) if isinstance(args, dict) else {}
+    rpc_args.pop(internal_name, None)
+
+    trusted_session_id = session_id if isinstance(session_id, str) else ""
+    if _SAFE_HERMES_SESSION_ID_RE.fullmatch(trusted_session_id):
+        rpc_args[internal_name] = trusted_session_id
+    return rpc_args
+
+
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     """Convert an MCP tool listing to the Hermes registry schema format.
 
@@ -4915,10 +4985,17 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
         A dict suitable for ``registry.register(schema=...)``.
     """
     prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
+    parameters = _normalize_mcp_input_schema(
+        getattr(mcp_tool, "inputSchema", None)
+    )
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
-        "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
+        "parameters": _prepare_mcp_public_parameters(
+            server_name,
+            mcp_tool.name,
+            parameters,
+        ),
     }
 
 
