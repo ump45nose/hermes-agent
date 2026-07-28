@@ -3231,6 +3231,35 @@ def _connect_attempt_is_current(
         return _server_connect_attempts.get(server_name) is attempt_token
 
 
+def _record_connect_attempt_result(
+    server_name: str,
+    config: dict,
+    attempt_token: object,
+    result: Any,
+) -> None:
+    """Record one discovery result only if its attempt still owns the server."""
+    if isinstance(result, BaseException):
+        message = _format_connect_error(result)
+        with _lock:
+            if _server_connect_attempts.get(server_name) is not attempt_token:
+                return
+            _server_connecting.discard(server_name)
+            _server_connect_errors[server_name] = message
+        command = config.get("command")
+        logger.warning(
+            "Failed to connect to MCP server '%s'%s: %s",
+            server_name,
+            f" (command={command})" if command else "",
+            message,
+        )
+        return
+
+    with _lock:
+        if _server_connect_attempts.get(server_name) is attempt_token:
+            _server_connecting.discard(server_name)
+            _server_connect_errors.pop(server_name, None)
+
+
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
@@ -5932,22 +5961,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             return_exceptions=True,
         )
         for name, result in zip(server_names, results):
-            if isinstance(result, BaseException):
-                command = new_servers.get(name, {}).get("command")
-                message = _format_connect_error(result)
-                with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors[name] = message
-                logger.warning(
-                    "Failed to connect to MCP server '%s'%s: %s",
-                    name,
-                    f" (command={command})" if command else "",
-                    message,
-                )
-            else:
-                with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors.pop(name, None)
+            _record_connect_attempt_result(
+                name,
+                new_servers[name],
+                connection_attempts[name],
+                result,
+            )
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.

@@ -1091,6 +1091,35 @@ class TestLazyMCPConnectionSingleFlight:
             mcp_tool._forget_mcp_tool_server(tool_name)
             self._clear_server_state(mcp_tool, server_name)
 
+    def test_late_stale_result_cannot_clear_newer_attempt_state(self):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = "late-stale-result"
+        old_token = object()
+        new_token = object()
+        self._clear_server_state(mcp_tool, server_name)
+        try:
+            with mcp_tool._lock:
+                mcp_tool._server_connect_attempts[server_name] = new_token
+                mcp_tool._server_connecting.add(server_name)
+                mcp_tool._server_connect_errors.pop(server_name, None)
+
+            mcp_tool._record_connect_attempt_result(
+                server_name,
+                {"command": "stale-command"},
+                old_token,
+                RuntimeError("stale failure"),
+            )
+
+            with mcp_tool._lock:
+                assert (
+                    mcp_tool._server_connect_attempts[server_name] is new_token
+                )
+                assert server_name in mcp_tool._server_connecting
+                assert server_name not in mcp_tool._server_connect_errors
+        finally:
+            self._clear_server_state(mcp_tool, server_name)
+
     def test_live_reconciliation_removes_missing_and_quarantined_cached_tools(
         self,
         monkeypatch,
