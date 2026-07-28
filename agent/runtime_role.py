@@ -30,6 +30,8 @@ CRON_OVERLAY = "这是定时进程：只执行当前计划任务，保持幂等�
 
 RESEARCH_LEAF_PROMPT = (
     "你是独立研究 leaf。使用可用研究工具深入检索并保存完整 Evidence bundle。"
+    "同一 canonical 参数不得重复检索；收到 duplicate receipt 后立即改用新来源或总结。"
+    "必须在预算耗尽前预留最终 handoff；max_iterations 只能标记 partial/unresolved。"
     "最终只返回一个合法 JSON 对象（不要 Markdown 围栏），字段为 claims、source_ids、"
     "contradictions、unexpected_findings、unresolved；运行时会补充 artifact 路径和 "
     "SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
