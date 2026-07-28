@@ -11,8 +11,14 @@ import yaml
 from agent.local_context import LocalContextStore
 from agent.episode_policy import eligible_session, episode_input_messages
 from agent.request_snapshot import capture_request_snapshot
-from agent.runtime_role import resolve_runtime_role
-from agent.tool_context_editor import edit_tool_context
+from agent.runtime_role import resolve_runtime_role, runtime_capability_overlay
+from agent.tool_context_editor import (
+    edit_tool_context,
+    mark_tool_results_consumed,
+    strip_internal_tool_metadata,
+)
+from agent.tool_result_classification import tool_may_have_side_effect
+from agent.prompt_builder import format_steer_marker
 from hermes_cli.prompt_compiler import (
     compile_profile_prompt,
     load_compiled_prompt,
@@ -74,6 +80,24 @@ def test_worker_role_requires_valid_lease(tmp_path, monkeypatch):
     assert not failed.verified
 
 
+def test_research_leaf_runtime_overlay_only_adds_scoped_artifact_reader():
+    direct, deferred = runtime_capability_overlay(
+        "research_leaf",
+        direct=set(),
+        deferred={"web", "smart-search", "tool_artifact"},
+    )
+    assert direct == frozenset({"tool_artifact"})
+    assert deferred == frozenset({"web", "smart-search"})
+
+    interactive_direct, interactive_deferred = runtime_capability_overlay(
+        "interactive",
+        direct=set(),
+        deferred={"web"},
+    )
+    assert interactive_direct == frozenset()
+    assert interactive_deferred == frozenset({"web"})
+
+
 def _assistant(call_id: str, name: str = "web_search"):
     return {
         "role": "assistant",
@@ -118,7 +142,270 @@ def test_tool_editor_preserves_current_and_removes_consumed_duplicate_pair():
     edited, report = edit_tool_context(messages)
     assert all(msg.get("tool_call_id") != "old" for msg in edited)
     assert any(msg.get("tool_call_id") == "new" for msg in edited)
-    assert report[0]["action"] == "remove_pair"
+    assert any(item["action"] == "remove_pair" for item in report)
+
+
+def test_tool_editor_receiptizes_unique_consumed_read_result():
+    messages = [
+        {"role": "user", "content": "search"},
+        _assistant("old"),
+        _tool("old", "unique useful evidence"),
+        {"role": "assistant", "content": "I used that evidence."},
+    ]
+    edited, report = edit_tool_context(messages, phase="readonly")
+    assert len(edited) == len(messages)
+    assert "body cleared" in edited[2]["content"]
+    assert "sha256=" in edited[2]["content"]
+    assert report == [
+        {
+            "tool_call_id": "old",
+            "tool_name": "web_search",
+            "action": "read_receipt",
+            "status": "success",
+            "artifact_ref": None,
+        }
+    ]
+
+
+def test_smart_search_receipt_keeps_source_index_not_result_body():
+    secret = "sk-proj-" + "a" * 30
+    nested = {
+        "ok": True,
+        "query": "RSS readers",
+        "content": "raw evidence body that must be cleared",
+        "sources_count": 2,
+        "providers_used": ["example"],
+        "sources": [
+            {
+                "title": f"Official documentation {secret}",
+                "url": "https://example.test/docs",
+                "provider": "example",
+            },
+            {
+                "title": "Release notes",
+                "url": "https://example.test/releases",
+                "provider": "example",
+            },
+        ],
+    }
+    content = (
+        '<untrusted_tool_result source="mcp__smart_search__smart_search">\n'
+        + json.dumps({"result": json.dumps(nested)})
+        + "\n</untrusted_tool_result>"
+    )
+    message = _tool("rss", content)
+    message["name"] = message["tool_name"] = "mcp__smart_search__smart_search"
+    message["_tool_receipt"].update(
+        {
+            "tool_name": "mcp__smart_search__smart_search",
+            "artifact_ref": "/owner/session/rss.txt",
+        }
+    )
+    edited, report = edit_tool_context(
+        [
+            _assistant("rss", "mcp__smart_search__smart_search"),
+            message,
+            {"role": "assistant", "content": "Evidence recorded."},
+        ],
+        phase="readonly",
+    )
+    receipt = edited[1]["content"]
+    assert "raw evidence body that must be cleared" not in receipt
+    assert "RSS readers" in receipt
+    assert "https://example.test/docs" in receipt
+    assert '"sources_count":2' in receipt
+    assert secret not in receipt
+    assert "/owner/session/rss.txt" in receipt
+    assert len(receipt) < 3_500
+    assert report[0]["action"] == "read_receipt"
+
+
+def test_tool_editor_report_only_reports_read_receipt_without_mutation():
+    messages = [
+        _assistant("old"),
+        _tool("old", "unique useful evidence"),
+        {"role": "assistant", "content": "done"},
+    ]
+    edited, report = edit_tool_context(
+        messages,
+        report_only=True,
+        phase="readonly",
+    )
+    assert edited is messages
+    assert edited[1]["content"] == "unique useful evidence"
+    assert report[0]["action"] == "read_receipt"
+
+
+def test_tool_editor_does_not_receiptize_unconsumed_read_result():
+    message = _tool("old", "not consumed")
+    message["_tool_receipt"]["consumed_turn"] = None
+    edited, report = edit_tool_context(
+        [_assistant("old"), message, {"role": "assistant", "content": "done"}],
+        phase="readonly",
+    )
+    assert edited[1]["content"] == "not consumed"
+    assert report == []
+
+
+def test_tool_editor_does_not_clear_unconsumed_empty_result():
+    message = _tool("old", "", status="empty")
+    message["_tool_receipt"]["consumed_turn"] = None
+    edited, report = edit_tool_context(
+        [_assistant("old"), message, {"role": "assistant", "content": "done"}],
+        phase="active",
+    )
+    assert edited[1]["content"] == ""
+    assert report == []
+
+
+def test_tool_editor_recognizes_real_steer_marker():
+    message = _tool("old", "duplicate" + format_steer_marker("stop now"))
+    message["_tool_receipt"]["steer_present"] = False
+    current = _tool("new", "duplicate" + format_steer_marker("stop now"))
+    current["_tool_receipt"]["consumed_turn"] = None
+    edited, report = edit_tool_context(
+        [
+            _assistant("old"),
+            message,
+            _assistant("new"),
+            current,
+        ],
+        phase="active",
+    )
+    assert edited[1]["content"] == message["content"]
+    assert report == []
+
+
+def test_tool_editor_never_removes_assistant_reasoning_with_pair():
+    assistant = _assistant("old")
+    assistant["reasoning_content"] = "signed/provider reasoning"
+    edited, report = edit_tool_context(
+        [
+            assistant,
+            _tool("old", "", status="empty"),
+            {"role": "assistant", "content": "done"},
+        ],
+        phase="active",
+    )
+    assert edited[0]["reasoning_content"] == "signed/provider reasoning"
+    assert "body removed" in edited[1]["content"]
+    assert report[0]["action"] == "placeholder"
+
+
+def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
+    content = "evidence\n" * 700
+    message = _tool("read-1", content)
+    message["_tool_receipt"]["consumed_turn"] = None
+    mark_tool_results_consumed(
+        [_assistant("read-1"), message],
+        consumed_turn=2,
+        artifact_dir=str(tmp_path / "artifacts"),
+    )
+    receipt = message["_tool_receipt"]
+    assert receipt["consumed_turn"] == 2
+    assert receipt["artifact_ref"]
+    artifact = Path(receipt["artifact_ref"])
+    assert artifact.read_text(encoding="utf-8") == content
+    assert artifact.stat().st_mode & 0o777 == 0o600
+
+
+def test_mark_consumed_updates_session_database_receipt(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("session", source="cli")
+    db.append_message(
+        "session",
+        "tool",
+        "evidence",
+        tool_name="web_search",
+        tool_call_id="read-db",
+        effect_disposition="none",
+        tool_receipt=_tool("read-db", "evidence")["_tool_receipt"],
+    )
+    message = _tool("read-db", "evidence")
+    message["_tool_receipt"]["consumed_turn"] = None
+    mark_tool_results_consumed(
+        [_assistant("read-db"), message],
+        consumed_turn=4,
+        session_db=db,
+        session_id="session",
+    )
+    loaded = db.get_messages_as_conversation("session")
+    assert loaded[0]["_tool_receipt"]["consumed_turn"] == 4
+
+
+def test_smart_search_and_context7_mcp_tools_are_explicitly_read_only():
+    assert not tool_may_have_side_effect("mcp__smart_search__smart_search")
+    assert not tool_may_have_side_effect("mcp__smart_search__smart_fetch")
+    assert not tool_may_have_side_effect("mcp__context7__query_docs")
+    assert tool_may_have_side_effect("mcp__mixed_server__update_record")
+
+
+def test_read_receipt_remains_provider_paired_across_wire_adapters():
+    raw_body = "RSS evidence that must not replay"
+    messages = [
+        {"role": "user", "content": "research"},
+        _assistant("rss-call"),
+        _tool("rss-call", raw_body),
+        {"role": "assistant", "content": "Evidence recorded."},
+    ]
+    edited, _ = edit_tool_context(messages, phase="readonly")
+    strip_internal_tool_metadata(edited)
+
+    from run_agent import AIAgent
+
+    chat = AIAgent._sanitize_api_messages(edited)
+    call_ids = {
+        call["id"]
+        for message in chat
+        for call in (message.get("tool_calls") or [])
+    }
+    result_ids = {
+        message["tool_call_id"]
+        for message in chat
+        if message.get("role") == "tool"
+    }
+    assert call_ids == result_ids == {"rss-call"}
+    assert raw_body not in json.dumps(chat)
+
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    responses = _chat_messages_to_responses_input(chat)
+    response_calls = {
+        item["call_id"]
+        for item in responses
+        if item.get("type") == "function_call"
+    }
+    response_outputs = {
+        item["call_id"]
+        for item in responses
+        if item.get("type") == "function_call_output"
+    }
+    assert response_calls == response_outputs == {"rss-call"}
+
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+
+    _, anthropic = convert_messages_to_anthropic(chat)
+    tool_uses = {
+        block["id"]
+        for message in anthropic
+        for block in (
+            message.get("content")
+            if isinstance(message.get("content"), list)
+            else []
+        )
+        if block.get("type") == "tool_use"
+    }
+    tool_results = {
+        block["tool_use_id"]
+        for message in anthropic
+        for block in (
+            message.get("content")
+            if isinstance(message.get("content"), list)
+            else []
+        )
+        if block.get("type") == "tool_result"
+    }
+    assert tool_uses == tool_results == {"rss-call"}
 
 
 def test_tool_editor_keeps_steer_and_unknown_effect():

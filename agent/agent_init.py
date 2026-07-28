@@ -1245,7 +1245,22 @@ def init_agent(
             else:
                 agent.direct_toolsets = _exposure.direct
                 agent.deferred_toolsets = _exposure.deferred
-                enabled_toolsets = sorted(_exposure.reachable)
+            # Explicit research-leaf process identity grants one schema-small,
+            # session-scoped local reader. This is a runtime capability overlay,
+            # not semantic routing: the handler cannot escape the current
+            # child's owner-only tool artifact directory.
+            from agent.runtime_role import runtime_capability_overlay
+
+            agent.direct_toolsets, agent.deferred_toolsets = (
+                runtime_capability_overlay(
+                    agent.runtime_role,
+                    direct=agent.direct_toolsets,
+                    deferred=agent.deferred_toolsets,
+                )
+            )
+            enabled_toolsets = sorted(
+                set(agent.direct_toolsets) | set(agent.deferred_toolsets)
+            )
             agent.enabled_toolsets = enabled_toolsets
     except ValueError:
         # Invalid V2 configuration is a startup error, not a reason to fall

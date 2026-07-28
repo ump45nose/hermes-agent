@@ -30,8 +30,9 @@ CRON_OVERLAY = "这是定时进程：只执行当前计划任务，保持幂等�
 
 RESEARCH_LEAF_PROMPT = (
     "你是独立研究 leaf。使用可用研究工具深入检索并保存完整 Evidence bundle。"
-    "返回 claims、source_ids、contradictions、unexpected_findings、unresolved "
-    "以及 artifact 路径和 SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
+    "最终只返回一个合法 JSON 对象（不要 Markdown 围栏），字段为 claims、source_ids、"
+    "contradictions、unexpected_findings、unresolved；运行时会补充 artifact 路径和 "
+    "SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
 )
 
 
@@ -40,6 +41,21 @@ class RuntimeRoleResolution:
     role: str
     verified: bool
     reason: str
+
+
+def runtime_capability_overlay(
+    role: str,
+    *,
+    direct: set[str] | frozenset[str],
+    deferred: set[str] | frozenset[str],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Apply process-identity-only capability overlays."""
+    resolved_direct = set(direct)
+    resolved_deferred = set(deferred)
+    if role == "research_leaf":
+        resolved_direct.add("tool_artifact")
+        resolved_deferred.discard("tool_artifact")
+    return frozenset(resolved_direct), frozenset(resolved_deferred)
 
 
 def _verified_worker_from_env() -> RuntimeRoleResolution:

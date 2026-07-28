@@ -214,13 +214,12 @@ class TestUntrustedWrapping:
 class TestMakeToolResultMessage:
     def test_low_risk_message_built_unchanged(self):
         msg = make_tool_result_message("terminal", "ls output", "call_1")
-        assert msg == {
-            "role": "tool",
-            "name": "terminal",
-            "tool_name": "terminal",
-            "content": "ls output",
-            "tool_call_id": "call_1",
-        }
+        assert msg["role"] == "tool"
+        assert msg["name"] == "terminal"
+        assert msg["tool_name"] == "terminal"
+        assert msg["content"] == "ls output"
+        assert msg["tool_call_id"] == "call_1"
+        assert msg["_tool_receipt"]["tool_name"] == "terminal"
 
     def test_effect_disposition_is_internal_message_metadata(self):
         msg = make_tool_result_message(
@@ -239,6 +238,16 @@ class TestMakeToolResultMessage:
             '<untrusted_tool_result source="web_extract">'
         )
         assert SAMPLE_LONG_TEXT in msg["content"]
+
+    def test_mcp_result_redacts_credential_shaped_values_before_history(self):
+        fake = "OPENAI_API_KEY=sk-test-abcdefghijklmnopqrstuvwxyz123456"
+        msg = make_tool_result_message(
+            "mcp__smart_search__smart_doctor",
+            fake,
+            "call_secret",
+        )
+        assert fake not in msg["content"]
+        assert "abcdefghijklmnopqrstuvwxyz123456" not in msg["content"]
 
     def test_high_risk_message_with_multimodal_short_text_unchanged(self):
         content_list = [{"type": "text", "text": "page contents"}]

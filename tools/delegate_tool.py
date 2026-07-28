@@ -1193,6 +1193,7 @@ def _build_child_agent(
                 "browser",
                 "context7",
                 "smart-search",
+                "tool_artifact",
             ]
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [
@@ -1200,6 +1201,12 @@ def _build_child_agent(
             for name in configured_allowlist
             if name in expanded_parent or name in parent_toolsets
         ]
+        # A research leaf receives one runtime-scoped local capability in
+        # addition to inherited retrieval tools. Its handler can only read
+        # owner-only tool-result artifacts under this child's session id; it
+        # cannot read arbitrary files or artifacts owned by another process.
+        if "tool_artifact" not in child_toolsets:
+            child_toolsets.append("tool_artifact")
 
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
@@ -1728,11 +1735,16 @@ def _write_research_evidence_bundle(
     summary: str,
     messages: List[Dict[str, Any]],
     status: str,
-) -> tuple[str, str, str]:
-    """Persist full leaf evidence and return (envelope, path, sha256)."""
+) -> tuple[str, str, str, str, str]:
+    """Persist full evidence plus a bounded parent handoff.
+
+    Returns ``(envelope, evidence_path, evidence_sha256, handoff_path,
+    handoff_sha256)``. The evidence bundle is an audit/drill-down artifact;
+    normal parent synthesis consumes the embedded envelope exactly once.
+    """
     directory = getattr(child, "_research_artifact_dir", None)
     if directory is None:
-        return summary, "", ""
+        return summary, "", "", "", ""
     payload = {
         "goal": goal,
         "status": status,
@@ -1749,33 +1761,118 @@ def _write_research_evidence_bundle(
         parsed = json.loads(summary)
     except (TypeError, ValueError):
         parsed = None
-    if isinstance(parsed, dict):
-        envelope = {
-            "claims": parsed.get("claims") or [],
-            "source_ids": parsed.get("source_ids") or urls,
-            "contradictions": parsed.get("contradictions") or [],
-            "unexpected_findings": parsed.get("unexpected_findings") or [],
-            "unresolved": parsed.get("unresolved") or [],
-        }
+    structured = isinstance(parsed, dict)
+    if structured:
+        claims = parsed.get("claims") or []
+        source_ids = parsed.get("source_ids") or urls
+        contradictions = parsed.get("contradictions") or []
+        unexpected = parsed.get("unexpected_findings") or []
+        unresolved = parsed.get("unresolved") or []
     else:
-        envelope = {
-            "claims": [summary] if summary else [],
-            "source_ids": urls,
-            "contradictions": [],
-            "unexpected_findings": [],
-            "unresolved": [] if status == "completed" else [status],
-        }
-    envelope["artifact_path"] = str(path)
-    envelope["artifact_sha256"] = digest
-    rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-    if len(rendered) > 12000:
-        envelope["claims"] = [
-            str(claim)[:7000] for claim in envelope.get("claims", [])[:1]
+        # A non-compliant Markdown response must not be copied wholesale into
+        # the parent and then read again from the evidence bundle. Extract a
+        # deterministic head/tail set of substantive lines as the handoff.
+        units = [
+            re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line).strip()
+            for line in str(summary or "").splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", "```"))
         ]
-        envelope["unresolved"] = list(envelope.get("unresolved", []))[:20]
+        claims = units[:8]
+        if len(units) > 12:
+            claims.extend(units[-4:])
+        source_ids = urls
+        contradictions = []
+        unexpected = []
+        unresolved = [] if status == "completed" else [status]
+
+    def _bounded_items(
+        value: Any,
+        *,
+        max_items: int,
+        item_cap: int,
+        total_cap: int,
+    ) -> List[Any]:
+        items = value if isinstance(value, list) else ([value] if value else [])
+        result: List[Any] = []
+        used = 0
+        for item in items[:max_items]:
+            rendered_item = json.dumps(
+                item, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+            compact: Any = item
+            if len(rendered_item) > item_cap:
+                compact = rendered_item[: max(0, item_cap - 1)] + "…"
+                rendered_item = json.dumps(compact, ensure_ascii=False)
+            if used + len(rendered_item) > total_cap:
+                break
+            result.append(compact)
+            used += len(rendered_item)
+        return result
+
+    envelope: Dict[str, Any] = {
+        "kind": "research_leaf_handoff",
+        "status": status,
+        "handoff_mode": (
+            "structured_json" if structured else "deterministic_markdown_extract"
+        ),
+        "claims": _bounded_items(
+            claims, max_items=16, item_cap=1_200, total_cap=6_800
+        ),
+        "source_ids": _bounded_items(
+            source_ids, max_items=40, item_cap=420, total_cap=3_600
+        ),
+        "contradictions": _bounded_items(
+            contradictions, max_items=12, item_cap=700, total_cap=2_000
+        ),
+        "unexpected_findings": _bounded_items(
+            unexpected, max_items=12, item_cap=700, total_cap=2_000
+        ),
+        "unresolved": _bounded_items(
+            unresolved, max_items=20, item_cap=700, total_cap=2_000
+        ),
+        "report_chars": len(summary),
+        "evidence_bundle_path": str(path),
+        "evidence_bundle_sha256": digest,
+        "artifact_is_audit_only": True,
+        "audit_read_policy": (
+            "Do not reread the whole evidence bundle during normal synthesis; "
+            "inspect only a specific missing claim, conflict, or source."
+        ),
+    }
+    rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    shrink_order = (
+        "unexpected_findings",
+        "source_ids",
+        "claims",
+        "contradictions",
+        "unresolved",
+    )
+    while len(rendered) > 12_000:
+        changed = False
+        for key in shrink_order:
+            values = envelope.get(key)
+            if isinstance(values, list) and len(values) > 1:
+                values.pop()
+                changed = True
+                break
+        if not changed:
+            break
         rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-        rendered = rendered[:12000]
-    return rendered, str(path), digest
+    if len(rendered) > 12_000:
+        # Metadata caps above make this defensive branch effectively
+        # unreachable, but keep valid JSON rather than slicing a document.
+        envelope["claims"] = envelope["claims"][:1]
+        envelope["source_ids"] = envelope["source_ids"][:3]
+        envelope["contradictions"] = []
+        envelope["unexpected_findings"] = []
+        envelope["unresolved"] = envelope["unresolved"][:3]
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+
+    handoff_path = directory / "handoff.json"
+    handoff_path.write_text(rendered, encoding="utf-8")
+    handoff_path.chmod(0o600)
+    handoff_digest = hashlib.sha256(rendered.encode()).hexdigest()
+    return rendered, str(path), digest, str(handoff_path), handoff_digest
 
 
 def _trim_summary_with_footer(
@@ -2332,8 +2429,16 @@ def _run_single_child(
 
         research_artifact_path = ""
         research_artifact_sha256 = ""
+        research_handoff_path = ""
+        research_handoff_sha256 = ""
         if getattr(child, "runtime_role", "") == "research_leaf":
-            summary, research_artifact_path, research_artifact_sha256 = (
+            (
+                summary,
+                research_artifact_path,
+                research_artifact_sha256,
+                research_handoff_path,
+                research_handoff_sha256,
+            ) = (
                 _write_research_evidence_bundle(
                     child,
                     goal=goal,
@@ -2365,8 +2470,11 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
-            "artifact_path": research_artifact_path or None,
-            "artifact_sha256": research_artifact_sha256 or None,
+            "handoff_path": research_handoff_path or None,
+            "handoff_sha256": research_handoff_sha256 or None,
+            "evidence_bundle_path": research_artifact_path or None,
+            "evidence_bundle_sha256": research_artifact_sha256 or None,
+            "artifact_is_audit_only": bool(research_artifact_path),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.

@@ -220,6 +220,40 @@ def maybe_persist_tool_result(
     )
 
 
+def persist_consumed_tool_result(
+    content: str,
+    tool_use_id: str,
+    *,
+    artifact_dir: str | os.PathLike[str] | None,
+    min_chars: int = 4_096,
+) -> str | None:
+    """Persist an exact result after the model has consumed it once.
+
+    Unlike :func:`maybe_persist_tool_result`, this does not replace or preview
+    the current message.  The first provider request therefore still receives
+    the complete result.  The returned path can be stored in the receipt and
+    used by the next request after the Tool Context Editor clears the body.
+    """
+    if not artifact_dir or len(content) < max(0, int(min_chars)):
+        return None
+    try:
+        local_dir = Path(artifact_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_dir.chmod(0o700)
+        local_path = local_dir / _safe_result_filename(tool_use_id)
+        if not local_path.exists():
+            local_path.write_text(content, encoding="utf-8")
+        local_path.chmod(0o600)
+        return str(local_path)
+    except Exception as exc:
+        logger.warning(
+            "Consumed tool-result artifact write failed for %s: %s",
+            tool_use_id,
+            exc,
+        )
+        return None
+
+
 def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,

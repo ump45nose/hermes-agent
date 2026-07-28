@@ -126,6 +126,15 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_structured_ok_false_is_failure(self):
+        result = json.dumps({"ok": False, "error": "network_error"})
+        is_failure, suffix = _detect_tool_failure(
+            "mcp__smart_search__smart_fetch",
+            result,
+        )
+        assert is_failure is True
+        assert "network_error" in suffix
+
     def test_dict_without_error_or_success_uses_generic_heuristic(self):
         # Plain successful dict — should pass through the generic
         # heuristic which only fires on the string "Error" / '"error"' / etc.

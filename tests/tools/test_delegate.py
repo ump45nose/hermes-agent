@@ -11,6 +11,8 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
+import tempfile
 import threading
 import time
 import types
@@ -2095,6 +2097,40 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             MockAgent.call_args[1]["enabled_toolsets"],
             ["web", "browser"],
         )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_research_leaf_receives_only_scoped_artifact_reader(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent._prompt_lock = {"preset": "research"}
+        parent.enabled_toolsets = ["web"]
+        parent.session_id = "parent-session"
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "run_agent.AIAgent"
+        ) as MockAgent, patch(
+            "hermes_constants.get_hermes_home"
+        ) as get_home:
+            get_home.return_value = Path(tmpdir)
+            mock_child = MagicMock()
+            mock_child.reachable_tool_names = {"web_search", "read_tool_artifact"}
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Research RSS readers",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["runtime_role"], "research_leaf")
+        self.assertIn("web", kwargs["enabled_toolsets"])
+        self.assertIn("tool_artifact", kwargs["enabled_toolsets"])
+        self.assertNotIn("file", kwargs["enabled_toolsets"])
 
 
 class TestChildCredentialLeasing(unittest.TestCase):

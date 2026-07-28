@@ -1298,6 +1298,14 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
 
     # Structured error in JSON result (any tool that surfaces {"error": ...}).
     if isinstance(data, dict):
+        if data.get("ok") is False:
+            err = (
+                data.get("error")
+                or data.get("message")
+                or data.get("status")
+                or "reported ok=false"
+            )
+            return True, f" [{_trim_error(str(err))}]"
         err = data.get("error") or data.get("message")
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
@@ -1506,5 +1514,4 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
 

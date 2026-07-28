@@ -1516,6 +1516,7 @@ def run_conversation(
                     consumed_turn=api_call_count,
                     session_db=getattr(agent, "_session_db", None),
                     session_id=agent.session_id or "",
+                    artifact_dir=str(getattr(agent, "_tool_artifact_dir", "") or ""),
                 )
                 
                 api_duration = time.time() - api_start_time
