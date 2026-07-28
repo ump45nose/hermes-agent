@@ -3,8 +3,9 @@
 
 This command is intentionally separate from the profile/prompt migration.  It
 does not rewrite profiles, prompts, MEMORY.md, AGENTS.md, or remote Mem0 data.
-The dedicated credential is read from the process environment or the root
-``.env`` without printing it.
+The dedicated credential is read from the process environment or the
+owner-only ``secrets/episode.env`` file without printing it.  It is
+intentionally not loaded from the shared root ``.env`` inherited by gateways.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -117,10 +119,19 @@ def _load_dedicated_key(root: Path, env_name: str) -> str:
     value = os.environ.get(env_name, "").strip()
     if value:
         return value
+    secret_path = root / "secrets" / "episode.env"
+    try:
+        secret_stat = secret_path.lstat()
+    except FileNotFoundError:
+        return ""
+    if stat.S_ISLNK(secret_stat.st_mode) or not stat.S_ISREG(secret_stat.st_mode):
+        raise RuntimeError(f"Episode secret file is not a regular file: {secret_path}")
+    if secret_stat.st_mode & 0o077:
+        raise RuntimeError(f"Episode secret file must be owner-only: {secret_path}")
     _install_repo_path()
     from agent.secret_scope import load_env_file
 
-    return str(load_env_file(root / ".env").get(env_name) or "").strip()
+    return str(load_env_file(secret_path).get(env_name) or "").strip()
 
 
 def _request_page(

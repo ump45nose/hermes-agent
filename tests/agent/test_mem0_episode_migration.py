@@ -1,13 +1,54 @@
 import copy
 import json
 import sqlite3
+from pathlib import Path
+
+import pytest
 
 from agent.local_context import LocalContextStore
 from scripts.migrate_mem0_episodes import (
+    _load_dedicated_key,
     _migrate_subject,
     _normalize_remote,
     _record_hash,
 )
+
+
+def _write_episode_secret(root: Path, value: str, mode: int = 0o600) -> Path:
+    path = root / "secrets" / "episode.env"
+    path.parent.mkdir(parents=True)
+    path.write_text(f"MEM0_EPISODES_API_KEY={value}\n", encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+def test_dedicated_key_uses_owner_only_episode_secret(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEM0_EPISODES_API_KEY", raising=False)
+    _write_episode_secret(tmp_path, "dedicated")
+    (tmp_path / ".env").write_text(
+        "MEM0_EPISODES_API_KEY=shared-root\n",
+        encoding="utf-8",
+    )
+
+    assert _load_dedicated_key(tmp_path, "MEM0_EPISODES_API_KEY") == "dedicated"
+
+
+def test_dedicated_key_does_not_fall_back_to_shared_root_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEM0_EPISODES_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "MEM0_EPISODES_API_KEY=shared-root\n",
+        encoding="utf-8",
+    )
+
+    assert _load_dedicated_key(tmp_path, "MEM0_EPISODES_API_KEY") == ""
+
+
+def test_dedicated_key_rejects_group_readable_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEM0_EPISODES_API_KEY", raising=False)
+    _write_episode_secret(tmp_path, "unsafe", mode=0o640)
+
+    with pytest.raises(RuntimeError, match="owner-only"):
+        _load_dedicated_key(tmp_path, "MEM0_EPISODES_API_KEY")
 
 
 def _remote_item(
