@@ -1015,51 +1015,42 @@ def run_conversation(
         # the next turn.
         _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
         try:
-            _canonical_messages = messages
-            _capability_edit_report = []
-            if getattr(agent, "_progressive_disclosure", False):
-                from agent.capability_history import edit_consumed_transients
-
-                api_messages, _capability_edit_report = edit_consumed_transients(
-                    api_messages
-                )
-                _canonical_messages, _canonical_capability_report = (
-                    edit_consumed_transients(messages)
-                )
-                if _canonical_capability_report:
-                    agent._tool_context_canonical_dirty = True
-
             from agent.tool_context_editor import (
-                edit_tool_context,
-                strip_internal_tool_metadata,
+                project_tool_context_for_provider,
             )
-            if _editor_mode != "off":
-                api_messages, _tool_edit_report = edit_tool_context(
+
+            _progressive = getattr(agent, "_progressive_disclosure", False)
+            api_messages, _api_projection_report = (
+                project_tool_context_for_provider(
                     api_messages,
-                    report_only=_editor_mode == "report_only",
-                    phase=(
-                        _editor_mode
-                        if _editor_mode in {"readonly", "failures", "active"}
-                        else "active"
-                    ),
+                    progressive_disclosure=_progressive,
+                    editor_mode=_editor_mode,
                 )
-                _canonical_messages, _canonical_tool_report = edit_tool_context(
-                    _canonical_messages,
-                    report_only=_editor_mode == "report_only",
-                    phase=(
-                        _editor_mode
-                        if _editor_mode in {"readonly", "failures", "active"}
-                        else "active"
-                    ),
+            )
+            _canonical_messages, _canonical_projection_report = (
+                project_tool_context_for_provider(
+                    messages,
+                    progressive_disclosure=_progressive,
+                    editor_mode=_editor_mode,
+                    strip_internal=False,
                 )
-                if _canonical_tool_report and _editor_mode != "report_only":
-                    agent._tool_context_canonical_dirty = True
-                if _tool_edit_report:
-                    request_logger.info(
-                        "Tool Context Editor mode=%s actions=%s",
-                        _editor_mode,
-                        _tool_edit_report,
-                    )
+            )
+            _capability_edit_report = _api_projection_report["capability"]
+            _tool_edit_report = _api_projection_report["tool_context"]
+            if (
+                _canonical_projection_report["capability"]
+                or (
+                    _canonical_projection_report["tool_context"]
+                    and _editor_mode != "report_only"
+                )
+            ):
+                agent._tool_context_canonical_dirty = True
+            if _tool_edit_report:
+                request_logger.info(
+                    "Tool Context Editor mode=%s actions=%s",
+                    _editor_mode,
+                    _tool_edit_report,
+                )
             if _canonical_messages is not messages and (
                 _canonical_messages != messages
             ):
@@ -1074,7 +1065,6 @@ def run_conversation(
                     "Capability transient editor actions=%s",
                     _capability_edit_report,
                 )
-            strip_internal_tool_metadata(api_messages)
         except Exception as exc:
             request_logger.warning("Tool Context Editor skipped: %s", exc)
 

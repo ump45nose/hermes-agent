@@ -261,6 +261,29 @@ def _blocker_receipt_text(
     )
 
 
+def _action_receipt_text(
+    receipt: ToolResultReceipt,
+    *,
+    content: Any,
+) -> str:
+    """Bound a consumed action/unknown result without erasing retry risk."""
+    text = _text(content)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "no textual result",
+    )
+    if len(first_line) > 480:
+        first_line = first_line[:477] + "..."
+    return (
+        "[tool action receipt after consumption: "
+        f"status={receipt.result_status}; effect={receipt.effect}; "
+        f"chars={len(text)}; sha256={digest}; "
+        f"artifact={receipt.artifact_ref or 'none'}; "
+        f"summary={first_line}]"
+    )
+
+
 def _embedded_json_object(text: str) -> dict[str, Any] | None:
     """Decode the first embedded JSON object, including wrapped MCP output."""
     decoder = json.JSONDecoder()
@@ -500,7 +523,6 @@ def edit_tool_context(
                 phase in {"failures", "active"}
                 and receipt.consumed_turn is not None
                 and receipt.result_status == "error"
-                and receipt.effect == "none"
                 and not receipt.steer_present
             ):
                 message["content"] = _blocker_receipt_text(
@@ -518,15 +540,14 @@ def edit_tool_context(
                 )
                 continue
             if (
-                phase == "active"
+                phase in {"failures", "active"}
                 and receipt.consumed_turn is not None
                 and not receipt.steer_present
                 and receipt.effect in {"landed", "unknown"}
             ):
-                message["content"] = (
-                    "[tool action receipt after consumption: "
-                    f"status={receipt.result_status}; effect={receipt.effect}; "
-                    f"artifact={receipt.artifact_ref or 'none'}]"
+                message["content"] = _action_receipt_text(
+                    receipt,
+                    content=message.get("content"),
                 )
                 report.append(
                     {
@@ -570,6 +591,45 @@ def strip_internal_tool_metadata(messages: list[dict[str, Any]]) -> None:
         message.pop("effect_disposition", None)
 
 
+def project_tool_context_for_provider(
+    messages: list[dict[str, Any]],
+    *,
+    progressive_disclosure: bool,
+    editor_mode: str,
+    strip_internal: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, str]]]]:
+    """Apply the canonical pre-provider tool-history projection.
+
+    Every provider-bound path, including forced final summaries, must use this
+    entry point.  Otherwise a side path can resurrect consumed discovery
+    payloads, skip receipts, or leak Hermes-only receipt metadata onto the
+    wire.
+    """
+    projected = [copy.deepcopy(message) for message in messages]
+    capability_report: list[dict[str, str]] = []
+    tool_report: list[dict[str, str]] = []
+    if progressive_disclosure:
+        from agent.capability_history import edit_consumed_transients
+
+        projected, capability_report = edit_consumed_transients(projected)
+    if editor_mode != "off":
+        projected, tool_report = edit_tool_context(
+            projected,
+            report_only=editor_mode == "report_only",
+            phase=(
+                editor_mode
+                if editor_mode in {"readonly", "failures", "active"}
+                else "active"
+            ),
+        )
+    if strip_internal:
+        strip_internal_tool_metadata(projected)
+    return projected, {
+        "capability": capability_report,
+        "tool_context": tool_report,
+    }
+
+
 def mark_tool_results_consumed(
     messages: list[dict[str, Any]],
     *,
@@ -608,7 +668,6 @@ def mark_tool_results_consumed(
             persist_artifacts
             and not receipt.artifact_ref
             and receipt.result_status == "success"
-            and receipt.effect == "none"
             and not receipt.steer_present
             and len(_text(message.get("content"))) > CONSUMED_ARTIFACT_MIN_CHARS
         ):

@@ -2206,6 +2206,11 @@ def init_agent(
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
         working_dir=os.getenv("TERMINAL_CWD") or None,
+        enabled=(
+            agent._context_files_enabled
+            and agent._coding_context
+            and not agent.skip_context_files
+        ),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

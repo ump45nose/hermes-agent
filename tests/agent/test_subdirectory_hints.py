@@ -49,6 +49,32 @@ class TestSubdirectoryHintTracker:
         result = tracker.check_tool_call("read_file", {"path": str(project / "AGENTS.md")})
         assert result is None
 
+    @pytest.mark.parametrize(
+        "context_files,coding_context",
+        [(False, True), (True, False), (False, False)],
+    )
+    def test_profile_governance_disables_all_hint_scanning(
+        self,
+        project,
+        context_files,
+        coding_context,
+    ):
+        tracker = SubdirectoryHintTracker(
+            working_dir=str(project),
+            enabled=context_files and coding_context,
+        )
+        result = tracker.check_tool_call(
+            "terminal",
+            {
+                "command": (
+                    f"cd {project / 'backend'} && "
+                    f"git -C {project / 'backend'} status"
+                )
+            },
+        )
+        assert result is None
+        assert tracker._loaded_dirs == {project.resolve()}
+
     def test_discovers_agents_md_via_ancestor_walk(self, project):
         """Reading backend/src/main.py discovers backend/AGENTS.md via ancestor walk."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
