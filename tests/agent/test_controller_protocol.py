@@ -7,7 +7,9 @@ from agent.controller_protocol import (
     CONTROLLER_RECEIPT_PREFIX,
     controller_create_call_ids,
     controller_dispatch_outcome,
+    controller_tool_policy_block,
     encode_controller_receipt,
+    runtime_protocol_tool_policy_block,
 )
 from gateway.kanban_watchers import _controller_receipt_for_event
 
@@ -16,6 +18,16 @@ def _call(call_id: str, name: str = "kanban_create"):
     return SimpleNamespace(
         id=call_id,
         function=SimpleNamespace(name=name),
+    )
+
+
+def _bridge_call(call_id: str, target: str):
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(
+            name="tool_call",
+            arguments=json.dumps({"name": target, "arguments": {}}),
+        ),
     )
 
 
@@ -74,6 +86,67 @@ def test_controller_does_not_park_on_failed_or_mixed_tool_batch():
     )
     assert not failed.parked
     assert "subscription" in failed.reason
+
+
+def test_controller_recognizes_kanban_create_through_progressive_bridge():
+    assistant = SimpleNamespace(
+        tool_calls=[
+            _bridge_call("c1", "kanban_create"),
+            _bridge_call("c2", "kanban_create"),
+        ]
+    )
+    assert controller_create_call_ids(_agent(), assistant) == ["c1", "c2"]
+
+
+def test_controller_specialist_action_boundary_is_static_and_role_scoped():
+    agent = _agent()
+    agent.runtime_role = "interactive"
+    for tool_name in (
+        "terminal",
+        "web_search",
+        "mcp__github__get_file_contents",
+        "mcp__smart_search__smart_research",
+        "mcp__shared_state__get_resource",
+    ):
+        reason = controller_tool_policy_block(agent, tool_name)
+        assert reason is not None
+        assert "kanban_roster" in reason
+
+    assert controller_tool_policy_block(agent, "kanban_roster") is None
+    assert controller_tool_policy_block(agent, "kanban_create") is None
+    assert controller_tool_policy_block(agent, "mcp__memos__search_memos") is None
+
+    agent.runtime_role = "cron"
+    assert controller_tool_policy_block(agent, "terminal") is None
+
+
+def test_research_parent_must_delegate_source_access_to_leaf():
+    agent = SimpleNamespace(
+        _prompt_lock={"protocols": ["research-parent@1"]},
+        runtime_role="kanban_worker",
+    )
+    for tool_name in (
+        "web_search",
+        "browser_navigate",
+        "mcp__github__get_file_contents",
+        "mcp__smart_search__smart_research",
+    ):
+        protocol, next_tool, reason = runtime_protocol_tool_policy_block(
+            agent, tool_name
+        )
+        assert protocol == "research-parent@1"
+        assert next_tool == "delegate_task"
+        assert "Only research_leaf" in reason
+
+    assert runtime_protocol_tool_policy_block(agent, "delegate_task") is None
+    assert runtime_protocol_tool_policy_block(agent, "kanban_complete") is None
+    agent.runtime_role = "research_leaf"
+    assert (
+        runtime_protocol_tool_policy_block(
+            agent, "mcp__github__get_file_contents"
+        )
+        is None
+    )
 
 
 def test_controller_receipt_uses_live_batch_barrier_and_internal_prefix():

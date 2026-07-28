@@ -67,11 +67,18 @@ def _profile_has_kanban_toolset() -> bool:
         platform_toolsets = cfg.get("platform_toolsets", {}) or {}
         if not isinstance(platform_toolsets, dict):
             return False
-        return any(
-            "kanban" in (toolsets or [])
-            for toolsets in platform_toolsets.values()
-            if isinstance(toolsets, (list, tuple, set))
-        )
+        for surface_config in platform_toolsets.values():
+            if isinstance(surface_config, (list, tuple, set)):
+                if "kanban" in surface_config:
+                    return True
+                continue
+            if not isinstance(surface_config, dict):
+                continue
+            for exposure in ("direct", "deferred"):
+                selected = surface_config.get(exposure, []) or []
+                if isinstance(selected, (list, tuple, set)) and "kanban" in selected:
+                    return True
+        return False
     except Exception:
         return False
 

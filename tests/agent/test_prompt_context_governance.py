@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from agent.local_context import LocalContextStore
@@ -56,7 +57,8 @@ def test_compiled_prompt_is_fixed_and_verifiable(tmp_path):
     assert saved_lock["compiled_sha256"] == hashlib.sha256(text.encode()).hexdigest()
     assert lock["model_adapter"]["family"] == "openai"
     assert verify_compiled_prompt(tmp_path)["ok"]
-    assert "Git" not in text
+    assert "git commit" not in text.lower()
+    assert "编辑代码" not in text
     assert "依赖安装" not in text
 
 
@@ -97,11 +99,21 @@ def test_controller_lock_v2_provisions_protocol_capabilities(tmp_path):
 def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path):
     lock = write_compiled_prompt(tmp_path, preset="research")
     assert lock["protocols"] == ["research-parent@1"]
+    assert "github.read" in lock["required_capabilities"]
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    github = config["mcp_servers"]["github"]
+    include = set(github["tools"]["include"])
+    assert github["enabled"] is True
+    assert "get_file_contents" in include
+    assert "search_repositories" in include
+    assert "create_or_update_file" not in include
+    assert "github" in config["platform_toolsets"]["subagent"]["deferred"]
+    assert "github" in config["delegation"]["research_leaf_toolsets"]
     runtime = validate_runtime_prompt_protocols(
         lock,
         platform="cron",
         runtime_role="cron",
-        reachable_toolsets={"delegation"},
+        reachable_toolsets={"delegation", "github"},
     )
     assert runtime["ok"]
 
@@ -109,7 +121,7 @@ def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path
         lock,
         platform="telegram",
         runtime_role="subagent",
-        reachable_toolsets={"delegation"},
+        reachable_toolsets={"delegation", "github"},
     )
     # A generic subagent overlay is not declared by this fixed Profile.
     assert not forbidden["ok"]
@@ -816,6 +828,60 @@ def test_tool_editor_active_replaces_consumed_side_effect_with_receipt():
     )
     assert "tool action receipt" in edited[1]["content"]
     assert report[0]["action"] == "action_receipt"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "terminal",
+        "mcp__github__search_code",
+        "mcp__mixed_server__unknown_tool",
+    ],
+)
+def test_tool_editor_failures_bounds_every_consumed_unknown_result(tool_name):
+    body = "read result\n" + ("x" * 40_000)
+    message = _tool("old", body)
+    message["name"] = message["tool_name"] = tool_name
+    message["_tool_receipt"].update(
+        {"tool_name": tool_name, "effect": "unknown"}
+    )
+    edited, report = edit_tool_context(
+        [
+            _assistant("old", tool_name),
+            message,
+            {"role": "assistant", "content": "Evidence consumed."},
+        ],
+        phase="failures",
+    )
+    receipt = edited[1]["content"]
+    assert len(receipt) < 900
+    assert "tool action receipt after consumption" in receipt
+    assert "effect=unknown" in receipt
+    assert "chars=40012" in receipt
+    assert "sha256=" in receipt
+    assert "x" * 100 not in receipt
+    assert report[0]["action"] == "action_receipt"
+
+
+def test_tool_editor_bounds_unknown_effect_failure_as_blocker():
+    message = _tool(
+        "failed",
+        "remote mutation status unknown\n" + ("z" * 20_000),
+        status="error",
+    )
+    message["_tool_receipt"]["effect"] = "unknown"
+    edited, report = edit_tool_context(
+        [
+            _assistant("failed", "mcp__mixed__write"),
+            message,
+            {"role": "assistant", "content": "Need operator decision."},
+        ],
+        phase="failures",
+    )
+    assert len(edited[1]["content"]) < 900
+    assert "unresolved tool blocker" in edited[1]["content"]
+    assert "remote mutation status unknown" in edited[1]["content"]
+    assert report[0]["action"] == "blocker_receipt"
 
 
 def test_tool_editor_failures_receiptizes_success_and_drops_superseded_failure():

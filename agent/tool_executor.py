@@ -531,6 +531,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
+        try:
+            from agent.controller_protocol import runtime_protocol_tool_policy_block
+
+            _runtime_policy_block = runtime_protocol_tool_policy_block(
+                agent,
+                function_name,
+            )
+        except Exception:
+            _runtime_policy_block = None
+
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
@@ -544,6 +554,30 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="tool_scope_block",
                 error_message=_ts_scope_block,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _runtime_policy_block is not None:
+            _policy_protocol, _policy_next_tool, _policy_error = (
+                _runtime_policy_block
+            )
+            block_result = json.dumps(
+                {
+                    "error": _policy_error,
+                    "protocol": _policy_protocol,
+                    "required_next_tool": _policy_next_tool,
+                },
+                ensure_ascii=False,
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="runtime_protocol_block",
+                error_message=_policy_error,
                 middleware_trace=list(middleware_trace),
             )
         else:
@@ -1238,6 +1272,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_error_type = "tool_scope_block"
         else:
             try:
+                from agent.controller_protocol import runtime_protocol_tool_policy_block
+
+                _runtime_policy_block = runtime_protocol_tool_policy_block(
+                    agent,
+                    function_name,
+                )
+            except Exception:
+                _runtime_policy_block = None
+            if _runtime_policy_block is not None:
+                (
+                    _block_protocol,
+                    _block_required_next_tool,
+                    _block_msg,
+                ) = _runtime_policy_block
+                _block_error_type = "runtime_protocol_block"
+        if _block_msg is None:
+            try:
                 from hermes_cli.plugins import resolve_pre_tool_block
                 _block_msg = resolve_pre_tool_block(
                     function_name,
@@ -1337,7 +1388,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
-            function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            _block_payload = {"error": _block_msg}
+            if _block_error_type == "runtime_protocol_block":
+                _block_payload.update(
+                    {
+                        "protocol": _block_protocol,
+                        "required_next_tool": _block_required_next_tool,
+                    }
+                )
+            function_result = json.dumps(_block_payload, ensure_ascii=False)
             tool_duration = 0.0
             _emit_terminal_post_tool_call(
                 agent,

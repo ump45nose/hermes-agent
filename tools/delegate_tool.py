@@ -1194,6 +1194,7 @@ def _build_child_agent(
                 "browser",
                 "context7",
                 "smart-search",
+                "github",
                 "tool_artifact",
             ]
         expanded_parent = _expand_parent_toolsets(parent_toolsets)

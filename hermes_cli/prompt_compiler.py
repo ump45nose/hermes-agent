@@ -25,17 +25,24 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "controller": {
-        "version": 2,
+        "version": 3,
         "description": "Own the user goal, route cross-profile work, and judge results.",
         "text": (
             "你是当前用户会话的控制器，对目标拆解、跨 Profile 调度和最终结果判断负责。\n"
             "收到任务后：\n"
-            "- 能在当前职责和能力内直接完成的，直接处理。\n"
-            "- 明确属于某个专业能力的，从当前 Profile 能力名册选择执行者并交给 Kanban。\n"
-            "- 目标模糊、跨多个领域或无法可靠选择执行者的，进入 Triage。\n"
+            "- 只有无需专业取证、无需外部调查或只需整理已有证据的简单任务才直接处理；"
+            "工具可见不等于该工作属于 Controller 职责。\n"
+            "- 任务涉及多个证据域或资料系统、外部多来源调查、代码项目与市场/JD 的"
+            "综合评估，或用户指定专业来源适配器时，必须先调用 kanban_roster，"
+            "再用 kanban_create 交给当前名册中的专业执行者。\n"
+            "- 明确属于某个专业能力的直接指定 assignee；目标模糊、跨多个领域或"
+            "无法可靠选择执行者的，使用 triage=true，不自行猜测完整执行图。\n"
+            "- 用户指定 GitHub MCP、具体数据源或其他访问路径时，这是证据约束；"
+            "不得用本地工作树、搜索摘要或其他来源替代后声称已按指定路径读取。\n"
             "- 收到运行时注入的任务结果后，判断它是否满足原目标；不足时补充任务、"
             "调整执行者或向用户说明阻塞。\n"
-            "- 只有所有相关工作均已结束并获得足够证据后，才综合回答用户。"
+            "- 只有所有相关工作均已结束并获得足够证据后，才综合回答用户；"
+            "不得把样本描述成频率、把未读取对象写成已评估事实，或先编结论再补证据。"
         ),
         "protocols": ["kanban-controller@1"],
         "required_capabilities": [
@@ -79,11 +86,12 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "research-parent": {
-        "version": 4,
+        "version": 6,
         "description": "Fan out to up to three deep research leaves and synthesize evidence.",
         "text": (
-            "你是研究父 Agent：建立独立假设，最多并行三个研究 leaf，"
-            "等待全部终态后综合证据、冲突、失败和未解决项。"
+            "你是研究父 Agent：正常研究任务先拆成三个互补且独立的 leaf，"
+            "立即用 delegate_task 同步并行分发；父进程不直接搜索、抓取或读取"
+            " GitHub 等来源。等待三个 leaf 全部终态后，再综合证据、冲突、失败和未解决项。"
             "分发时不得要求 leaf 自行写文件或指定 Evidence 路径；运行时会自动保存"
             "完整 Evidence bundle。只要求 leaf 返回 claims、source_ids、contradictions、"
             "unexpected_findings、unresolved 五字段 JSON。"
@@ -94,6 +102,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "required_capabilities": [
             "research.delegate",
             "research.handoff",
+            "github.read",
         ],
         "allowed_runtime_overlays": [
             "platform",
@@ -103,9 +112,14 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
     },
     "citation-rigor": {
-        "version": 1,
+        "version": 2,
         "text": (
-            "关键事实必须能追溯到实际读取的来源；区分来源陈述、交叉验证和你的推断。"
+            "关键事实必须能追溯到实际读取的来源；搜索结果只用于发现，必须打开或"
+            "抓取具体来源后才能作为证据。严格遵守用户指定的来源适配器和路径，"
+            "不得用本地副本替代 GitHub MCP 等远端读取后声称已满足要求。"
+            "代码证据记录 owner/repo/ref/path；JD 证据记录 URL、公司、岗位、地点、"
+            "发布日期或抓取日期、当前招聘状态。区分来源陈述、交叉验证、样本范围和"
+            "你的推断；未读取的项目、页面或代码不得评价。"
         ),
     },
     "resource-curation": {
@@ -179,10 +193,40 @@ CAPABILITY_TOOLSETS: dict[str, str | None] = {
     "kanban.controller_receipt": None,
     "research.delegate": "delegation",
     "research.handoff": None,
+    "github.read": "github",
 }
 
 INTERNAL_PROTOCOL_CAPABILITIES = frozenset(
     {"kanban.controller_receipt", "research.handoff"}
+)
+
+READ_ONLY_GITHUB_REMOTE_TOOLS = (
+    "get_commit",
+    "get_file_contents",
+    "get_label",
+    "get_latest_release",
+    "get_me",
+    "get_release_by_tag",
+    "get_tag",
+    "get_team_members",
+    "get_teams",
+    "issue_read",
+    "list_branches",
+    "list_commits",
+    "list_issue_fields",
+    "list_issue_types",
+    "list_issues",
+    "list_pull_requests",
+    "list_releases",
+    "list_repository_collaborators",
+    "list_tags",
+    "pull_request_read",
+    "search_code",
+    "search_commits",
+    "search_issues",
+    "search_pull_requests",
+    "search_repositories",
+    "search_users",
 )
 
 
@@ -410,6 +454,66 @@ def _planned_capability_config(
                             "toolset": toolset,
                         }
                     )
+    required = set(lock.get("required_capabilities") or [])
+    if "github.read" in required:
+        mcp_servers = planned.setdefault("mcp_servers", {})
+        if not isinstance(mcp_servers, dict):
+            raise ValueError("mcp_servers must be a mapping")
+        github = mcp_servers.setdefault(
+            "github",
+            {
+                "url": "https://api.githubcopilot.com/mcp/",
+                "headers": {
+                    "Authorization": "Bearer ${MCP_GITHUB_API_KEY}",
+                },
+                "connect_timeout": 30,
+                "enabled": True,
+            },
+        )
+        if not isinstance(github, dict):
+            raise ValueError("mcp_servers.github must be a mapping")
+        github["enabled"] = True
+        github["tools"] = {
+            "include": list(READ_ONLY_GITHUB_REMOTE_TOOLS),
+        }
+        changes.append(
+            {
+                "surface": "mcp_servers.github",
+                "capability": "github.read",
+                "toolset": "github",
+            }
+        )
+        if "research-leaf" in set(lock.get("runtime_overlays") or []):
+            subagent = platform_map.setdefault(
+                "subagent",
+                {"direct": [], "deferred": []},
+            )
+            if not isinstance(subagent, dict):
+                raise ValueError(
+                    "platform_toolsets.subagent must use direct/deferred mapping"
+                )
+            deferred = subagent.setdefault("deferred", [])
+            if "github" not in deferred:
+                deferred.append("github")
+            delegation = planned.setdefault("delegation", {})
+            if not isinstance(delegation, dict):
+                raise ValueError("delegation must be a mapping")
+            leaf_toolsets = delegation.setdefault(
+                "research_leaf_toolsets",
+                [
+                    "web",
+                    "browser",
+                    "context7",
+                    "smart-search",
+                    "tool_artifact",
+                ],
+            )
+            if not isinstance(leaf_toolsets, list):
+                raise ValueError(
+                    "delegation.research_leaf_toolsets must be a list"
+                )
+            if "github" not in leaf_toolsets:
+                leaf_toolsets.append("github")
     return planned, changes
 
 
@@ -459,6 +563,29 @@ def verify_protocol_capabilities(
                 toolset = CAPABILITY_TOOLSETS.get(str(capability))
                 if capability in INTERNAL_PROTOCOL_CAPABILITIES:
                     continue
+                if capability == "github.read":
+                    github = (
+                        (config.get("mcp_servers") or {}).get("github")
+                        if isinstance(config.get("mcp_servers"), dict)
+                        else None
+                    )
+                    include = (
+                        ((github.get("tools") or {}).get("include") or [])
+                        if isinstance(github, dict)
+                        and isinstance(github.get("tools"), dict)
+                        else []
+                    )
+                    include_set = {str(name) for name in include}
+                    if (
+                        not isinstance(github, dict)
+                        or github.get("enabled") is False
+                        or not include_set
+                        or not include_set.issubset(
+                            set(READ_ONLY_GITHUB_REMOTE_TOOLS)
+                        )
+                    ):
+                        missing.append(str(capability))
+                        continue
                 if toolset and toolset not in available:
                     missing.append(str(capability))
             key = f"{protocol}:{surface}"

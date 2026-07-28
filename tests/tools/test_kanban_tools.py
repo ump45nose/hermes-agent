@@ -144,17 +144,21 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
 
 
 def test_kanban_tools_visible_with_platform_toolsets_config(monkeypatch, tmp_path):
-    """Current platform_toolsets config must satisfy the registry gate."""
+    """Current direct/deferred platform config must satisfy the registry gate."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
         "platform_toolsets:\n"
         "  cli:\n"
-        "    - terminal\n"
-        "    - kanban\n"
+        "    direct: []\n"
+        "    deferred:\n"
+        "      - terminal\n"
+        "      - kanban\n"
         "  telegram:\n"
-        "    - terminal\n",
+        "    direct: []\n"
+        "    deferred:\n"
+        "      - terminal\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -187,6 +191,12 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from gateway.session_context import reset_session_vars
+
+    # This module is also run after gateway/agent suites that intentionally
+    # bind ContextVars. Model the fresh worker process instead of inheriting
+    # a previous test's canonical session id.
+    reset_session_vars()
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -200,7 +210,8 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    return tid
+    yield tid
+    reset_session_vars()
 
 
 def test_show_defaults_to_env_task_id(worker_env):
