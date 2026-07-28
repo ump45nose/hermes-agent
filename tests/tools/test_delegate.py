@@ -2103,7 +2103,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         parent = _make_mock_parent()
         parent._prompt_lock = {"preset": "research"}
         parent.enabled_toolsets = ["web"]
-        parent.session_id = "parent-session"
+        parent.session_id = "../../parent-session"
 
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "run_agent.AIAgent"
@@ -2125,12 +2125,17 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
                 parent_agent=parent,
                 task_count=1,
             )
+            research_artifact_dir = Path(mock_child._research_artifact_dir)
 
         kwargs = MockAgent.call_args[1]
         self.assertEqual(kwargs["runtime_role"], "research_leaf")
         self.assertIn("web", kwargs["enabled_toolsets"])
         self.assertIn("tool_artifact", kwargs["enabled_toolsets"])
         self.assertNotIn("file", kwargs["enabled_toolsets"])
+        research_root = (Path(tmpdir) / "artifacts" / "research").resolve()
+        self.assertTrue(research_artifact_dir.is_relative_to(research_root))
+        self.assertEqual(research_artifact_dir.parent.parent, research_root)
+        self.assertNotIn("..", research_artifact_dir.parent.name)
 
 
 class TestChildCredentialLeasing(unittest.TestCase):

@@ -35,6 +35,8 @@ RESEARCH_LEAF_PROMPT = (
     "SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
 )
 
+TOOL_ARTIFACT_TOOLSET = "tool_artifact"
+
 
 @dataclass(frozen=True)
 class RuntimeRoleResolution:
@@ -53,9 +55,36 @@ def runtime_capability_overlay(
     resolved_direct = set(direct)
     resolved_deferred = set(deferred)
     if role == "research_leaf":
-        resolved_direct.add("tool_artifact")
-        resolved_deferred.discard("tool_artifact")
+        resolved_direct.add(TOOL_ARTIFACT_TOOLSET)
+        resolved_deferred.discard(TOOL_ARTIFACT_TOOLSET)
+    else:
+        resolved_direct.discard(TOOL_ARTIFACT_TOOLSET)
+        resolved_deferred.discard(TOOL_ARTIFACT_TOOLSET)
     return frozenset(resolved_direct), frozenset(resolved_deferred)
+
+
+def scope_runtime_toolsets(
+    role: str,
+    *,
+    enabled: list[str] | None,
+    disabled: list[str] | None,
+) -> tuple[list[str] | None, list[str]]:
+    """Enforce role-scoped toolsets before legacy/default-all resolution."""
+    scoped_disabled = list(disabled or [])
+    if role == "research_leaf":
+        scoped_enabled = None if enabled is None else list(enabled)
+        scoped_disabled = [
+            name for name in scoped_disabled if name != TOOL_ARTIFACT_TOOLSET
+        ]
+    else:
+        scoped_enabled = (
+            None
+            if enabled is None
+            else [name for name in enabled if name != TOOL_ARTIFACT_TOOLSET]
+        )
+        if TOOL_ARTIFACT_TOOLSET not in scoped_disabled:
+            scoped_disabled.append(TOOL_ARTIFACT_TOOLSET)
+    return scoped_enabled, scoped_disabled
 
 
 def _verified_worker_from_env() -> RuntimeRoleResolution:

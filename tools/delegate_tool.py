@@ -1482,14 +1482,16 @@ def _build_child_agent(
                 "research leaf has no reachable research-grade retrieval tools; "
                 "terminal remains unavailable and the leaf was not started"
             )
-        from hermes_constants import get_hermes_home
+        from hermes_constants import contained_session_path, get_hermes_home
 
-        child._research_artifact_dir = (
-            get_hermes_home()
-            / "artifacts"
-            / "research"
-            / str(getattr(parent_agent, "session_id", "session"))
-            / subagent_id
+        _research_root = get_hermes_home() / "artifacts" / "research"
+        _parent_artifact_dir = contained_session_path(
+            _research_root,
+            getattr(parent_agent, "session_id", "session"),
+        )
+        child._research_artifact_dir = contained_session_path(
+            _parent_artifact_dir,
+            subagent_id,
         )
         child._research_artifact_dir.mkdir(parents=True, exist_ok=True)
         child._research_artifact_dir.chmod(0o700)

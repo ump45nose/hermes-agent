@@ -11,7 +11,11 @@ import yaml
 from agent.local_context import LocalContextStore
 from agent.episode_policy import eligible_session, episode_input_messages
 from agent.request_snapshot import capture_request_snapshot
-from agent.runtime_role import resolve_runtime_role, runtime_capability_overlay
+from agent.runtime_role import (
+    resolve_runtime_role,
+    runtime_capability_overlay,
+    scope_runtime_toolsets,
+)
 from agent.tool_context_editor import (
     edit_tool_context,
     mark_tool_results_consumed,
@@ -91,11 +95,39 @@ def test_research_leaf_runtime_overlay_only_adds_scoped_artifact_reader():
 
     interactive_direct, interactive_deferred = runtime_capability_overlay(
         "interactive",
-        direct=set(),
-        deferred={"web"},
+        direct={"tool_artifact"},
+        deferred={"web", "tool_artifact"},
     )
     assert interactive_direct == frozenset()
     assert interactive_deferred == frozenset({"web"})
+
+
+def test_non_research_toolset_scope_removes_artifact_from_default_all_and_explicit():
+    enabled, disabled = scope_runtime_toolsets(
+        "interactive",
+        enabled=None,
+        disabled=[],
+    )
+    assert enabled is None
+    assert disabled == ["tool_artifact"]
+
+    enabled, disabled = scope_runtime_toolsets(
+        "kanban_worker",
+        enabled=["web", "tool_artifact"],
+        disabled=["terminal"],
+    )
+    assert enabled == ["web"]
+    assert disabled == ["terminal", "tool_artifact"]
+
+
+def test_research_toolset_scope_retains_artifact_reader():
+    enabled, disabled = scope_runtime_toolsets(
+        "research_leaf",
+        enabled=["web", "tool_artifact"],
+        disabled=["tool_artifact", "terminal"],
+    )
+    assert enabled == ["web", "tool_artifact"]
+    assert disabled == ["terminal"]
 
 
 def test_research_leaf_spills_large_smart_search_before_first_injection():
@@ -118,6 +150,30 @@ def test_research_leaf_spills_large_smart_search_before_first_injection():
     assert (
         _budget_for_agent(interactive).resolve_threshold(
             "mcp__smart_search__smart_search"
+        )
+        == 100_000
+    )
+
+    readonly_parent = SimpleNamespace(
+        runtime_role="interactive",
+        _tool_context_editor_mode="readonly",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    assert (
+        _budget_for_agent(readonly_parent).resolve_threshold(
+            "mcp__smart_search__smart_fetch"
+        )
+        == 16_000
+    )
+
+    report_only_interactive = SimpleNamespace(
+        runtime_role="interactive",
+        _tool_context_editor_mode="report_only",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    assert (
+        _budget_for_agent(report_only_interactive).resolve_threshold(
+            "mcp__smart_search__smart_fetch"
         )
         == 100_000
     )
@@ -325,6 +381,7 @@ def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
         [_assistant("read-1"), message],
         consumed_turn=2,
         artifact_dir=str(tmp_path / "artifacts"),
+        persist_artifacts=True,
     )
     receipt = message["_tool_receipt"]
     assert receipt["consumed_turn"] == 2
@@ -332,6 +389,24 @@ def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
     artifact = Path(receipt["artifact_ref"])
     assert artifact.read_text(encoding="utf-8") == content
     assert artifact.stat().st_mode & 0o777 == 0o600
+
+
+def test_mark_consumed_does_not_persist_artifact_unless_enabled(tmp_path):
+    content = "interactive evidence\n" * 400
+    message = _tool("read-interactive", content)
+    message["_tool_receipt"]["consumed_turn"] = None
+    artifact_dir = tmp_path / "artifacts"
+
+    mark_tool_results_consumed(
+        [_assistant("read-interactive"), message],
+        consumed_turn=2,
+        artifact_dir=str(artifact_dir),
+    )
+
+    receipt = message["_tool_receipt"]
+    assert receipt["consumed_turn"] == 2
+    assert not receipt["artifact_ref"]
+    assert not artifact_dir.exists()
 
 
 def test_mark_consumed_updates_session_database_receipt(tmp_path):

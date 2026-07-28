@@ -429,11 +429,16 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
-    from agent.runtime_role import resolve_runtime_role
+    from agent.runtime_role import resolve_runtime_role, scope_runtime_toolsets
     _role_resolution = resolve_runtime_role(runtime_role, platform=platform)
     agent.runtime_role = _role_resolution.role
     agent._runtime_role_verified = _role_resolution.verified
     agent._runtime_role_reason = _role_resolution.reason
+    enabled_toolsets, disabled_toolsets = scope_runtime_toolsets(
+        agent.runtime_role,
+        enabled=enabled_toolsets,
+        disabled=disabled_toolsets,
+    )
     if not _role_resolution.verified:
         _ra().logger.warning(
             "runtime role failed closed to %s: %s",
@@ -1356,12 +1361,13 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
-    from hermes_constants import get_hermes_home as _artifact_home
-    agent._tool_artifact_dir = (
-        _artifact_home()
-        / "artifacts"
-        / "tool-results"
-        / str(agent.session_id)
+    from hermes_constants import (
+        contained_session_path,
+        get_hermes_home as _artifact_home,
+    )
+    agent._tool_artifact_dir = contained_session_path(
+        _artifact_home() / "artifacts" / "tool-results",
+        agent.session_id,
     )
 
     # Expose session ID to tools (terminal, execute_code) so agents can

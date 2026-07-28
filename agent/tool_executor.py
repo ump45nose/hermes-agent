@@ -109,10 +109,14 @@ def _budget_for_agent(agent) -> BudgetConfig:
         base = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
         base = DEFAULT_BUDGET
-    if getattr(agent, "runtime_role", "") != "research_leaf":
+    is_research_leaf = getattr(agent, "runtime_role", "") == "research_leaf"
+    is_readonly_parent = (
+        getattr(agent, "_tool_context_editor_mode", "") == "readonly"
+    )
+    if not (is_research_leaf or is_readonly_parent):
         return base
 
-    # Research leaves routinely receive 20-80K SmartSearch JSON documents.
+    # Research agents routinely receive 20-80K SmartSearch JSON documents.
     # Sending every one in full once creates a replay floor of hundreds of
     # thousands of non-cache tokens even when the Context Editor clears it on
     # the next request. Spill large retrieval bodies before first injection;
@@ -1603,6 +1607,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name, function_args, effective_task_id,
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
+                    runtime_role=getattr(agent, "runtime_role", "interactive"),
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     enabled_tools=list(
@@ -1651,6 +1656,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name, function_args, effective_task_id,
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
+                    runtime_role=getattr(agent, "runtime_role", "interactive"),
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     enabled_tools=list(

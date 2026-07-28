@@ -472,6 +472,7 @@ def mark_tool_results_consumed(
     session_db: Any = None,
     session_id: str = "",
     artifact_dir: str | None = None,
+    persist_artifacts: bool = False,
 ) -> None:
     """Mark the latest result batch after a provider accepted its request."""
     current_ids = _current_unconsumed_ids(messages)
@@ -487,7 +488,8 @@ def mark_tool_results_consumed(
             message.get("content")
         )
         if (
-            not receipt.artifact_ref
+            persist_artifacts
+            and not receipt.artifact_ref
             and receipt.result_status == "success"
             and receipt.effect == "none"
             and not receipt.steer_present

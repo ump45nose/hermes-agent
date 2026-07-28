@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+from hermes_constants import contained_session_path, get_hermes_home
 from tools.registry import registry
 
 
@@ -49,8 +49,23 @@ READ_TOOL_ARTIFACT_SCHEMA = {
 }
 
 
-def read_tool_artifact(args: dict[str, Any], *, session_id: str = "", **_: Any) -> str:
+def read_tool_artifact(
+    args: dict[str, Any],
+    *,
+    session_id: str = "",
+    runtime_role: str = "",
+    **_: Any,
+) -> str:
     """Return one bounded slice, restricted to the caller's session directory."""
+    if runtime_role != "research_leaf":
+        return json.dumps(
+            {
+                "ok": False,
+                "error_type": "runtime_scope_violation",
+                "error": "tool artifacts are only available to research leaf processes",
+            },
+            ensure_ascii=False,
+        )
     if not session_id:
         return json.dumps(
             {"ok": False, "error_type": "missing_session", "error": "session id unavailable"},
@@ -73,12 +88,10 @@ def read_tool_artifact(args: dict[str, Any], *, session_id: str = "", **_: Any) 
             ensure_ascii=False,
         )
 
-    session_root = (
-        get_hermes_home()
-        / "artifacts"
-        / "tool-results"
-        / str(session_id)
-    ).resolve()
+    session_root = contained_session_path(
+        get_hermes_home() / "artifacts" / "tool-results",
+        session_id,
+    )
     try:
         candidate = Path(artifact_ref).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
