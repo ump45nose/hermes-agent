@@ -98,6 +98,31 @@ def test_research_leaf_runtime_overlay_only_adds_scoped_artifact_reader():
     assert interactive_deferred == frozenset({"web"})
 
 
+def test_research_leaf_spills_large_smart_search_before_first_injection():
+    from agent.tool_executor import _budget_for_agent
+
+    leaf = SimpleNamespace(
+        runtime_role="research_leaf",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    budget = _budget_for_agent(leaf)
+    assert budget.resolve_threshold("mcp__smart_search__smart_search") == 16_000
+    assert budget.resolve_threshold("mcp__smart_search__smart_fetch") == 16_000
+    assert budget.resolve_threshold("mcp__smart_search__smart_doctor") == 8_000
+    assert budget.preview_size == 4_000
+
+    interactive = SimpleNamespace(
+        runtime_role="interactive",
+        context_compressor=SimpleNamespace(context_length=200_000),
+    )
+    assert (
+        _budget_for_agent(interactive).resolve_threshold(
+            "mcp__smart_search__smart_search"
+        )
+        == 100_000
+    )
+
+
 def _assistant(call_id: str, name: str = "web_search"):
     return {
         "role": "assistant",

@@ -106,9 +106,34 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        base = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
-        return DEFAULT_BUDGET
+        base = DEFAULT_BUDGET
+    if getattr(agent, "runtime_role", "") != "research_leaf":
+        return base
+
+    # Research leaves routinely receive 20-80K SmartSearch JSON documents.
+    # Sending every one in full once creates a replay floor of hundreds of
+    # thousands of non-cache tokens even when the Context Editor clears it on
+    # the next request. Spill large retrieval bodies before first injection;
+    # the leaf gets a useful preview and can page the exact owner-only artifact
+    # through read_tool_artifact. Search depth is preserved, prompt bulk is not.
+    overrides = dict(base.tool_overrides)
+    for name in (
+        "mcp__smart_search__smart_search",
+        "mcp__smart_search__smart_fetch",
+        "mcp__smart_search__smart_research",
+        "mcp__smart_search__smart_map",
+        "mcp__smart_search__read_resource",
+    ):
+        overrides[name] = 16_000
+    overrides["mcp__smart_search__smart_doctor"] = 8_000
+    return BudgetConfig(
+        default_result_size=base.default_result_size,
+        turn_budget=base.turn_budget,
+        preview_size=max(base.preview_size, 4_000),
+        tool_overrides=overrides,
+    )
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
