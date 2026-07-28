@@ -1,12 +1,13 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import model_tools
 import pytest
 from agent import research_tool_dedupe
 from agent.research_tool_dedupe import ResearchToolDeduper
-from tools.registry import registry
+from tools.registry import ToolRegistry
 
 
 TOOL = "mcp__smart_search__smart_fetch"
@@ -493,8 +494,9 @@ def test_duplicate_receipt_is_bounded_and_omits_unrelated_arguments(monkeypatch)
     assert json.loads(receipt)["request"]["question"].endswith("…")
 
 
-def test_registry_generation_refreshes_same_session_and_arguments():
-    tool_name = "mcp__smart_search__dedupe_generation_test"
+def test_tool_generation_refreshes_same_session_and_arguments(monkeypatch):
+    tool_name = "mcp__smart_search__smart_fetch"
+    isolated_registry = ToolRegistry()
     schema = {
         "name": tool_name,
         "description": "Test dynamic SmartSearch entry.",
@@ -506,7 +508,7 @@ def test_registry_generation_refreshes_same_session_and_arguments():
     calls = []
 
     def register_version(version):
-        registry.register(
+        isolated_registry.register(
             name=tool_name,
             toolset="mcp-smart-search-test",
             schema=schema,
@@ -516,39 +518,374 @@ def test_registry_generation_refreshes_same_session_and_arguments():
             ),
         )
 
-    registry.deregister(tool_name)
-    try:
-        register_version(1)
-        first = model_tools.handle_function_call(
-            tool_name,
-            {"query": "same"},
-            session_id="dedupe-registry-generation",
-            runtime_role="research_leaf",
-            skip_pre_tool_call_hook=True,
-            skip_tool_request_middleware=True,
-        )
-        duplicate = model_tools.handle_function_call(
-            tool_name,
-            {"query": "same"},
-            session_id="dedupe-registry-generation",
-            runtime_role="research_leaf",
-            skip_pre_tool_call_hook=True,
-            skip_tool_request_middleware=True,
-        )
-        assert json.loads(first)["version"] == 1
-        assert json.loads(duplicate)["duplicate"] is True
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+    register_version(1)
+    first = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-tool-generation",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    duplicate = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-tool-generation",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    assert json.loads(first)["version"] == 1
+    assert json.loads(duplicate)["duplicate"] is True
 
-        registry.deregister(tool_name)
-        register_version(2)
-        refreshed = model_tools.handle_function_call(
+    isolated_registry.deregister(tool_name)
+    register_version(2)
+    refreshed = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-tool-generation",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    assert json.loads(refreshed)["version"] == 2
+    assert calls == [1, 2]
+
+
+def test_unrelated_registry_mutations_do_not_bust_duplicate(monkeypatch):
+    tool_name = "mcp__smart_search__smart_fetch"
+    unrelated_name = "mcp__other__lazy_registration"
+    isolated_registry = ToolRegistry()
+    calls = []
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search-test",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=lambda _args, **_kwargs: (
+            calls.append(1) or json.dumps({"ok": True, "content": "evidence"})
+        ),
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    first = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-unrelated-mutation",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    target_generation = isolated_registry.get_tool_generation(tool_name)
+    global_generation = isolated_registry.get_generation()
+
+    isolated_registry.register(
+        name=unrelated_name,
+        toolset="mcp-other",
+        schema={"name": unrelated_name, "parameters": {"type": "object"}},
+        handler=lambda _args, **_kwargs: json.dumps({"ok": True}),
+    )
+    isolated_registry.register_toolset_alias("other", "mcp-other")
+    isolated_registry.deregister(unrelated_name)
+
+    assert isolated_registry.get_generation() > global_generation
+    assert isolated_registry.get_tool_generation(tool_name) == target_generation
+
+    duplicate = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-unrelated-mutation",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert json.loads(first)["content"] == "evidence"
+    assert json.loads(duplicate)["duplicate"] is True
+    assert calls == [1]
+
+
+def test_first_lazy_prepare_uses_live_tool_generation(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    tool_name = "mcp__smart_search__smart_research"
+    isolated_registry = ToolRegistry()
+    prepare_calls = []
+    remote_calls = []
+
+    def live_handler(_args, **_kwargs):
+        remote_calls.append(1)
+        return json.dumps({"ok": True, "content": "remote evidence"})
+
+    def ensure_connected(_server_name):
+        prepare_calls.append(1)
+        isolated_registry.register(
+            name=tool_name,
+            toolset="mcp-smart-search",
+            schema={"name": tool_name, "parameters": {"type": "object"}},
+            handler=live_handler,
+        )
+        return SimpleNamespace(
+            session=object(),
+            _tools=[SimpleNamespace(name="smart_research")],
+        )
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "_ensure_lazy_mcp_server_connected",
+        ensure_connected,
+    )
+    monkeypatch.setattr("tools.registry.registry", isolated_registry)
+    lazy_handler = mcp_tool._make_lazy_cached_handler(
+        "smart-search",
+        "smart_research",
+        120,
+    )
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=lazy_handler,
+    )
+    cached_generation = isolated_registry.get_tool_generation(tool_name)
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    first = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-first-lazy-prepare",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    live_generation = isolated_registry.get_tool_generation(tool_name)
+    duplicate = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-first-lazy-prepare",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert live_generation > cached_generation
+    assert json.loads(first)["content"] == "remote evidence"
+    assert json.loads(duplicate)["duplicate"] is True
+    assert prepare_calls == [1]
+    assert remote_calls == [1]
+
+
+def test_lazy_prepare_failure_fails_open_to_real_dispatch(monkeypatch):
+    tool_name = "mcp__smart_search__smart_fetch"
+    isolated_registry = ToolRegistry()
+    dispatch_calls = []
+    prepare_calls = []
+
+    def cached_handler(_args, **_kwargs):
+        dispatch_calls.append(1)
+        return json.dumps({"error": "real lazy dispatch failed"})
+
+    def failed_prepare():
+        prepare_calls.append(1)
+        raise RuntimeError("prepare failed")
+
+    cached_handler._hermes_prepare_for_dispatch = failed_prepare
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search-test",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=cached_handler,
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    first = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-lazy-prepare-failure",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    second = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-lazy-prepare-failure",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert json.loads(first)["error"] == "real lazy dispatch failed"
+    assert json.loads(second)["error"] == "real lazy dispatch failed"
+    assert prepare_calls == [1, 1]
+    assert dispatch_calls == [1, 1]
+
+
+def test_real_lazy_handler_reuses_prepare_failure_without_second_connect(
+    monkeypatch,
+):
+    import tools.mcp_tool as mcp_tool
+
+    tool_name = "mcp__smart_search__smart_research"
+    isolated_registry = ToolRegistry()
+    connect_calls = []
+
+    def failed_connect(_server_name):
+        connect_calls.append(1)
+        return None
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "_ensure_lazy_mcp_server_connected",
+        failed_connect,
+    )
+    lazy_handler = mcp_tool._make_lazy_cached_handler(
+        "smart-search",
+        "smart_research",
+        120,
+    )
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=lazy_handler,
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    result = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-real-lazy-failure-handoff",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert "could not be connected" in json.loads(result)["error"]
+    assert connect_calls == [1]
+
+
+@pytest.mark.parametrize("prepare_result", [None, False])
+def test_lazy_prepare_non_success_bypasses_dedupe(
+    monkeypatch,
+    prepare_result,
+):
+    tool_name = "mcp__smart_search__smart_fetch"
+    isolated_registry = ToolRegistry()
+    dispatch_calls = []
+
+    def cached_handler(_args, **_kwargs):
+        dispatch_calls.append(1)
+        return json.dumps({"ok": True, "content": "uncached result"})
+
+    cached_handler._hermes_prepare_for_dispatch = lambda: prepare_result
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search-test",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=cached_handler,
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    results = [
+        model_tools.handle_function_call(
             tool_name,
             {"query": "same"},
-            session_id="dedupe-registry-generation",
+            session_id=f"dedupe-prepare-{prepare_result!r}",
             runtime_role="research_leaf",
             skip_pre_tool_call_hook=True,
             skip_tool_request_middleware=True,
         )
-        assert json.loads(refreshed)["version"] == 2
-        assert calls == [1, 2]
-    finally:
-        registry.deregister(tool_name)
+        for _ in range(2)
+    ]
+
+    assert all(json.loads(result)["content"] == "uncached result" for result in results)
+    assert dispatch_calls == [1, 1]
+
+
+def test_prepare_hook_runs_without_registry_lock(monkeypatch):
+    tool_name = "mcp__smart_search__smart_fetch"
+    isolated_registry = ToolRegistry()
+    mutation_finished = threading.Event()
+
+    def prepare():
+        def mutate_registry():
+            isolated_registry.register(
+                name="mcp__other__during_prepare",
+                toolset="mcp-other",
+                schema={
+                    "name": "mcp__other__during_prepare",
+                    "parameters": {"type": "object"},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+            )
+            mutation_finished.set()
+
+        thread = threading.Thread(target=mutate_registry)
+        thread.start()
+        assert mutation_finished.wait(timeout=2)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        return False
+
+    def cached_handler(_args, **_kwargs):
+        return json.dumps({"error": "not prepared"})
+
+    cached_handler._hermes_prepare_for_dispatch = prepare
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search-test",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=cached_handler,
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    result = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-prepare-outside-lock",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert mutation_finished.is_set()
+    assert json.loads(result)["error"] == "not prepared"
+
+
+def test_deregister_tombstone_prevents_stale_duplicate(monkeypatch):
+    tool_name = "mcp__smart_search__smart_fetch"
+    isolated_registry = ToolRegistry()
+    isolated_registry.register(
+        name=tool_name,
+        toolset="mcp-smart-search-test",
+        schema={"name": tool_name, "parameters": {"type": "object"}},
+        handler=lambda _args, **_kwargs: json.dumps(
+            {"ok": True, "content": "cached evidence"}
+        ),
+    )
+    monkeypatch.setattr(model_tools, "registry", isolated_registry)
+
+    first = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-deregister-tombstone",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    generation = isolated_registry.get_tool_generation(tool_name)
+    isolated_registry.deregister(tool_name)
+    after_deregister = model_tools.handle_function_call(
+        tool_name,
+        {"query": "same"},
+        session_id="dedupe-deregister-tombstone",
+        runtime_role="research_leaf",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert json.loads(first)["content"] == "cached evidence"
+    assert isolated_registry.get_tool_generation(tool_name) == generation + 1
+    assert "Unknown tool" in json.loads(after_deregister)["error"]
+    assert json.loads(after_deregister).get("duplicate") is not True
