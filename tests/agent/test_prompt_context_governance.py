@@ -57,6 +57,35 @@ def test_compiled_prompt_is_fixed_and_verifiable(tmp_path):
     assert "依赖安装" not in text
 
 
+def test_fixed_prompt_runtime_shell_carries_capability_version(monkeypatch):
+    import agent.system_prompt as system_prompt
+
+    monkeypatch.setattr(
+        system_prompt,
+        "_ra",
+        lambda: SimpleNamespace(load_soul_md=lambda _limit: "SOUL"),
+    )
+    agent = SimpleNamespace(
+        runtime_role="interactive",
+        _progressive_disclosure=True,
+        _compiled_prompt="compiled duties",
+        _prompt_lock={"compiled_sha256": "locked"},
+        platform="telegram",
+        _memory_store=None,
+        _memory_manager=None,
+        _scenario_context="",
+        model="model-a",
+        provider="provider-a",
+    )
+    parts = system_prompt._build_fixed_profile_prompt_parts(agent, None)
+    assert parts["stable"].startswith("Capability-Prompt-Version: 2\n\n")
+    assert "compiled duties" in parts["stable"]
+    assert agent._prompt_source_manifest[0] == {
+        "kind": "capability_protocol",
+        "version": 2,
+    }
+
+
 def _worker_db(path: Path, *, claim: str = "claim", expires: float | None = None):
     with sqlite3.connect(path) as conn:
         conn.execute(
@@ -421,6 +450,36 @@ def test_tool_editor_report_only_reports_read_receipt_without_mutation():
     assert report[0]["action"] == "read_receipt"
 
 
+def test_tool_editor_bounds_unresolved_consumed_failure():
+    messages = [
+        _assistant("old"),
+        _tool("old", "upstream failed\n" + ("x" * 8_000), status="error"),
+        {"role": "assistant", "content": "I need another approach."},
+    ]
+    edited, report = edit_tool_context(messages, phase="failures")
+    assert len(edited[1]["content"]) < 700
+    assert "unresolved tool blocker" in edited[1]["content"]
+    assert "upstream failed" in edited[1]["content"]
+    assert report[0]["action"] == "blocker_receipt"
+
+
+def test_consumed_large_read_is_saved_before_receipt(tmp_path):
+    message = _tool("large", "e" * 16_001, status="success")
+    message["_tool_receipt"]["consumed_turn"] = None
+    messages = [_assistant("large"), message]
+    mark_tool_results_consumed(
+        messages,
+        consumed_turn=7,
+        artifact_dir=str(tmp_path),
+        persist_artifacts=True,
+    )
+    receipt = messages[1]["_tool_receipt"]
+    assert receipt["artifact_ref"]
+    artifact = Path(receipt["artifact_ref"])
+    assert artifact.read_text(encoding="utf-8") == "e" * 16_001
+    assert artifact.stat().st_mode & 0o777 == 0o600
+
+
 def test_tool_editor_does_not_receiptize_unconsumed_read_result():
     message = _tool("old", "not consumed")
     message["_tool_receipt"]["consumed_turn"] = None
@@ -478,7 +537,7 @@ def test_tool_editor_never_removes_assistant_reasoning_with_pair():
 
 
 def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
-    content = "evidence\n" * 700
+    content = "evidence\n" * 2_000
     message = _tool("read-1", content)
     message["_tool_receipt"]["consumed_turn"] = None
     mark_tool_results_consumed(

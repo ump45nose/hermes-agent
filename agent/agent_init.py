@@ -1650,8 +1650,20 @@ def init_agent(
     if not isinstance(_editor_cfg, dict):
         _editor_cfg = {}
     agent._tool_context_editor_mode = str(
-        _editor_cfg.get("mode", "report_only")
+        _editor_cfg.get("mode", "failures")
     ).lower()
+    if agent._tool_context_editor_mode not in {
+        "off",
+        "report_only",
+        "readonly",
+        "failures",
+        "active",
+    }:
+        logger.warning(
+            "Unknown tool_context_editor.mode=%r; using failures",
+            agent._tool_context_editor_mode,
+        )
+        agent._tool_context_editor_mode = "failures"
     if not agent._context_files_enabled:
         agent.skip_context_files = True
         agent.load_soul_identity = True

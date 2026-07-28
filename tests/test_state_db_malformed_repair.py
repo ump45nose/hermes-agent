@@ -356,3 +356,35 @@ def test_select_cached_agent_history_prefers_longer_live_transcript():
     # No live transcript / not a list → no-op.
     assert _select_cached_agent_history(persisted, None) is persisted
     assert _select_cached_agent_history(persisted, "nope") is persisted
+
+
+def test_select_cached_agent_history_never_resurrects_disclosure_payloads():
+    from gateway.run import _select_cached_agent_history
+
+    persisted = [{"role": "user", "content": "find a tool"}]
+    live = [
+        *persisted,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "search-1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "arguments": '{"query":"web"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "search-1",
+            "content": "large transient schema index",
+        },
+        {"role": "assistant", "content": "Use web_search."},
+    ]
+    out = _select_cached_agent_history(persisted, live)
+    assert [row["role"] for row in out] == ["user", "assistant"]
+    assert "large transient" not in str(out)

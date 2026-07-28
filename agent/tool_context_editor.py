@@ -11,6 +11,8 @@ from typing import Any
 
 from agent.tool_result_classification import tool_may_have_side_effect
 
+CONSUMED_ARTIFACT_MIN_CHARS = 16_000
+
 
 @dataclass
 class ToolResultReceipt:
@@ -235,6 +237,28 @@ def _read_receipt_text(
             ]
         )
     return "\n".join(parts)
+
+
+def _blocker_receipt_text(
+    receipt: ToolResultReceipt,
+    *,
+    content: Any,
+) -> str:
+    text = _text(content)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "tool error",
+    )
+    if len(first_line) > 240:
+        first_line = first_line[:237] + "..."
+    return (
+        "[unresolved tool blocker after consumption; "
+        f"status={receipt.result_status}; effect={receipt.effect}; "
+        f"chars={len(text)}; sha256={digest}; "
+        f"artifact={receipt.artifact_ref or 'none'}; "
+        f"summary={first_line}]"
+    )
 
 
 def _embedded_json_object(text: str) -> dict[str, Any] | None:
@@ -473,6 +497,27 @@ def edit_tool_context(
             phase=phase,
         ):
             if (
+                phase in {"failures", "active"}
+                and receipt.consumed_turn is not None
+                and receipt.result_status == "error"
+                and receipt.effect == "none"
+                and not receipt.steer_present
+            ):
+                message["content"] = _blocker_receipt_text(
+                    receipt,
+                    content=message.get("content"),
+                )
+                report.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "action": "blocker_receipt",
+                        "status": receipt.result_status,
+                        "artifact_ref": receipt.artifact_ref,
+                    }
+                )
+                continue
+            if (
                 phase == "active"
                 and receipt.consumed_turn is not None
                 and not receipt.steer_present
@@ -565,6 +610,7 @@ def mark_tool_results_consumed(
             and receipt.result_status == "success"
             and receipt.effect == "none"
             and not receipt.steer_present
+            and len(_text(message.get("content"))) > CONSUMED_ARTIFACT_MIN_CHARS
         ):
             try:
                 from tools.tool_result_storage import persist_consumed_tool_result

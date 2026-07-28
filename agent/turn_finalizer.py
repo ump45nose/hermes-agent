@@ -281,18 +281,52 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
+
+        # The final provider call may have consumed a tool result without a
+        # subsequent API round. Canonicalize once more before persistence so
+        # raw discovery/results cannot survive in Gateway memory or reload from
+        # SQLite on the next user turn.
+        _canonical_dirty = bool(
+            getattr(agent, "_tool_context_canonical_dirty", False)
+        )
+        if getattr(agent, "_progressive_disclosure", False):
+            from agent.capability_history import durable_projection
+
+            _projected = durable_projection(messages)
+            if _projected != messages:
+                _canonical_dirty = True
+            messages = _projected
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
+        if _editor_mode != "off":
+            from agent.tool_context_editor import edit_tool_context
+
+            _edited, _edit_report = edit_tool_context(
+                messages,
+                report_only=_editor_mode == "report_only",
+                phase=(
+                    _editor_mode
+                    if _editor_mode in {"readonly", "failures", "active"}
+                    else "active"
+                ),
+            )
+            if _edit_report and _editor_mode != "report_only":
+                _canonical_dirty = True
+            messages = _edited
+        agent._session_messages = messages
         agent._persist_session(messages, conversation_history)
+
+        # Incremental persistence may already have written the full result
+        # before it was consumed. Rewrite only the active transcript when the
+        # canonical projection changed; archived compaction history stays
+        # untouched and recoverable.
+        _session_db = getattr(agent, "_session_db", None)
+        _replace = getattr(_session_db, "replace_messages", None)
+        if _canonical_dirty and callable(_replace) and agent.session_id:
+            _replace(agent.session_id, messages, active_only=True)
+        agent._tool_context_canonical_dirty = False
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
-
-    # The live API loop may use discovery payloads for this request, but the
-    # continuation returned to gateways/CLI is the same clean projection that
-    # was written durably.
-    if getattr(agent, "_progressive_disclosure", False):
-        from agent.capability_history import durable_projection
-
-        messages = durable_projection(messages)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.

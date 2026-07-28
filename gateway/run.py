@@ -1046,8 +1046,19 @@ def _select_cached_agent_history(
     Returns ``persisted_history`` unchanged unless the live copy is a longer
     list, in which case a copy of the live transcript is returned.
     """
-    if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        return list(live_history)
+    if isinstance(live_history, list):
+        # Cached-agent recovery is a defensive bypass around the durable
+        # transcript. Apply the same progressive-disclosure projection before
+        # preferring it, otherwise raw search/describe payloads can re-enter the
+        # next request even though SQLite was clean.
+        try:
+            from agent.capability_history import durable_projection
+
+            clean_live = durable_projection(live_history)
+        except Exception:
+            clean_live = list(live_history)
+        if len(clean_live) > len(persisted_history):
+            return clean_live
     return persisted_history
 
 

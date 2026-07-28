@@ -1008,10 +1008,27 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Clear already-consumed, provably useless tool bodies before provider
-        # adaptation. Internal receipts never leave the process.
-        _editor_mode = getattr(agent, "_tool_context_editor_mode", "report_only")
+        # Clear capability-disclosure payloads after exactly one successful
+        # provider consumption, then compact ordinary consumed tool results.
+        # Apply the same projection to the canonical live list: editing only
+        # ``api_messages`` lets a cached Gateway resurrect the raw payload on
+        # the next turn.
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
         try:
+            _canonical_messages = messages
+            _capability_edit_report = []
+            if getattr(agent, "_progressive_disclosure", False):
+                from agent.capability_history import edit_consumed_transients
+
+                api_messages, _capability_edit_report = edit_consumed_transients(
+                    api_messages
+                )
+                _canonical_messages, _canonical_capability_report = (
+                    edit_consumed_transients(messages)
+                )
+                if _canonical_capability_report:
+                    agent._tool_context_canonical_dirty = True
+
             from agent.tool_context_editor import (
                 edit_tool_context,
                 strip_internal_tool_metadata,
@@ -1026,12 +1043,37 @@ def run_conversation(
                         else "active"
                     ),
                 )
+                _canonical_messages, _canonical_tool_report = edit_tool_context(
+                    _canonical_messages,
+                    report_only=_editor_mode == "report_only",
+                    phase=(
+                        _editor_mode
+                        if _editor_mode in {"readonly", "failures", "active"}
+                        else "active"
+                    ),
+                )
+                if _canonical_tool_report and _editor_mode != "report_only":
+                    agent._tool_context_canonical_dirty = True
                 if _tool_edit_report:
                     request_logger.info(
                         "Tool Context Editor mode=%s actions=%s",
                         _editor_mode,
                         _tool_edit_report,
                     )
+            if _canonical_messages is not messages and (
+                _canonical_messages != messages
+            ):
+                messages[:] = _canonical_messages
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
+                agent._session_messages = messages
+            if _capability_edit_report:
+                request_logger.info(
+                    "Capability transient editor actions=%s",
+                    _capability_edit_report,
+                )
             strip_internal_tool_metadata(api_messages)
         except Exception as exc:
             request_logger.warning("Tool Context Editor skipped: %s", exc)
@@ -1518,9 +1560,7 @@ def run_conversation(
                     session_id=agent.session_id or "",
                     artifact_dir=str(getattr(agent, "_tool_artifact_dir", "") or ""),
                     persist_artifacts=(
-                        getattr(agent, "runtime_role", "") == "research_leaf"
-                        and _editor_mode
-                        in {"readonly", "failures", "active"}
+                        _editor_mode in {"readonly", "failures", "active"}
                     ),
                 )
                 
