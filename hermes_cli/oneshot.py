@@ -453,8 +453,18 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
-    return (result.get("final_response") or "", result)
+    result: dict = {}
+    response = ""
+    try:
+        result = agent.run_conversation(prompt)
+        # Extract both values before close(): hard teardown clears agent-owned
+        # conversation state and finalizes the SQLite session, but oneshot
+        # still needs the completed result for stdout and --usage-file.
+        response = result.get("final_response") or ""
+    finally:
+        agent.close()
+
+    return response, result
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:
