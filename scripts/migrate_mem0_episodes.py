@@ -26,6 +26,18 @@ MEM0_LIST_URL = "https://api.mem0.ai/v3/memories/"
 DEFAULT_ROOT = Path("/home/hermes/.hermes")
 PAGE_SIZE = 100
 MAX_REMOTE_RECORDS_PER_SUBJECT = 10_000
+EPISODE_BODY_FIELDS = (
+    "title",
+    "goal",
+    "context",
+    "actions",
+    "decisions",
+    "outcome",
+    "summary",
+    "artifacts",
+    "open_loops",
+    "reusable_lesson",
+)
 
 
 def _install_repo_path() -> None:
@@ -50,20 +62,23 @@ def _sha256(value: str) -> str:
 
 def _record_hash(record: dict[str, Any]) -> str:
     metadata = record["metadata"]
-    stable_metadata = {
-        key: metadata.get(key)
-        for key in (
-            "memory_kind",
-            "schema_version",
-            "source",
-            "profile",
-            "subject_id",
-            "source_session_id",
-            "source_hash",
-            "outcome",
-        )
-        if metadata.get(key) is not None
-    }
+    stable_metadata: dict[str, Any] = {}
+    for key in (
+        "memory_kind",
+        "schema_version",
+        "source",
+        "profile",
+        "subject_id",
+        "source_session_id",
+        "source_hash",
+        "outcome",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            # Mem0 currently serializes numeric metadata values as strings.
+            # Normalize both local and remote representations so schema_version
+            # 2 and "2" do not become a false body conflict.
+            stable_metadata[key] = str(value)
     return _sha256(
         _canonical_json(
             {
@@ -201,13 +216,16 @@ def _normalize_remote(
     if metadata.get("memory_kind") != "episode":
         return None, None
     source_hash = str(metadata.get("source_hash") or "").strip()
-    run_id = str(
-        item.get("run_id")
-        or metadata.get("run_id")
-        or item.get("id")
-        or ""
-    ).strip()
     profile = str(metadata.get("profile") or "").strip()
+    source_session_id = str(metadata.get("source_session_id") or "").strip()
+    run_id = str(item.get("run_id") or metadata.get("run_id") or "").strip()
+    if not run_id and source_session_id and profile:
+        # Mem0's list endpoint does not currently echo the request run_id.
+        # Reconstruct the canonical id from metadata written by Episode sync
+        # before falling back to the remote memory UUID.
+        run_id = f"hermes:{subject_id}:{profile}:{source_session_id}"
+    if not run_id:
+        run_id = str(item.get("id") or "").strip()
     if not source_hash:
         return None, "missing_source_hash"
     if not run_id:
@@ -217,6 +235,22 @@ def _normalize_remote(
     body = item.get("memory")
     if not isinstance(body, str):
         body = _canonical_json(body)
+    else:
+        try:
+            decoded_body = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded_body = None
+        if isinstance(decoded_body, dict):
+            # The shadow payload adds episode_schema_version for the remote API;
+            # the canonical local row stores only Episode content fields.
+            body = json.dumps(
+                {
+                    key: decoded_body.get(key)
+                    for key in EPISODE_BODY_FIELDS
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
     record = {
         "remote_id": str(item.get("id") or ""),
         "subject_id": subject_id,
