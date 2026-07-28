@@ -118,12 +118,13 @@ def _budget_for_agent(agent) -> BudgetConfig:
     if not (is_research_leaf or is_readonly_parent):
         return base
 
-    # Research agents routinely receive 20-80K SmartSearch JSON documents.
-    # Sending every one in full once creates a replay floor of hundreds of
-    # thousands of non-cache tokens even when the Context Editor clears it on
-    # the next request. Spill large retrieval bodies before first injection;
-    # the leaf gets a useful preview and can page the exact owner-only artifact
-    # through read_tool_artifact. Search depth is preserved, prompt bulk is not.
+    # Research agents routinely receive 20-80K SmartSearch JSON documents and
+    # session-search hits. Sending every one in full once creates a replay floor
+    # of hundreds of thousands of non-cache tokens even when the Context Editor
+    # clears it on the next request. Spill large retrieval bodies before first
+    # injection; the leaf gets a useful preview and can page the exact
+    # owner-only artifact through read_tool_artifact. Search depth is preserved,
+    # prompt bulk is not.
     overrides = dict(base.tool_overrides)
     for name in (
         "mcp__smart_search__smart_search",
@@ -131,6 +132,7 @@ def _budget_for_agent(agent) -> BudgetConfig:
         "mcp__smart_search__smart_research",
         "mcp__smart_search__smart_map",
         "mcp__smart_search__read_resource",
+        "session_search",
     ):
         overrides[name] = 16_000
     overrides["mcp__smart_search__smart_doctor"] = 8_000

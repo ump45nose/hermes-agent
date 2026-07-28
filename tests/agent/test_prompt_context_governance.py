@@ -179,6 +179,10 @@ def test_research_leaf_spills_large_smart_search_before_first_injection():
         )
         == 16_000
     )
+    assert (
+        _budget_for_agent(failures_parent).resolve_threshold("session_search")
+        == 16_000
+    )
 
     active_parent = SimpleNamespace(
         runtime_role="interactive",
