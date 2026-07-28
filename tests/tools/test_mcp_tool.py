@@ -773,21 +773,18 @@ class TestLazyMCPConnectionSingleFlight:
         import tools.mcp_tool as mcp_tool
 
         server_name = "lazy-single-flight-success"
-        server = SimpleNamespace(session=object())
+        server = SimpleNamespace(session=object(), _registered_tool_names=[])
         calls = []
-        calls_lock = threading.Lock()
         entered = threading.Event()
         release = threading.Event()
         start = threading.Barrier(2)
 
-        def fake_register(_servers):
-            with calls_lock:
-                calls.append(1)
+        def fake_run(_coro_or_factory, timeout=30):
+            calls.append(timeout)
             entered.set()
             assert release.wait(timeout=5)
             with mcp_tool._lock:
                 mcp_tool._servers[server_name] = server
-            return []
 
         self._clear_server_state(mcp_tool, server_name)
         try:
@@ -797,8 +794,16 @@ class TestLazyMCPConnectionSingleFlight:
                 return_value={server_name: {"connect_timeout": 1}},
             ), patch.object(
                 mcp_tool,
-                "register_mcp_servers",
-                side_effect=fake_register,
+                "_MCP_AVAILABLE",
+                True,
+            ), patch.object(
+                mcp_tool,
+                "_ensure_mcp_loop",
+                return_value=None,
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=fake_run,
             ):
                 def connect():
                     start.wait(timeout=5)
@@ -811,7 +816,7 @@ class TestLazyMCPConnectionSingleFlight:
                     results = [future.result(timeout=5) for future in futures]
 
             assert results == [server, server]
-            assert calls == [1]
+            assert calls == [120]
         finally:
             self._clear_server_state(mcp_tool, server_name)
 
@@ -819,24 +824,21 @@ class TestLazyMCPConnectionSingleFlight:
         import tools.mcp_tool as mcp_tool
 
         server_name = "lazy-single-flight-retry"
-        server = SimpleNamespace(session=object())
+        server = SimpleNamespace(session=object(), _registered_tool_names=[])
         calls = []
-        calls_lock = threading.Lock()
         first_entered = threading.Event()
         release_first = threading.Event()
         start = threading.Barrier(2)
 
-        def fake_register(_servers):
-            with calls_lock:
-                calls.append(1)
-                attempt = len(calls)
+        def fake_run(_coro_or_factory, timeout=30):
+            calls.append(timeout)
+            attempt = len(calls)
             if attempt == 1:
                 first_entered.set()
                 assert release_first.wait(timeout=5)
                 raise RuntimeError("first connect failed")
             with mcp_tool._lock:
                 mcp_tool._servers[server_name] = server
-            return []
 
         self._clear_server_state(mcp_tool, server_name)
         try:
@@ -846,8 +848,16 @@ class TestLazyMCPConnectionSingleFlight:
                 return_value={server_name: {"connect_timeout": 1}},
             ), patch.object(
                 mcp_tool,
-                "register_mcp_servers",
-                side_effect=fake_register,
+                "_MCP_AVAILABLE",
+                True,
+            ), patch.object(
+                mcp_tool,
+                "_ensure_mcp_loop",
+                return_value=None,
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=fake_run,
             ):
                 def connect():
                     start.wait(timeout=5)
@@ -870,7 +880,7 @@ class TestLazyMCPConnectionSingleFlight:
                     release_first.set()
                     results = [future.result(timeout=5) for future in futures]
 
-            assert calls == [1]
+            assert calls == [120]
             assert results == [None, None]
 
             with patch.object(
@@ -879,15 +889,23 @@ class TestLazyMCPConnectionSingleFlight:
                 return_value={server_name: {"connect_timeout": 1}},
             ), patch.object(
                 mcp_tool,
-                "register_mcp_servers",
-                side_effect=fake_register,
+                "_MCP_AVAILABLE",
+                True,
+            ), patch.object(
+                mcp_tool,
+                "_ensure_mcp_loop",
+                return_value=None,
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=fake_run,
             ):
                 retried = mcp_tool._ensure_lazy_mcp_server_connected(
                     server_name
                 )
 
             assert retried is server
-            assert calls == [1, 1]
+            assert calls == [120, 120]
         finally:
             self._clear_server_state(mcp_tool, server_name)
 
@@ -1117,6 +1135,64 @@ class TestLazyMCPConnectionSingleFlight:
                 )
                 assert server_name in mcp_tool._server_connecting
                 assert server_name not in mcp_tool._server_connect_errors
+        finally:
+            self._clear_server_state(mcp_tool, server_name)
+
+    def test_old_flight_completion_cannot_retire_new_attempt(self):
+        import tools.mcp_tool as mcp_tool
+
+        server_name = "flight-attempt-aba"
+        old_token = object()
+        new_token = object()
+        old_flight = SimpleNamespace(
+            event=threading.Event(),
+            success=False,
+            waiters=1,
+            attempt_token=old_token,
+        )
+        new_flight = SimpleNamespace(
+            event=threading.Event(),
+            success=False,
+            waiters=1,
+            attempt_token=new_token,
+        )
+        self._clear_server_state(mcp_tool, server_name)
+        try:
+            with mcp_tool._lock:
+                mcp_tool._server_connect_attempts[server_name] = new_token
+                mcp_tool._server_connecting.add(server_name)
+                mcp_tool._lazy_connect_flights[server_name] = new_flight
+
+            mcp_tool._retire_connect_attempt(
+                server_name,
+                old_token,
+                old_flight,
+                success=False,
+                error="old attempt failed",
+            )
+
+            assert old_flight.event.is_set()
+            assert not new_flight.event.is_set()
+            with mcp_tool._lock:
+                assert (
+                    mcp_tool._server_connect_attempts[server_name] is new_token
+                )
+                assert mcp_tool._lazy_connect_flights[server_name] is new_flight
+                assert server_name in mcp_tool._server_connecting
+                assert server_name not in mcp_tool._server_connect_errors
+
+            mcp_tool._retire_connect_attempt(
+                server_name,
+                new_token,
+                new_flight,
+                success=True,
+            )
+            assert new_flight.event.is_set()
+            assert new_flight.success is True
+            with mcp_tool._lock:
+                assert server_name not in mcp_tool._server_connect_attempts
+                assert server_name not in mcp_tool._lazy_connect_flights
+                assert server_name not in mcp_tool._server_connecting
         finally:
             self._clear_server_state(mcp_tool, server_name)
 
