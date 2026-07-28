@@ -3,7 +3,9 @@
 import json
 
 from agent.tool_result_classification import (
+    declared_tool_retention,
     file_mutation_result_landed,
+    tool_may_have_side_effect,
 )
 
 
@@ -33,11 +35,32 @@ def test_top_level_file_mutation_error_does_not_count_as_landed():
 
 
 def test_side_effect_classification_keeps_session_mutations():
-    from agent.tool_result_classification import tool_may_have_side_effect
-
     assert tool_may_have_side_effect("todo") is True
     assert tool_may_have_side_effect("memory") is True
     assert tool_may_have_side_effect("write_file") is True
     assert tool_may_have_side_effect("mcp_unknown") is True
     assert tool_may_have_side_effect("read_file") is False
     assert tool_may_have_side_effect("web_search") is False
+
+
+def test_registry_effect_metadata_overrides_legacy_name_classification():
+    from tools.registry import registry
+
+    name = "test_declared_read_only_effect"
+    registry.register(
+        name=name,
+        toolset="test",
+        schema={
+            "name": name,
+            "description": "read-only test tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+        effect_disposition="none",
+        retain_result_until="next_tool",
+    )
+    try:
+        assert tool_may_have_side_effect(name) is False
+        assert declared_tool_retention(name) == "next_tool"
+    finally:
+        registry.deregister(name)

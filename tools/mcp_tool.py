@@ -4109,6 +4109,7 @@ def _write_mcp_schema_cache(server_name: str, server: Any, config: dict) -> None
         tools.append({
             "remote_name": str(getattr(mcp_tool, "name", "") or ""),
             "schema": schema,
+            "effect_disposition": _mcp_effect_disposition(mcp_tool, config),
             "schema_hash": hashlib.sha256(
                 json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
@@ -5097,6 +5098,40 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
+def _mcp_effect_disposition(mcp_tool, config: dict | None = None) -> str | None:
+    """Resolve MCP effect metadata with local policy taking precedence.
+
+    Remote ``readOnlyHint`` is advisory, not an authority boundary. It is used
+    only when the operator explicitly opts in for that server. The normal
+    authoritative path is a local ``tool_effects.read_only`` list.
+    """
+    config = config if isinstance(config, dict) else {}
+    remote_name = str(getattr(mcp_tool, "name", "") or "")
+    effects = config.get("tool_effects")
+    if isinstance(effects, dict):
+        read_only = effects.get("read_only")
+        if isinstance(read_only, list) and remote_name in {
+            str(name) for name in read_only
+        }:
+            return "none"
+    if config.get("trust_read_only_annotations") is not True:
+        return None
+    annotations = getattr(mcp_tool, "annotations", None)
+    if annotations is None:
+        return None
+    if isinstance(annotations, dict):
+        read_only = annotations.get(
+            "readOnlyHint", annotations.get("read_only_hint")
+        )
+    else:
+        read_only = getattr(
+            annotations,
+            "readOnlyHint",
+            getattr(annotations, "read_only_hint", None),
+        )
+    return "none" if read_only is True else None
+
+
 def _build_utility_schemas(server_name: str) -> List[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
@@ -5425,6 +5460,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            effect_disposition=_mcp_effect_disposition(mcp_tool, config),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -5462,6 +5498,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            effect_disposition="none",
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
@@ -5765,6 +5802,11 @@ def _register_cached_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 check_fn=lambda: True,
                 is_async=False,
                 description=str(schema.get("description") or ""),
+                effect_disposition=(
+                    str(entry.get("effect_disposition"))
+                    if entry.get("effect_disposition") in {"none", "unknown"}
+                    else None
+                ),
             )
             _track_mcp_tool_server(registered_name, server_name)
             registered.append(registered_name)
@@ -5828,6 +5870,7 @@ def _register_cached_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 check_fn=lambda: True,
                 is_async=False,
                 description=str(schema.get("description") or ""),
+                effect_disposition="none",
             )
             _track_mcp_tool_server(util_name, server_name)
             registered.append(util_name)

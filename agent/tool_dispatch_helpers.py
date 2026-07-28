@@ -464,6 +464,7 @@ def make_tool_result_message(
     result_status: str = "unknown",
     artifact_ref: str | None = None,
     supersedes: str | None = None,
+    retain_until: str | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -539,6 +540,7 @@ def make_tool_result_message(
         effect=effect_disposition,
         artifact_ref=artifact_ref,
         supersedes=supersedes,
+        retain_until=retain_until,
     ).to_dict()
     return message
 

@@ -66,13 +66,21 @@ def test_new_profile_appears_in_live_roster_without_controller_recompile(
         description="New live specialist",
         prompt_preset="default",
     )
+    # A scratch/import staging directory is not a routable Profile.
+    (tmp_path / "profiles" / "source").mkdir()
     from hermes_cli.kanban_decompose import _build_roster
 
     roster, names = _build_roster()
     assert "new-specialist" in names
+    assert "source" not in names
     assert any(
         entry["name"] == "new-specialist"
         and entry["description"] == "New live specialist"
         for entry in roster
     )
+    excluded_roster, excluded_names = _build_roster(
+        exclude_names={"lingjun"}
+    )
+    assert "lingjun" not in excluded_names
+    assert all(entry["name"] != "lingjun" for entry in excluded_roster)
     assert (controller / "prompt" / "system.md").read_bytes() == compiled_before

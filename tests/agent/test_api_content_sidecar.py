@@ -972,8 +972,8 @@ class TestMaxIterationsSummaryReplay:
         wire = json.dumps(captured["messages"])
         assert "FULL SCHEMA" not in wire
         assert '"tool_describe"' not in wire
-        assert "X" * 1_000 not in wire
-        assert "tool action receipt" in wire
+        assert "X" * 1_000 in wire
+        assert "tool action receipt" not in wire
         assert "_tool_receipt" not in wire
         assert "effect_disposition" not in wire
 

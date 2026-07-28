@@ -41,6 +41,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -214,7 +215,10 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return "default"
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
+def _build_roster(
+    *,
+    exclude_names: set[str] | frozenset[str] | tuple[str, ...] = (),
+) -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 
     Each roster entry is ``{name, description, has_description}``. The
@@ -228,7 +232,21 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
+    excluded = {str(name) for name in exclude_names if name}
     for p in all_profiles:
+        if p.name in excluded:
+            continue
+        # Named Profiles created by Hermes carry profile.yaml. Ignore scratch,
+        # import-staging, and test directories that merely happen to live
+        # beneath profiles/. Synthetic test doubles without ``path`` retain
+        # their prior behavior.
+        profile_path = getattr(p, "path", None)
+        if (
+            profile_path is not None
+            and not bool(getattr(p, "is_default", False))
+            and not (Path(profile_path) / "profile.yaml").is_file()
+        ):
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,

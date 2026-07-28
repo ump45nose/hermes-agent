@@ -33,6 +33,7 @@ from agent.display import (
 )
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_result_classification import (
+    declared_tool_retention,
     file_mutation_result_landed,
     tool_may_have_side_effect,
 )
@@ -1127,8 +1128,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
             result_status=result_status,
             artifact_ref=artifact_ref_from_content(function_result),
+            retain_until=declared_tool_retention(name),
         )
         messages.append(tool_message)
+        try:
+            from agent.controller_protocol import note_controller_tool_result
+
+            note_controller_tool_result(agent, name, result_status)
+        except Exception:
+            pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None
@@ -1877,8 +1885,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effect_disposition=_effect,
             result_status="error" if _is_error_result else "success",
             artifact_ref=artifact_ref_from_content(function_result),
+            retain_until=declared_tool_retention(function_name),
         )
         messages.append(tool_message)
+        try:
+            from agent.controller_protocol import note_controller_tool_result
+
+            note_controller_tool_result(
+                agent,
+                function_name,
+                "error" if _is_error_result else "success",
+            )
+        except Exception:
+            pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None

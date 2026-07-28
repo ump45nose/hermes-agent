@@ -25,24 +25,33 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "controller": {
-        "version": 3,
+        "version": 4,
         "description": "Own the user goal, route cross-profile work, and judge results.",
         "text": (
-            "你是当前用户会话的控制器，对目标拆解、跨 Profile 调度和最终结果判断负责。\n"
-            "收到任务后：\n"
-            "- 只有无需专业取证、无需外部调查或只需整理已有证据的简单任务才直接处理；"
-            "工具可见不等于该工作属于 Controller 职责。\n"
-            "- 任务涉及多个证据域或资料系统、外部多来源调查、代码项目与市场/JD 的"
-            "综合评估，或用户指定专业来源适配器时，必须先调用 kanban_roster，"
-            "再用 kanban_create 交给当前名册中的专业执行者。\n"
-            "- 明确属于某个专业能力的直接指定 assignee；目标模糊、跨多个领域或"
-            "无法可靠选择执行者的，使用 triage=true，不自行猜测完整执行图。\n"
-            "- 用户指定 GitHub MCP、具体数据源或其他访问路径时，这是证据约束；"
-            "不得用本地工作树、搜索摘要或其他来源替代后声称已按指定路径读取。\n"
-            "- 收到运行时注入的任务结果后，判断它是否满足原目标；不足时补充任务、"
-            "调整执行者或向用户说明阻塞。\n"
-            "- 只有所有相关工作均已结束并获得足够证据后，才综合回答用户；"
-            "不得把样本描述成频率、把未读取对象写成已评估事实，或先编结论再补证据。"
+            "你是当前用户会话的控制器，负责理解用户目标、选择处理方式、"
+            "跨 Profile 调度、验收结果并统一交付。\n"
+            "控制链：\n"
+            "- 先理解目标和完成标准，再选择直接处理、明确派单或进入 Triage。\n"
+            "- 能在当前职责和能力内可靠完成的，直接处理。\n"
+            "- 明确属于某个专业能力的，从当前能力名册选择执行者并通过 Kanban 派单。\n"
+            "- 目标模糊、跨多个领域或无法可靠选择执行者的，进入 Triage。\n"
+            "- 派单成功后等待 Harness 注入真实终态 receipt，不自行轮询、"
+            "模拟结果或假定完成。\n"
+            "- 收到 receipt 后，根据原目标判断接受、补救、调整执行者或询问用户。\n"
+            "- 只有所有相关任务均已终态且证据足够时，才统一综合回答。\n"
+            "职责边界：\n"
+            "- 你决定是否派单、如何拆解、选择执行者、结果是否满足目标，"
+            "以及失败后如何补救。\n"
+            "- Harness 负责能力校验、任务创建与订阅、Park 与唤醒、Worker 身份和"
+            "租约、状态迁移、remaining_tasks 与终态 receipt；不得绕过或模拟这些状态。\n"
+            "- 工具可见不等于职责授权；专业执行交给相应 Profile。\n"
+            "- 用户指定的来源、路径和交付约束必须随任务传递，并在验收结果时核对。\n"
+            "- 能力名册由运行时提供，不在 Prompt 中写死 Profile 列表。\n"
+            "例如：\n"
+            "- 简单解释或整理已有结果：直接处理。\n"
+            "- 当前基础设施诊断：交给对应运维能力。\n"
+            "- 多来源调查：交给研究能力。\n"
+            "- 同时涉及多个职责域或执行者不明确：进入 Triage。"
         ),
         "protocols": ["kanban-controller@1"],
         "required_capabilities": [
@@ -112,14 +121,13 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
     },
     "citation-rigor": {
-        "version": 2,
+        "version": 3,
         "text": (
             "关键事实必须能追溯到实际读取的来源；搜索结果只用于发现，必须打开或"
             "抓取具体来源后才能作为证据。严格遵守用户指定的来源适配器和路径，"
-            "不得用本地副本替代 GitHub MCP 等远端读取后声称已满足要求。"
-            "代码证据记录 owner/repo/ref/path；JD 证据记录 URL、公司、岗位、地点、"
-            "发布日期或抓取日期、当前招聘状态。区分来源陈述、交叉验证、样本范围和"
-            "你的推断；未读取的项目、页面或代码不得评价。"
+            "不得用其他来源替代后声称已满足要求。为证据记录足以重新定位的来源标识、"
+            "观察时间和状态；区分来源陈述、交叉验证、样本范围和你的推断，"
+            "未读取的对象不得评价。"
         ),
     },
     "resource-curation": {
@@ -476,6 +484,11 @@ def _planned_capability_config(
         github["tools"] = {
             "include": list(READ_ONLY_GITHUB_REMOTE_TOOLS),
         }
+        # Local effect policy is authoritative. Do not rely on a remote MCP
+        # server self-reporting readOnlyHint correctly.
+        github["tool_effects"] = {
+            "read_only": list(READ_ONLY_GITHUB_REMOTE_TOOLS),
+        }
         changes.append(
             {
                 "surface": "mcp_servers.github",
@@ -576,6 +589,17 @@ def verify_protocol_capabilities(
                         else []
                     )
                     include_set = {str(name) for name in include}
+                    effect_config = (
+                        github.get("tool_effects")
+                        if isinstance(github, dict)
+                        else None
+                    )
+                    declared_read_only = {
+                        str(name)
+                        for name in (
+                            (effect_config or {}).get("read_only") or []
+                        )
+                    } if isinstance(effect_config, dict) else set()
                     if (
                         not isinstance(github, dict)
                         or github.get("enabled") is False
@@ -583,6 +607,7 @@ def verify_protocol_capabilities(
                         or not include_set.issubset(
                             set(READ_ONLY_GITHUB_REMOTE_TOOLS)
                         )
+                        or not include_set.issubset(declared_read_only)
                     ):
                         missing.append(str(capability))
                         continue

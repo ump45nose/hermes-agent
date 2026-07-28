@@ -8,7 +8,9 @@ from agent.controller_protocol import (
     controller_create_call_ids,
     controller_dispatch_outcome,
     controller_tool_policy_block,
+    build_controller_dispatch_nudge,
     encode_controller_receipt,
+    note_controller_tool_result,
     runtime_protocol_tool_policy_block,
 )
 from gateway.kanban_watchers import _controller_receipt_for_event
@@ -96,6 +98,90 @@ def test_controller_recognizes_kanban_create_through_progressive_bridge():
         ]
     )
     assert controller_create_call_ids(_agent(), assistant) == ["c1", "c2"]
+
+
+def test_controller_roster_selection_requires_create_before_text_exit():
+    agent = _agent()
+    agent.runtime_role = "interactive"
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "r1",
+                    "function": {
+                        "name": "tool_call",
+                        "arguments": json.dumps(
+                            {"name": "kanban_roster", "arguments": {}}
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_roster",
+            "tool_call_id": "r1",
+            "content": '{"profiles": []}',
+        },
+    ]
+
+    nudge = build_controller_dispatch_nudge(
+        agent,
+        messages=messages,
+    )
+    assert nudge is not None
+    assert "kanban_create" in nudge
+    assert "triage=true" in nudge
+    assert (
+        build_controller_dispatch_nudge(
+            agent,
+            messages=messages,
+            attempts=2,
+        )
+        is None
+    )
+
+
+def test_controller_dispatch_nudge_stops_after_create_attempt():
+    agent = _agent()
+    agent.runtime_role = "interactive"
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [_call("r1", "kanban_roster")],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [_bridge_call("c1", "kanban_create")],
+        },
+    ]
+    assert (
+        build_controller_dispatch_nudge(
+            agent,
+            messages=messages,
+        )
+        is None
+    )
+
+
+def test_controller_repeated_roster_is_blocked_after_success():
+    agent = _agent()
+    agent.runtime_role = "interactive"
+    note_controller_tool_result(agent, "kanban_roster", "success")
+
+    reason = controller_tool_policy_block(agent, "kanban_roster")
+    assert reason is not None
+    assert "kanban_create" in reason
+    protocol, next_tool, _ = runtime_protocol_tool_policy_block(
+        agent, "kanban_roster"
+    )
+    assert protocol == CONTROLLER_PROTOCOL
+    assert next_tool == "kanban_create"
+    assert controller_tool_policy_block(agent, "kanban_create") is None
+
+    note_controller_tool_result(agent, "kanban_create", "error")
+    assert controller_tool_policy_block(agent, "kanban_roster") is None
 
 
 def test_controller_specialist_action_boundary_is_static_and_role_scoped():

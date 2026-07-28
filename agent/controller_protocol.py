@@ -125,6 +125,77 @@ def controller_create_call_ids(agent: Any, assistant_message: Any) -> list[str]:
     return [_call_id(call) for call in calls if _call_id(call)]
 
 
+def _message_tool_call_names(message: Any) -> tuple[str, ...]:
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return ()
+    return tuple(
+        name
+        for name in (_call_name(call) for call in message.get("tool_calls") or [])
+        if name
+    )
+
+
+def build_controller_dispatch_nudge(
+    agent: Any,
+    *,
+    messages: list[dict[str, Any]] | None,
+    attempts: int = 0,
+    max_attempts: int = 2,
+) -> str | None:
+    """Keep an explicitly selected Controller dispatch path from falling out.
+
+    This is deliberately not a semantic task router. The model selects the
+    dispatch path by calling ``kanban_roster``. Once selected, a plain-text
+    answer is not a valid transition until it has at least attempted
+    ``kanban_create``. Failed creates still return to the model for repair and
+    are not hidden by this guard.
+    """
+    if not controller_protocol_enabled(agent):
+        return None
+    if str(getattr(agent, "runtime_role", "interactive")) != "interactive":
+        return None
+    if attempts >= max_attempts or not messages:
+        return None
+
+    selected = False
+    for message in messages:
+        names = _message_tool_call_names(message)
+        if "kanban_roster" in names:
+            selected = True
+        if selected and "kanban_create" in names:
+            return None
+    if not selected:
+        return None
+
+    return (
+        "[System: You selected the Controller dispatch path by calling "
+        "`kanban_roster`, but no `kanban_create` attempt followed. Plain text, "
+        "a progress report, or asking the user to perform the specialist work "
+        "is not a valid Controller transition. In the next response, call "
+        "`kanban_create` with an assignee from the returned roster, or use "
+        "`triage=true` when the target is ambiguous or crosses domains. Do not "
+        "narrate intent.]"
+    )
+
+
+def note_controller_tool_result(
+    agent: Any,
+    tool_name: str,
+    result_status: str,
+) -> None:
+    """Record the explicit Controller branch selected during this user turn."""
+    if not controller_protocol_enabled(agent):
+        return
+    if str(getattr(agent, "runtime_role", "interactive")) != "interactive":
+        return
+    if tool_name == "kanban_roster" and result_status == "success":
+        agent._controller_dispatch_selected = True
+    elif tool_name == "kanban_create":
+        # A create attempt returns to normal model repair on failure and parks
+        # deterministically on success.
+        agent._controller_dispatch_selected = False
+
+
 def controller_tool_policy_block(
     agent: Any,
     tool_name: str,
@@ -141,6 +212,15 @@ def controller_tool_policy_block(
     if str(getattr(agent, "runtime_role", "interactive")) != "interactive":
         return None
     name = str(tool_name or "")
+    if (
+        getattr(agent, "_controller_dispatch_selected", False)
+        and name == "kanban_roster"
+    ):
+        return (
+            "Controller dispatch path already has a current roster. "
+            "Do not refresh it in a loop; call kanban_create with a listed "
+            "assignee, or use triage=true when routing is ambiguous."
+        )
     delegated = (
         name in _DELEGATED_TOOL_NAMES
         or any(name.startswith(prefix) for prefix in _DELEGATED_TOOL_PREFIXES)
@@ -163,7 +243,12 @@ def runtime_protocol_tool_policy_block(
     """Return ``(protocol, required_next_tool, error)`` for a hard boundary."""
     controller_error = controller_tool_policy_block(agent, tool_name)
     if controller_error is not None:
-        return CONTROLLER_PROTOCOL, "kanban_roster", controller_error
+        required_next = (
+            "kanban_create"
+            if getattr(agent, "_controller_dispatch_selected", False)
+            else "kanban_roster"
+        )
+        return CONTROLLER_PROTOCOL, required_next, controller_error
 
     protocols = set((getattr(agent, "_prompt_lock", None) or {}).get("protocols") or [])
     if RESEARCH_PARENT_PROTOCOL not in protocols:

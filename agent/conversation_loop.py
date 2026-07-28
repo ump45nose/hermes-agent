@@ -5640,6 +5640,54 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                # A Controller chooses the dispatch branch semantically by
+                # calling kanban_roster. From that point, the Harness owns the
+                # state transition: a plain-text progress report cannot replace
+                # kanban_create -> autosubscribe -> park. This does not classify
+                # the user's query or force simple direct tasks through Kanban.
+                try:
+                    from agent.controller_protocol import (
+                        build_controller_dispatch_nudge,
+                    )
+
+                    _controller_dispatch_nudge = build_controller_dispatch_nudge(
+                        agent,
+                        messages=messages[current_turn_user_idx:],
+                        attempts=getattr(
+                            agent, "_controller_dispatch_nudges", 0
+                        ),
+                    )
+                except Exception:
+                    logger.debug(
+                        "controller dispatch stop-loop check failed",
+                        exc_info=True,
+                    )
+                    _controller_dispatch_nudge = None
+
+                if _controller_dispatch_nudge:
+                    agent._controller_dispatch_nudges = (
+                        getattr(agent, "_controller_dispatch_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "controller_dispatch_required"
+                    final_msg["_controller_dispatch_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _controller_dispatch_nudge,
+                            "_controller_dispatch_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    logger.info(
+                        "controller dispatch stop-loop nudge issued "
+                        "(attempt %d)",
+                        agent._controller_dispatch_nudges,
+                    )
+                    _pending_verification_response = final_response
+                    final_response = None
+                    continue
+
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,

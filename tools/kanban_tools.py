@@ -1259,8 +1259,33 @@ def _handle_roster(args: dict, **kw) -> str:
     try:
         from hermes_cli.kanban_decompose import _build_roster
 
-        roster, _valid = _build_roster()
-        return _ok(profiles=roster)
+        try:
+            from gateway.session_context import get_session_env
+
+            current_profile = (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+            )
+        except Exception:
+            current_profile = ""
+        current_profile = current_profile or os.environ.get("HERMES_PROFILE", "")
+        roster, _valid = _build_roster(
+            exclude_names={current_profile} if current_profile else set()
+        )
+        return _ok(
+            profiles=roster,
+            next_transition={
+                "tool": "kanban_create",
+                "required": ["title"],
+                "routing": (
+                    "set assignee to one roster profile, or set triage=true "
+                    "when the target is ambiguous or crosses domains"
+                ),
+                "controller_rule": (
+                    "after roster, plain text is not a dispatch transition"
+                ),
+            },
+        )
     except Exception as exc:
         logger.exception("kanban_roster failed")
         return tool_error(f"kanban_roster: {exc}")
@@ -2164,6 +2189,8 @@ registry.register(
     schema=KANBAN_ROSTER_SCHEMA,
     handler=_handle_roster,
     check_fn=_check_kanban_orchestrator_mode,
+    effect_disposition="none",
+    retain_result_until="kanban_create",
     emoji="👥",
 )
 

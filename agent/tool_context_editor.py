@@ -24,6 +24,7 @@ class ToolResultReceipt:
     steer_present: bool = False
     supersedes: str | None = None
     request_ledger: dict[str, str] | None = None
+    retain_until: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,6 +72,7 @@ def build_receipt(
     effect: str | None = None,
     artifact_ref: str | None = None,
     supersedes: str | None = None,
+    retain_until: str | None = None,
 ) -> ToolResultReceipt:
     text = _text(content)
     status = result_status
@@ -86,6 +88,7 @@ def build_receipt(
         artifact_ref=artifact_ref,
         steer_present=_has_steer(content),
         supersedes=supersedes,
+        retain_until=retain_until,
     )
 
 
@@ -161,6 +164,26 @@ def _current_unconsumed_ids(messages: list[dict[str, Any]]) -> set[str]:
         if role == "assistant" and _text(message.get("content")).strip():
             break
     return set()
+
+
+def _retention_satisfied(
+    messages: list[dict[str, Any]],
+    *,
+    after_index: int,
+    required_tool: str | None,
+) -> bool:
+    if not required_tool:
+        return True
+    for message in messages[after_index + 1:]:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            name, arguments = _call_name_and_arguments(call)
+            if name == "tool_call":
+                name = str(arguments.get("name") or "")
+            if name == required_tool:
+                return True
+    return False
 
 
 def _safe_to_clear(
@@ -282,6 +305,26 @@ def _action_receipt_text(
         f"artifact={receipt.artifact_ref or 'none'}; "
         f"summary={first_line}]"
     )
+
+
+_PROJECTED_CONTENT_PREFIXES = {
+    "[tool read result consumed;": "read_receipt",
+    "[unresolved tool blocker after consumption;": "blocker_receipt",
+    "[tool action receipt after consumption:": "action_receipt",
+    "[tool result body removed after consumption;": "placeholder",
+}
+
+
+def _projected_content_form(message: dict[str, Any]) -> str | None:
+    """Recognize canonical and legacy projections so editing is idempotent."""
+    form = message.get("_tool_context_form")
+    if form in set(_PROJECTED_CONTENT_PREFIXES.values()):
+        return str(form)
+    text = _text(message.get("content")).lstrip()
+    for prefix, projected_form in _PROJECTED_CONTENT_PREFIXES.items():
+        if text.startswith(prefix):
+            return projected_form
+    return None
 
 
 def _embedded_json_object(text: str) -> dict[str, Any] | None:
@@ -477,6 +520,18 @@ def edit_tool_context(
             continue
         call_id = str(message.get("tool_call_id") or "")
         receipt = receipt_from_message(message)
+        projected_form = _projected_content_form(message)
+        if projected_form is not None:
+            # The canonical history may already contain a compact projection
+            # from a prior request. Never hash/summarize that projection again.
+            message["_tool_context_form"] = projected_form
+            continue
+        if not _retention_satisfied(
+            edited,
+            after_index=index,
+            required_tool=receipt.retain_until,
+        ):
+            continue
         owner = owners.get(call_id)
         if owner and owner[2] and not receipt.request_ledger:
             receipt.request_ledger = owner[2]
@@ -503,6 +558,7 @@ def edit_tool_context(
                 receipt,
                 content=message.get("content"),
             )
+            message["_tool_context_form"] = "read_receipt"
             report.append(
                 {
                     "tool_call_id": call_id,
@@ -529,6 +585,7 @@ def edit_tool_context(
                     receipt,
                     content=message.get("content"),
                 )
+                message["_tool_context_form"] = "blocker_receipt"
                 report.append(
                     {
                         "tool_call_id": call_id,
@@ -540,7 +597,7 @@ def edit_tool_context(
                 )
                 continue
             if (
-                phase in {"failures", "active"}
+                phase == "active"
                 and receipt.consumed_turn is not None
                 and not receipt.steer_present
                 and receipt.effect in {"landed", "unknown"}
@@ -549,6 +606,7 @@ def edit_tool_context(
                     receipt,
                     content=message.get("content"),
                 )
+                message["_tool_context_form"] = "action_receipt"
                 report.append(
                     {
                         "tool_call_id": call_id,
@@ -570,6 +628,7 @@ def edit_tool_context(
                 "[tool result body removed after consumption; "
                 f"status={receipt.result_status}; effect={receipt.effect}]"
             )
+            message["_tool_context_form"] = "placeholder"
         report.append(
             {
                 "tool_call_id": call_id,
@@ -589,6 +648,7 @@ def strip_internal_tool_metadata(messages: list[dict[str, Any]]) -> None:
     for message in messages:
         message.pop("_tool_receipt", None)
         message.pop("effect_disposition", None)
+        message.pop("_tool_context_form", None)
 
 
 def project_tool_context_for_provider(

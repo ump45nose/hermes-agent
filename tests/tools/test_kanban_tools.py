@@ -143,6 +143,41 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_controller_roster_returns_next_transition_and_excludes_self(
+    monkeypatch,
+):
+    import hermes_cli.kanban_decompose as decompose
+    import tools.kanban_tools as kanban_tools
+
+    captured = {}
+
+    def _roster(*, exclude_names=()):
+        captured["exclude_names"] = set(exclude_names)
+        return (
+            [
+                {
+                    "name": "research",
+                    "description": "research",
+                    "has_description": True,
+                }
+            ],
+            {"research"},
+        )
+
+    monkeypatch.setenv("HERMES_PROFILE", "lingjun")
+    monkeypatch.setattr(
+        kanban_tools, "_require_orchestrator_tool", lambda _name: None
+    )
+    monkeypatch.setattr(decompose, "_build_roster", _roster)
+
+    payload = json.loads(kanban_tools._handle_roster({}))
+    assert payload["ok"] is True
+    assert payload["profiles"][0]["name"] == "research"
+    assert payload["next_transition"]["tool"] == "kanban_create"
+    assert payload["next_transition"]["required"] == ["title"]
+    assert captured["exclude_names"] == {"lingjun"}
+
+
 def test_kanban_tools_visible_with_platform_toolsets_config(monkeypatch, tmp_path):
     """Current direct/deferred platform config must satisfy the registry gate."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

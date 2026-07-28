@@ -96,6 +96,21 @@ def test_controller_lock_v2_provisions_protocol_capabilities(tmp_path):
     assert missing["missing"] == ["kanban.create", "kanban.roster"]
 
 
+def test_controller_module_is_generic_control_protocol_not_incident_patch():
+    text, lock = compile_profile_prompt("lingjun")
+
+    assert "直接处理、明确派单或进入 Triage" in text
+    assert "Harness 负责能力校验" in text
+    assert "多来源调查：交给研究能力" in text
+    for incident_term in ("GitHub MCP", "市场/JD", "样本描述成频率"):
+        assert incident_term not in text
+    controller = next(
+        module for module in lock["modules"] if module["id"] == "controller"
+    )
+    assert controller["version"] == 4
+    assert controller["protocols"] == ["kanban-controller@1"]
+
+
 def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path):
     lock = write_compiled_prompt(tmp_path, preset="research")
     assert lock["protocols"] == ["research-parent@1"]
@@ -103,10 +118,12 @@ def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path
     config = yaml.safe_load((tmp_path / "config.yaml").read_text())
     github = config["mcp_servers"]["github"]
     include = set(github["tools"]["include"])
+    declared_read_only = set(github["tool_effects"]["read_only"])
     assert github["enabled"] is True
     assert "get_file_contents" in include
     assert "search_repositories" in include
     assert "create_or_update_file" not in include
+    assert include == declared_read_only
     assert "github" in config["platform_toolsets"]["subagent"]["deferred"]
     assert "github" in config["delegation"]["research_leaf_toolsets"]
     runtime = validate_runtime_prompt_protocols(
@@ -838,7 +855,7 @@ def test_tool_editor_active_replaces_consumed_side_effect_with_receipt():
         "mcp__mixed_server__unknown_tool",
     ],
 )
-def test_tool_editor_failures_bounds_every_consumed_unknown_result(tool_name):
+def test_tool_editor_failures_preserves_consumed_unknown_result(tool_name):
     body = "read result\n" + ("x" * 40_000)
     message = _tool("old", body)
     message["name"] = message["tool_name"] = tool_name
@@ -853,14 +870,74 @@ def test_tool_editor_failures_bounds_every_consumed_unknown_result(tool_name):
         ],
         phase="failures",
     )
-    receipt = edited[1]["content"]
-    assert len(receipt) < 900
-    assert "tool action receipt after consumption" in receipt
-    assert "effect=unknown" in receipt
-    assert "chars=40012" in receipt
-    assert "sha256=" in receipt
-    assert "x" * 100 not in receipt
+    assert edited[1]["content"] == body
+    assert report == []
+
+
+def test_tool_editor_active_action_receipt_is_idempotent():
+    message = _tool("old", "created external object")
+    message["_tool_receipt"]["effect"] = "unknown"
+    first, report = edit_tool_context(
+        [
+            _assistant("old", "send_message"),
+            message,
+            {"role": "assistant", "content": "done"},
+        ],
+        phase="active",
+    )
+    first_text = first[1]["content"]
     assert report[0]["action"] == "action_receipt"
+
+    second, second_report = edit_tool_context(first, phase="active")
+    assert second[1]["content"] == first_text
+    assert second[1]["_tool_context_form"] == "action_receipt"
+    assert second_report == []
+
+
+def test_tool_editor_retains_roster_until_create_transition():
+    roster = _tool(
+        "roster",
+        '{"profiles":[{"name":"research","description":"research"}]}',
+    )
+    roster["_tool_receipt"]["retain_until"] = "kanban_create"
+    before_create = [
+        _assistant("roster", "kanban_roster"),
+        roster,
+        {"role": "assistant", "content": "considering roster"},
+    ]
+    retained, report = edit_tool_context(before_create, phase="failures")
+    assert retained[1]["content"] == roster["content"]
+    assert report == []
+
+    after_create = [
+        *before_create,
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "create",
+                    "function": {
+                        "name": "tool_call",
+                        "arguments": json.dumps(
+                            {
+                                "name": "kanban_create",
+                                "arguments": {
+                                    "title": "research",
+                                    "assignee": "research",
+                                },
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+    ]
+    released, released_report = edit_tool_context(
+        after_create,
+        phase="failures",
+    )
+    assert "tool read result consumed" in released[1]["content"]
+    assert released_report[0]["action"] == "read_receipt"
 
 
 def test_tool_editor_bounds_unknown_effect_failure_as_blocker():
