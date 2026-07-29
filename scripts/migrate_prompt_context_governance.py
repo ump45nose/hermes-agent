@@ -93,11 +93,11 @@ def _set_config(name: str, home: Path) -> None:
             if "delegation" not in deferred:
                 deferred.append("delegation")
         platform["subagent"] = {
-            "direct": [],
+            "direct": ["tool_artifact"],
             "deferred": ["web", "browser", "context7", "smart-search"],
         }
         config.setdefault("delegation", {})["research_leaf_toolsets"] = [
-            "web", "browser", "context7", "smart-search"
+            "web", "browser", "context7", "smart-search", "tool_artifact"
         ]
     if name == "xp":
         for exposure in platform.values():

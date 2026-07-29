@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import re
+from contextvars import copy_context
 
 logger = logging.getLogger(__name__)
 import os
@@ -1318,6 +1319,7 @@ def _build_child_agent(
                 "browser",
                 "context7",
                 "smart-search",
+                "tool_artifact",
             ]
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [
@@ -1325,6 +1327,12 @@ def _build_child_agent(
             for name in configured_allowlist
             if name in expanded_parent or name in parent_toolsets
         ]
+        # A research leaf receives one runtime-scoped local capability in
+        # addition to inherited retrieval tools. Its handler can only read
+        # owner-only tool-result artifacts under this child's session id; it
+        # cannot read arbitrary files or artifacts owned by another process.
+        if "tool_artifact" not in child_toolsets:
+            child_toolsets.append("tool_artifact")
 
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
@@ -1603,14 +1611,16 @@ def _build_child_agent(
                 "research leaf has no reachable research-grade retrieval tools; "
                 "terminal remains unavailable and the leaf was not started"
             )
-        from hermes_constants import get_hermes_home
+        from hermes_constants import contained_session_path, get_hermes_home
 
-        child._research_artifact_dir = (
-            get_hermes_home()
-            / "artifacts"
-            / "research"
-            / str(getattr(parent_agent, "session_id", "session"))
-            / subagent_id
+        _research_root = get_hermes_home() / "artifacts" / "research"
+        _parent_artifact_dir = contained_session_path(
+            _research_root,
+            getattr(parent_agent, "session_id", "session"),
+        )
+        child._research_artifact_dir = contained_session_path(
+            _parent_artifact_dir,
+            subagent_id,
         )
         child._research_artifact_dir.mkdir(parents=True, exist_ok=True)
         child._research_artifact_dir.chmod(0o700)
@@ -1888,11 +1898,16 @@ def _write_research_evidence_bundle(
     summary: str,
     messages: List[Dict[str, Any]],
     status: str,
-) -> tuple[str, str, str]:
-    """Persist full leaf evidence and return (envelope, path, sha256)."""
+) -> tuple[str, str, str, str, str]:
+    """Persist full evidence plus a bounded parent handoff.
+
+    Returns ``(envelope, evidence_path, evidence_sha256, handoff_path,
+    handoff_sha256)``. The evidence bundle is an audit/drill-down artifact;
+    normal parent synthesis consumes the embedded envelope exactly once.
+    """
     directory = getattr(child, "_research_artifact_dir", None)
     if directory is None:
-        return summary, "", ""
+        return summary, "", "", "", ""
     payload = {
         "goal": goal,
         "status": status,
@@ -1909,33 +1924,122 @@ def _write_research_evidence_bundle(
         parsed = json.loads(summary)
     except (TypeError, ValueError):
         parsed = None
-    if isinstance(parsed, dict):
-        envelope = {
-            "claims": parsed.get("claims") or [],
-            "source_ids": parsed.get("source_ids") or urls,
-            "contradictions": parsed.get("contradictions") or [],
-            "unexpected_findings": parsed.get("unexpected_findings") or [],
-            "unresolved": parsed.get("unresolved") or [],
-        }
+    structured = isinstance(parsed, dict)
+    if structured:
+        claims = parsed.get("claims") or []
+        source_ids = parsed.get("source_ids") or urls
+        contradictions = parsed.get("contradictions") or []
+        unexpected = parsed.get("unexpected_findings") or []
+        unresolved = parsed.get("unresolved") or []
     else:
-        envelope = {
-            "claims": [summary] if summary else [],
-            "source_ids": urls,
-            "contradictions": [],
-            "unexpected_findings": [],
-            "unresolved": [] if status == "completed" else [status],
-        }
-    envelope["artifact_path"] = str(path)
-    envelope["artifact_sha256"] = digest
-    rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-    if len(rendered) > 12000:
-        envelope["claims"] = [
-            str(claim)[:7000] for claim in envelope.get("claims", [])[:1]
+        # A non-compliant Markdown response must not be copied wholesale into
+        # the parent and then read again from the evidence bundle. Extract a
+        # deterministic head/tail set of substantive lines as the handoff.
+        units = [
+            re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line).strip()
+            for line in str(summary or "").splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", "```"))
         ]
-        envelope["unresolved"] = list(envelope.get("unresolved", []))[:20]
+        claims = units[:8]
+        if len(units) > 12:
+            claims.extend(units[-4:])
+        source_ids = urls
+        contradictions = []
+        unexpected = []
+        unresolved = [] if status == "completed" else [status]
+    if status != "completed":
+        unresolved = list(unresolved) if isinstance(unresolved, list) else [unresolved]
+        if status not in unresolved:
+            unresolved.append(status)
+
+    def _bounded_items(
+        value: Any,
+        *,
+        max_items: int,
+        item_cap: int,
+        total_cap: int,
+    ) -> List[Any]:
+        items = value if isinstance(value, list) else ([value] if value else [])
+        result: List[Any] = []
+        used = 0
+        for item in items[:max_items]:
+            rendered_item = json.dumps(
+                item, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+            compact: Any = item
+            if len(rendered_item) > item_cap:
+                compact = rendered_item[: max(0, item_cap - 1)] + "…"
+                rendered_item = json.dumps(compact, ensure_ascii=False)
+            if used + len(rendered_item) > total_cap:
+                break
+            result.append(compact)
+            used += len(rendered_item)
+        return result
+
+    envelope: Dict[str, Any] = {
+        "kind": "research_leaf_handoff",
+        "status": status,
+        "handoff_mode": (
+            "structured_json" if structured else "deterministic_markdown_extract"
+        ),
+        "claims": _bounded_items(
+            claims, max_items=16, item_cap=1_200, total_cap=6_800
+        ),
+        "source_ids": _bounded_items(
+            source_ids, max_items=40, item_cap=420, total_cap=3_600
+        ),
+        "contradictions": _bounded_items(
+            contradictions, max_items=12, item_cap=700, total_cap=2_000
+        ),
+        "unexpected_findings": _bounded_items(
+            unexpected, max_items=12, item_cap=700, total_cap=2_000
+        ),
+        "unresolved": _bounded_items(
+            unresolved, max_items=20, item_cap=700, total_cap=2_000
+        ),
+        "report_chars": len(summary),
+        "evidence_bundle_path": str(path),
+        "evidence_bundle_sha256": digest,
+        "artifact_is_audit_only": True,
+        "audit_read_policy": (
+            "Do not reread the whole evidence bundle during normal synthesis; "
+            "inspect only a specific missing claim, conflict, or source."
+        ),
+    }
+    rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    shrink_order = (
+        "unexpected_findings",
+        "source_ids",
+        "claims",
+        "contradictions",
+        "unresolved",
+    )
+    while len(rendered) > 12_000:
+        changed = False
+        for key in shrink_order:
+            values = envelope.get(key)
+            if isinstance(values, list) and len(values) > 1:
+                values.pop()
+                changed = True
+                break
+        if not changed:
+            break
         rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-        rendered = rendered[:12000]
-    return rendered, str(path), digest
+    if len(rendered) > 12_000:
+        # Metadata caps above make this defensive branch effectively
+        # unreachable, but keep valid JSON rather than slicing a document.
+        envelope["claims"] = envelope["claims"][:1]
+        envelope["source_ids"] = envelope["source_ids"][:3]
+        envelope["contradictions"] = []
+        envelope["unexpected_findings"] = []
+        envelope["unresolved"] = envelope["unresolved"][:3]
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+
+    handoff_path = directory / "handoff.json"
+    handoff_path.write_text(rendered, encoding="utf-8")
+    handoff_path.chmod(0o600)
+    handoff_digest = hashlib.sha256(rendered.encode()).hexdigest()
+    return rendered, str(path), digest, str(handoff_path), handoff_digest
 
 
 def _trim_summary_with_footer(
@@ -2304,17 +2408,12 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
-
-        _child_context = contextvars.copy_context()
+        # The actual child conversation runs in a second worker thread so a
+        # hard timeout can abandon it. ContextVars do not cross that boundary
+        # automatically; copy the profile secret scope and HERMES_HOME context
+        # so lazy MCP connections resolve this profile's ${ENV} placeholders.
         _child_future = _timeout_executor.submit(
-            _child_context.run,
-            _run_with_thread_capture,
+            copy_context().run, _run_with_thread_capture
         )
         try:
             result = _child_future.result(timeout=child_timeout)
@@ -2439,6 +2538,7 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+        is_research_leaf = getattr(child, "runtime_role", "") == "research_leaf"
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
@@ -2447,13 +2547,24 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        # Determine exit reason before status: a research leaf can return a
+        # usable handoff while still exhausting its budget. That is partial
+        # evidence, never a completed research branch.
+        if interrupted:
+            exit_reason = "interrupted"
+        elif completed:
+            exit_reason = "completed"
+        else:
+            exit_reason = "max_iterations"
+
         if interrupted:
             status = "interrupted"
         elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
+            status = (
+                "partial"
+                if is_research_leaf and exit_reason == "max_iterations"
+                else "completed"
+            )
         else:
             status = "failed"
 
@@ -2470,10 +2581,16 @@ def _run_single_child(
                     for tc in msg.get("tool_calls") or []:
                         fn = tc.get("function", {})
                         arguments = fn.get("arguments", "")
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            )
                         entry_t = {
                             "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(arguments),
-                            "input_summary": _summarize_tool_arguments(arguments),
+                            "args_bytes": len(arguments.encode("utf-8")),
                         }
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
@@ -2483,7 +2600,7 @@ def _run_single_child(
                     content = _stringify_tool_content(msg.get("content", ""))
                     is_error = _looks_like_error_output(content)
                     result_meta = {
-                        "result_bytes": len(content),
+                        "result_bytes": len(content.encode("utf-8")),
                         "status": "error" if is_error else "ok",
                     }
                     # Match by tool_call_id for parallel calls
@@ -2495,18 +2612,37 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
-        if interrupted:
-            exit_reason = "interrupted"
-        elif completed:
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
+        tool_trace_summary = {
+            "calls": len(tool_trace),
+            "errors": sum(
+                1 for trace_entry in tool_trace
+                if trace_entry.get("status") == "error"
+            ),
+            "unique_tools": sorted(
+                {
+                    str(trace_entry.get("tool") or "unknown")
+                    for trace_entry in tool_trace
+                }
+            ),
+            "bytes": sum(
+                int(trace_entry.get("args_bytes") or 0)
+                + int(trace_entry.get("result_bytes") or 0)
+                for trace_entry in tool_trace
+            ),
+        }
 
         research_artifact_path = ""
         research_artifact_sha256 = ""
-        if getattr(child, "runtime_role", "") == "research_leaf":
-            summary, research_artifact_path, research_artifact_sha256 = (
+        research_handoff_path = ""
+        research_handoff_sha256 = ""
+        if is_research_leaf:
+            (
+                summary,
+                research_artifact_path,
+                research_artifact_sha256,
+                research_handoff_path,
+                research_handoff_sha256,
+            ) = (
                 _write_research_evidence_bundle(
                     child,
                     goal=goal,
@@ -2537,9 +2673,11 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
-            "tool_trace": tool_trace,
-            "artifact_path": research_artifact_path or None,
-            "artifact_sha256": research_artifact_sha256 or None,
+            "handoff_path": research_handoff_path or None,
+            "handoff_sha256": research_handoff_sha256 or None,
+            "evidence_bundle_path": research_artifact_path or None,
+            "evidence_bundle_sha256": research_artifact_sha256 or None,
+            "artifact_is_audit_only": bool(research_artifact_path),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -2558,6 +2696,10 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if is_research_leaf:
+            entry["tool_trace_summary"] = tool_trace_summary
+        else:
+            entry["tool_trace"] = tool_trace
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -2895,6 +3037,30 @@ def _run_child_lifecycle(
     return result
 
 
+def _run_single_child_scoped(
+    task_index: int,
+    goal: str,
+    child: Any,
+    parent_agent: Any,
+) -> Dict[str, Any]:
+    """Run one child with the parent profile's explicit secret scope.
+
+    Delegation uses worker threads, while the secret boundary is ContextVar
+    based. Store the immutable snapshot on the child at construction and
+    reinstall it at the worker entry point; never fall back to ambient process
+    secrets from another profile.
+    """
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    scope = getattr(child, "_delegate_secret_scope", None)
+    token = set_secret_scope(scope) if scope is not None else None
+    try:
+        return _run_single_child(task_index, goal, child, parent_agent)
+    finally:
+        if token is not None:
+            reset_secret_scope(token)
+
+
 def _recover_tasks_from_json_string(
     tasks: Any,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -3118,8 +3284,33 @@ def delegate_task(
             child.tool_progress_callback = wrap_progress_callback(
                 getattr(child, "tool_progress_callback", None), _writer
             )
-            child._live_transcript_path = str(_writer.path)
-        children.append((i, t, child))
+            # Override with correct parent tool names (before child construction mutated global)
+            child._delegate_saved_tool_names = _parent_tool_names
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                current_secret_scope,
+            )
+            from hermes_constants import get_hermes_home
+
+            child._delegate_secret_scope = dict(
+                current_secret_scope()
+                or build_profile_secret_scope(get_hermes_home())
+            )
+            # Tee the child's progress events into its live transcript log.
+            # wrap_progress_callback preserves the inner callback contract
+            # (including the _flush attribute) and never lets writer failures
+            # reach the agent loop. When no parent display exists the inner
+            # callback is None and the wrapper still records events.
+            _writer = live_writers[i] if i < len(live_writers) else None
+            if _writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(
+                    getattr(child, "tool_progress_callback", None), _writer
+                )
+                child._live_transcript_path = str(_writer.path)
+            children.append((i, t, child))
+    finally:
+        # Authoritative restore: reset global to parent's tool names after all children built
+        _model_tools._last_resolved_tool_names = _parent_tool_names
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3134,7 +3325,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child_scoped(
+                _i, _t["goal"], child, parent_agent
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -3150,8 +3343,7 @@ def delegate_task(
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
                     future = executor.submit(
-                        child_context.run,
-                        _run_single_child,
+                        _run_single_child_scoped,
                         task_index=i,
                         goal=t["goal"],
                         child=child,

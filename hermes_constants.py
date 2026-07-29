@@ -4,7 +4,9 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import hashlib
 import os
+import re
 import shutil
 import stat
 import sys
@@ -17,6 +19,30 @@ _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
+
+
+def safe_session_path_component(session_id: object) -> str:
+    """Return a stable, traversal-free path component for a session id."""
+    raw = str(session_id or "").strip()
+    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
+    sanitized = sanitized[:96] or "session"
+    if raw and sanitized == raw:
+        return sanitized
+    digest = hashlib.sha256(
+        raw.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:12]
+    return f"{sanitized}_{digest}"
+
+
+def contained_session_path(root: str | Path, session_id: object) -> Path:
+    """Return a canonical session directory contained directly under *root*."""
+    canonical_root = Path(root).expanduser().resolve()
+    candidate = (
+        canonical_root / safe_session_path_component(session_id)
+    ).resolve()
+    if candidate.parent != canonical_root:
+        raise ValueError("session artifact path escaped its canonical root")
+    return candidate
 
 
 def set_hermes_home_override(path: str | Path | None) -> Token:

@@ -48,6 +48,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_list_entities",
     "ha_list_services",
     "read_file",
+    "read_tool_artifact",
     "search_files",
     "session_search",
     "skill_view",
@@ -483,6 +484,36 @@ def make_tool_result_message(
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
     """
+    # MCP/web/browser output is attacker- or provider-controlled and may
+    # include echoed configuration diagnostics. Redact credential-shaped
+    # values before the result enters canonical session history or a Provider
+    # request. The exact pre-redaction output may still exist in the owner-only
+    # artifact store when the result was persisted earlier.
+    if (
+        name.startswith("mcp__")
+        or name.startswith("browser_")
+        or name in _UNTRUSTED_TOOL_NAMES
+    ):
+        try:
+            from agent.redact import redact_sensitive_text
+
+            if isinstance(content, str):
+                content = redact_sensitive_text(content, force=True)
+            elif isinstance(content, list):
+                content = [
+                    {
+                        **part,
+                        "text": redact_sensitive_text(
+                            str(part.get("text") or ""),
+                            force=True,
+                        ),
+                    }
+                    if isinstance(part, dict) and part.get("type") == "text"
+                    else part
+                    for part in content
+                ]
+        except Exception as exc:
+            logger.debug("Tool-result ingress redaction failed for %s: %s", name, exc)
     wrapped = _maybe_wrap_untrusted(name, content)
     message = {
         "role": "tool",
@@ -518,6 +549,7 @@ def make_tool_result_message(
 # promptware defense.  Skipped for short outputs (under 32 chars) where the
 # overhead of the wrapper outweighs any indirect-injection risk.
 _UNTRUSTED_TOOL_NAMES = frozenset({
+    "read_tool_artifact",
     "web_extract",
     "web_search",
 })

@@ -339,7 +339,12 @@ def store_extracted_episode(item: dict[str, Any]) -> bool:
         body=body,
         metadata={
             "memory_kind": "episode",
+            "schema_version": 2,
+            "source": "hermes_episode_daily_sync",
+            "profile": item["profile"],
+            "subject_id": item["subject_id"],
             "source_session_id": item["session_id"],
+            "source_hash": item["source_hash"],
             "outcome": item.get("outcome"),
         },
     )

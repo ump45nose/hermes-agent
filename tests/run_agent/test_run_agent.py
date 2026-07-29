@@ -118,6 +118,35 @@ def agent():
         return a
 
 
+def test_default_all_agent_hides_research_artifact_toolset(agent):
+    assert agent.enabled_toolsets is None
+    assert "tool_artifact" in agent.disabled_toolsets
+
+
+def test_agent_tool_artifact_dir_normalizes_session_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        scoped_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            session_id="../../escape",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    artifact_root = (tmp_path / "artifacts" / "tool-results").resolve()
+    assert scoped_agent._tool_artifact_dir.parent == artifact_root
+    assert ".." not in scoped_agent._tool_artifact_dir.name
+
+
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
     agent._persist_user_message_idx = 0
@@ -3144,6 +3173,7 @@ class TestConcurrentToolExecution:
                 "web_search", {"q": "test"}, "task-1",
                 tool_call_id=None,
                 session_id=agent.session_id,
+                runtime_role="interactive",
                 turn_id="",
                 api_request_id="",
                 enabled_tools=list(agent.valid_tool_names),

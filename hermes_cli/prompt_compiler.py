@@ -63,10 +63,12 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "research-parent": {
-        "version": 1,
+        "version": 2,
         "text": (
             "你是研究父 Agent：建立独立假设，最多并行三个研究 leaf，"
             "等待全部终态后综合证据、冲突、失败和未解决项。"
+            "正常综合只使用 leaf 返回的结构化 handoff；Evidence bundle 仅在"
+            "某个具体结论、冲突或来源缺失时按需钻取，不整包重复读取。"
         ),
     },
     "citation-rigor": {

@@ -601,11 +601,16 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
-    from agent.runtime_role import resolve_runtime_role
+    from agent.runtime_role import resolve_runtime_role, scope_runtime_toolsets
     _role_resolution = resolve_runtime_role(runtime_role, platform=platform)
     agent.runtime_role = _role_resolution.role
     agent._runtime_role_verified = _role_resolution.verified
     agent._runtime_role_reason = _role_resolution.reason
+    enabled_toolsets, disabled_toolsets = scope_runtime_toolsets(
+        agent.runtime_role,
+        enabled=enabled_toolsets,
+        disabled=disabled_toolsets,
+    )
     if not _role_resolution.verified:
         _ra().logger.warning(
             "runtime role failed closed to %s: %s",
@@ -1423,7 +1428,22 @@ def init_agent(
             else:
                 agent.direct_toolsets = _exposure.direct
                 agent.deferred_toolsets = _exposure.deferred
-                enabled_toolsets = sorted(_exposure.reachable)
+            # Explicit research-leaf process identity grants one schema-small,
+            # session-scoped local reader. This is a runtime capability overlay,
+            # not semantic routing: the handler cannot escape the current
+            # child's owner-only tool artifact directory.
+            from agent.runtime_role import runtime_capability_overlay
+
+            agent.direct_toolsets, agent.deferred_toolsets = (
+                runtime_capability_overlay(
+                    agent.runtime_role,
+                    direct=agent.direct_toolsets,
+                    deferred=agent.deferred_toolsets,
+                )
+            )
+            enabled_toolsets = sorted(
+                set(agent.direct_toolsets) | set(agent.deferred_toolsets)
+            )
             agent.enabled_toolsets = enabled_toolsets
     except ValueError:
         # Invalid V2 configuration is a startup error, not a reason to fall
@@ -1519,12 +1539,13 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
-    from hermes_constants import get_hermes_home as _artifact_home
-    agent._tool_artifact_dir = (
-        _artifact_home()
-        / "artifacts"
-        / "tool-results"
-        / str(agent.session_id)
+    from hermes_constants import (
+        contained_session_path,
+        get_hermes_home as _artifact_home,
+    )
+    agent._tool_artifact_dir = contained_session_path(
+        _artifact_home() / "artifacts" / "tool-results",
+        agent.session_id,
     )
 
     # Expose session ID to tools (terminal, execute_code) so agents can

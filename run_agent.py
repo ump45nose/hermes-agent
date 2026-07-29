@@ -348,15 +348,9 @@ def _safe_session_filename_component(session_id: str) -> str:
     distinct IDs that sanitize to the same component don't collide.  The
     result is always a single, traversal-free path segment.
     """
-    raw = str(session_id or "").strip()
-    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
-    sanitized = sanitized[:96] or "session"
-    if raw and sanitized == raw:
-        return sanitized
-    digest = hashlib.sha256(
-        raw.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()[:12]
-    return f"{sanitized}_{digest}"
+    from hermes_constants import safe_session_path_component
+
+    return safe_session_path_component(session_id)
 
 
 class _StreamErrorEvent(Exception):

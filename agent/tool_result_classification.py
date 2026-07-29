@@ -13,14 +13,32 @@ FILE_MUTATING_TOOL_NAMES = frozenset({"write_file", "patch"})
 # cannot mutate either external state or Hermes session state. Unknown/plugin/
 # MCP tools stay effect-capable by default.
 NO_EFFECT_TOOL_NAMES = frozenset({
-    "read_file", "search_files", "session_search", "skill_view", "skills_list",
+    "read_file", "read_tool_artifact", "search_files", "session_search",
+    "skill_view", "skills_list",
     "web_extract", "web_search", "vision_analyze", "browser_snapshot",
     "browser_get_images", "browser_console", "read_terminal",
 })
 
+# These MCP servers expose retrieval-only capabilities in Hermes.  Treating
+# every dynamically-named MCP tool as effect-capable is the safe general
+# default, but it also caused successful SmartSearch results to carry
+# ``effect=unknown`` forever.  That prevented the Tool Context Editor from
+# replacing already-consumed 20-80K search/fetch bodies with receipts.
+#
+# Prefixes belong here only when the whole exposed server is read-only.  A
+# mixed read/write MCP server must keep the default ``unknown`` disposition
+# and classify individual tools through an explicit allowlist instead.
+NO_EFFECT_TOOL_PREFIXES = (
+    "mcp__smart_search__",
+    "mcp__context7__",
+)
+
 
 def tool_may_have_side_effect(tool_name: str) -> bool:
-    return tool_name not in NO_EFFECT_TOOL_NAMES
+    return (
+        tool_name not in NO_EFFECT_TOOL_NAMES
+        and not any(tool_name.startswith(prefix) for prefix in NO_EFFECT_TOOL_PREFIXES)
+    )
 
 
 def file_mutation_result_landed(tool_name: str, result: Any) -> bool:

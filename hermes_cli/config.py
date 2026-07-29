@@ -753,19 +753,21 @@ def _chown_to_hermes_uid(path) -> None:
 
 
 def _profile_group_access_enabled(path) -> bool:
-    """Return whether an explicit profile marker enables collaborative modes.
+    """Return whether an explicit home marker enables collaborative modes.
 
     Named profile homes are normally forced back to 0700/0600 whenever their
     skeleton is ensured. That also resets the effective ACL mask and silently
     revokes a collaborator's access after a restart. A profile owner can opt in
     to stable group access by creating ``.group_access`` in that profile root.
+    The deployment root uses the same marker because shared credentials live
+    there and a root ``config set`` must not collapse an existing collaborative
+    2770 home to 0700.
     """
     try:
         home = get_hermes_home().resolve()
         candidate = Path(path).resolve()
         return (
-            home.parent.name == "profiles"
-            and (home / ".group_access").is_file()
+            (home / ".group_access").is_file()
             and (candidate == home or candidate.is_relative_to(home))
         )
     except (OSError, RuntimeError, ValueError):
@@ -5963,6 +5965,9 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "require_mention",       # top-level convenience form honored by the gateway (#3979)
     "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
     "signal",            # Signal settings bridged to env vars by gateway/config.py
+    "tool_context_editor",  # phased receipt-driven tool-result cleanup
+    "observability",        # owner-only one-shot provider request snapshots
+    "episode_store",        # canonical local Episode store and Mem0 shadow state
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 

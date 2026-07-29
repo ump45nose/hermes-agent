@@ -237,6 +237,11 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+        # Per-tool mutation generations support caches whose validity depends
+        # on one handler/schema, not the whole registry. Tombstones are kept
+        # after deregistration so a later re-register cannot reuse an older
+        # generation and revive stale per-tool cache entries.
+        self._tool_generations: Dict[str, int] = {}
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
@@ -275,6 +280,20 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def get_generation(self) -> int:
+        """Return the current mutation generation under the registry lock."""
+        with self._lock:
+            return self._generation
+
+    def get_tool_generation(self, name: str) -> int:
+        """Return the mutation generation for one tool name.
+
+        Registering or deregistering another tool, and toolset alias changes,
+        do not affect this value. Unknown and never-registered names return 0.
+        """
+        with self._lock:
+            return self._tool_generations.get(name, 0)
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -445,6 +464,9 @@ class ToolRegistry:
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+            self._tool_generations[name] = (
+                self._tool_generations.get(name, 0) + 1
+            )
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
@@ -511,6 +533,9 @@ class ToolRegistry:
                     if target != entry.toolset
                 }
             self._generation += 1
+            self._tool_generations[name] = (
+                self._tool_generations.get(name, 0) + 1
+            )
         logger.debug("Deregistered tool: %s", name)
 
     # ------------------------------------------------------------------

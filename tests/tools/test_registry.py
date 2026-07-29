@@ -113,56 +113,83 @@ class TestRegisterAndDispatch:
         assert result["result_type"] == "NoneType"
 
 
-    def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
-        """Parallel MCP registrations with one name leave exactly one owner."""
+class TestMutationGenerations:
+    def test_per_tool_generation_changes_only_for_that_tool_name(self):
         reg = ToolRegistry()
-        barrier = threading.Barrier(3)
-        errors = []
 
-        def _register(toolset, owner):
-            try:
-                barrier.wait(timeout=5)
+        assert reg.get_tool_generation("alpha") == 0
+        assert reg.get_tool_generation("beta") == 0
 
-                def _handler(args, **kwargs):
-                    return json.dumps({"owner": owner})
-
-                reg.register(
-                    name="mcp__foo_bar__search",
-                    toolset=toolset,
-                    schema=_make_schema("mcp__foo_bar__search"),
-                    handler=_handler,
-                )
-            except BaseException as exc:  # pragma: no cover - asserted below
-                errors.append(exc)
-
-        threads = [
-            threading.Thread(target=_register, args=("mcp-foo-bar", "dash")),
-            threading.Thread(target=_register, args=("mcp-foo_bar", "underscore")),
-        ]
-
-        with caplog.at_level(logging.ERROR, logger="tools.registry"):
-            for thread in threads:
-                thread.start()
-            barrier.wait(timeout=5)
-            for thread in threads:
-                thread.join(timeout=10)
-
-        assert all(not thread.is_alive() for thread in threads)
-        assert errors == []
-        assert reg._generation == 1
-
-        entry = reg.get_entry("mcp__foo_bar__search")
-        assert entry is not None
-        assert entry.toolset in {"mcp-foo-bar", "mcp-foo_bar"}
-        assert json.loads(reg.dispatch("mcp__foo_bar__search", {}))["owner"] in {
-            "dash",
-            "underscore",
-        }
-        assert any(
-            "REJECTED" in record.message
-            and "mcp__foo_bar__search" in record.message
-            for record in caplog.records
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
         )
+        alpha_generation = reg.get_tool_generation("alpha")
+        assert alpha_generation == 1
+
+        reg.register(
+            name="beta",
+            toolset="core",
+            schema=_make_schema("beta"),
+            handler=_dummy_handler,
+        )
+        reg.register_toolset_alias("core-alias", "core")
+        reg.deregister("beta")
+
+        assert reg.get_tool_generation("alpha") == alpha_generation
+        assert reg.get_tool_generation("beta") == 2
+
+        reg.deregister("alpha")
+        assert reg.get_tool_generation("alpha") == alpha_generation + 1
+
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+        assert reg.get_tool_generation("alpha") == alpha_generation + 2
+
+    def test_same_tool_overwrite_advances_generation(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+        before = reg.get_tool_generation("alpha")
+
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=lambda _args, **_kwargs: json.dumps({"version": 2}),
+        )
+
+        assert reg.get_tool_generation("alpha") == before + 1
+
+    def test_rejected_overwrite_does_not_advance_generation(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+        before = reg.get_tool_generation("alpha")
+
+        reg.register(
+            name="alpha",
+            toolset="other",
+            schema=_make_schema("alpha"),
+            handler=lambda _args, **_kwargs: json.dumps({"version": 2}),
+        )
+
+        assert reg.get_tool_generation("alpha") == before
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):

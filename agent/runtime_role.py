@@ -30,9 +30,14 @@ CRON_OVERLAY = "这是定时进程：只执行当前计划任务，保持幂等�
 
 RESEARCH_LEAF_PROMPT = (
     "你是独立研究 leaf。使用可用研究工具深入检索并保存完整 Evidence bundle。"
-    "返回 claims、source_ids、contradictions、unexpected_findings、unresolved "
-    "以及 artifact 路径和 SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
+    "同一 canonical 参数不得重复检索；收到 duplicate receipt 后立即改用新来源或总结。"
+    "必须在预算耗尽前预留最终 handoff；max_iterations 只能标记 partial/unresolved。"
+    "最终只返回一个合法 JSON 对象（不要 Markdown 围栏），字段为 claims、source_ids、"
+    "contradictions、unexpected_findings、unresolved；运行时会补充 artifact 路径和 "
+    "SHA-256。不得分发、修改 Kanban、写 memory/shared-state。"
 )
+
+TOOL_ARTIFACT_TOOLSET = "tool_artifact"
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,48 @@ class RuntimeRoleResolution:
     role: str
     verified: bool
     reason: str
+
+
+def runtime_capability_overlay(
+    role: str,
+    *,
+    direct: set[str] | frozenset[str],
+    deferred: set[str] | frozenset[str],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Apply process-identity-only capability overlays."""
+    resolved_direct = set(direct)
+    resolved_deferred = set(deferred)
+    if role == "research_leaf":
+        resolved_direct.add(TOOL_ARTIFACT_TOOLSET)
+        resolved_deferred.discard(TOOL_ARTIFACT_TOOLSET)
+    else:
+        resolved_direct.discard(TOOL_ARTIFACT_TOOLSET)
+        resolved_deferred.discard(TOOL_ARTIFACT_TOOLSET)
+    return frozenset(resolved_direct), frozenset(resolved_deferred)
+
+
+def scope_runtime_toolsets(
+    role: str,
+    *,
+    enabled: list[str] | None,
+    disabled: list[str] | None,
+) -> tuple[list[str] | None, list[str]]:
+    """Enforce role-scoped toolsets before legacy/default-all resolution."""
+    scoped_disabled = list(disabled or [])
+    if role == "research_leaf":
+        scoped_enabled = None if enabled is None else list(enabled)
+        scoped_disabled = [
+            name for name in scoped_disabled if name != TOOL_ARTIFACT_TOOLSET
+        ]
+    else:
+        scoped_enabled = (
+            None
+            if enabled is None
+            else [name for name in enabled if name != TOOL_ARTIFACT_TOOLSET]
+        )
+        if TOOL_ARTIFACT_TOOLSET not in scoped_disabled:
+            scoped_disabled.append(TOOL_ARTIFACT_TOOLSET)
+    return scoped_enabled, scoped_disabled
 
 
 def _verified_worker_from_env() -> RuntimeRoleResolution:

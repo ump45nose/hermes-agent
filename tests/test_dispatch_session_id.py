@@ -73,3 +73,16 @@ class TestSessionIdForwarding:
                 skip_pre_tool_call_hook=True,
             )
         assert captured.get("task_id") == "task-999"
+
+    def test_runtime_role_is_forwarded_from_trusted_dispatch_context(self):
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                session_id="sess-1",
+                runtime_role="research_leaf",
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("runtime_role") == "research_leaf"

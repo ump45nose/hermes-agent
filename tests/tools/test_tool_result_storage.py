@@ -194,6 +194,7 @@ class TestBuildPersistedMessage:
         assert "50,000 characters" in msg
         assert "/tmp/hermes-results/test123.txt" in msg
         assert "read_file" in msg
+        assert "read_tool_artifact" in msg
         assert "first 100 chars..." in msg
         assert "..." in msg  # has_more indicator
 

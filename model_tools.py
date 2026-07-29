@@ -1099,6 +1099,7 @@ def handle_function_call(
     task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    runtime_role: Optional[str] = None,
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
@@ -1119,6 +1120,7 @@ def handle_function_call(
         function_name: Name of the function to call.
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
+        runtime_role: Trusted process role supplied by the agent runtime.
         user_task: The user's original task (for browser_snapshot context).
         enabled_tools: Tool names enabled for this session.  When provided,
                        execute_code uses this list to determine which sandbox
@@ -1247,6 +1249,7 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                runtime_role=runtime_role,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1278,6 +1281,28 @@ def handle_function_call(
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
+
+    _research_dedupe_pending: List[Tuple[Any, Dict[str, Any]]] = []
+
+    def _abort_research_dedupe_pending() -> None:
+        if not _research_dedupe_pending:
+            return
+        try:
+            from agent.research_tool_dedupe import (
+                abort_research_leaf_smart_search,
+            )
+        except Exception:
+            _research_dedupe_pending.clear()
+            return
+        while _research_dedupe_pending:
+            decision, _arguments = _research_dedupe_pending.pop()
+            try:
+                abort_research_leaf_smart_search(decision)
+            except Exception as _dedupe_abort_error:
+                logger.debug(
+                    "research SmartSearch dedupe abort failed: %s",
+                    _dedupe_abort_error,
+                )
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1382,20 +1407,101 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        runtime_role=runtime_role,
                         enabled_tools=sandbox_enabled,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
-                    )
-            if skip_tool_execution_middleware:
-                result = _dispatch(function_args)
-            else:
-                from hermes_cli.middleware import run_tool_execution_middleware
+                    # Execution middleware is expected to be single-use, but
+                    # custom/legacy middleware can retry the terminal call.
+                    # Only the last real dispatch may remain pending for the
+                    # final model-visible result; otherwise an exact retry
+                    # waits on its own lease and different retries cache one
+                    # aggregate result under multiple argument keys.
+                    _abort_research_dedupe_pending()
+                    decision = None
+                    try:
+                        from agent.research_tool_dedupe import (
+                            begin_research_leaf_smart_search,
+                            is_research_leaf_smart_search_dedupe_eligible,
+                        )
+
+                        dedupe_ready = True
+                        if is_research_leaf_smart_search_dedupe_eligible(
+                            runtime_role or "",
+                            session_id or "",
+                            function_name,
+                        ):
+                            entry = registry.get_entry(function_name)
+                            prepare = getattr(
+                                getattr(entry, "handler", None),
+                                "_hermes_prepare_for_dispatch",
+                                None,
+                            )
+                            if callable(prepare):
+                                try:
+                                    dedupe_ready = prepare() is True
+                                except Exception as _prepare_error:
+                                    # Lazy connection is an optimization here;
+                                    # the real dispatch must still run and
+                                    # surface its own result/error.
+                                    dedupe_ready = False
+                                    logger.debug(
+                                        "research SmartSearch lazy prepare "
+                                        "failed open: %s",
+                                        _prepare_error,
+                                    )
+
+                        if dedupe_ready:
+                            decision = begin_research_leaf_smart_search(
+                                runtime_role=runtime_role or "",
+                                session_id=session_id or "",
+                                tool_name=function_name,
+                                arguments=next_args,
+                                tool_generation=registry.get_tool_generation(
+                                    function_name
+                                ),
+                            )
+                            if decision.duplicate_result is not None:
+                                return decision.duplicate_result
+                    except Exception as _dedupe_begin_error:
+                        # Deduplication is an optimization and must never make
+                        # an otherwise valid retrieval unavailable.
+                        logger.debug(
+                            "research SmartSearch dedupe begin failed: %s",
+                            _dedupe_begin_error,
+                        )
+                        decision = None
+
+                    try:
+                        raw_result = registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            runtime_role=runtime_role,
+                            user_task=user_task,
+                        )
+                        if decision is not None and decision.owner:
+                            _research_dedupe_pending.append(
+                                (decision, dict(next_args))
+                            )
+                        return raw_result
+                    except BaseException:
+                        if decision is not None and decision.owner:
+                            try:
+                                from agent.research_tool_dedupe import (
+                                    abort_research_leaf_smart_search,
+                                )
+
+                                abort_research_leaf_smart_search(decision)
+                            except Exception as _dedupe_abort_error:
+                                logger.debug(
+                                    "research SmartSearch dedupe dispatch abort "
+                                    "failed: %s",
+                                    _dedupe_abort_error,
+                                )
+                        raise
+            from hermes_cli.middleware import run_tool_execution_middleware
 
                 result = run_tool_execution_middleware(
                     function_name,
@@ -1463,12 +1569,46 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
+        if _research_dedupe_pending:
+            try:
+                from agent.research_tool_dedupe import (
+                    abort_research_leaf_smart_search,
+                    finish_research_leaf_smart_search,
+                )
+
+                pending = list(_research_dedupe_pending)
+                for decision, effective_args in pending:
+                    try:
+                        finish_research_leaf_smart_search(
+                            decision,
+                            result,
+                            effective_args,
+                        )
+                    except Exception as _dedupe_finish_error:
+                        # The model-visible tool result remains authoritative.
+                        # A cache bookkeeping failure only forfeits dedupe.
+                        try:
+                            abort_research_leaf_smart_search(decision)
+                        except Exception:
+                            pass
+                        logger.debug(
+                            "research SmartSearch dedupe finish failed: %s",
+                            _dedupe_finish_error,
+                        )
+            except BaseException:
+                _abort_research_dedupe_pending()
+                raise
+            else:
+                _research_dedupe_pending.clear()
+
         return result
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+    finally:
+        _abort_research_dedupe_pending()
 
 
 # =============================================================================
