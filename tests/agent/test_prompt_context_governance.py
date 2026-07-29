@@ -99,15 +99,22 @@ def test_controller_lock_v2_provisions_protocol_capabilities(tmp_path):
 def test_controller_module_is_generic_control_protocol_not_incident_patch():
     text, lock = compile_profile_prompt("lingjun")
 
-    assert "直接处理、明确派单或进入 Triage" in text
+    assert "职责\n" in text
+    assert "自己处理\n" in text
+    assert "走 Kanban\n" in text
+    assert "边界\n" in text
+    assert "复杂链路范例\n" in text
+    assert "先调用 kanban_roster，再调用 kanban_create" in text
+    assert "派单成功后停止当前执行，由 Harness Park 当前会话" in text
+    assert "存在未终态的相关任务时，不得提前给出最终答案" in text
     assert "Harness 负责能力校验" in text
-    assert "多来源调查：交给研究能力" in text
+    assert "需要专业领域判断或执行、外部或多来源取证" in text
     for incident_term in ("GitHub MCP", "市场/JD", "样本描述成频率"):
         assert incident_term not in text
     controller = next(
         module for module in lock["modules"] if module["id"] == "controller"
     )
-    assert controller["version"] == 4
+    assert controller["version"] == 5
     assert controller["protocols"] == ["kanban-controller@1"]
 
 
