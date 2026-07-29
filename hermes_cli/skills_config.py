@@ -61,6 +61,18 @@ def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str
     return global_disabled | _normalize_skill_names(platform_disabled)
 
 
+def get_cron_only_skills(config: dict) -> Set[str]:
+    """Return skills that are available to cron jobs but hidden interactively.
+
+    Keep this separate from ``get_disabled_skills``: copying cron-only names
+    into ``skills.disabled`` would also disable them for cron.
+    """
+    skills_cfg = config.get("skills") or {}
+    if not isinstance(skills_cfg, dict):
+        return set()
+    return _normalize_skill_names(skills_cfg.get("cron_only"))
+
+
 def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[str] = None):
     """Persist disabled skill names to config."""
     config.setdefault("skills", {})

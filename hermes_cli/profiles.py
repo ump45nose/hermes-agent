@@ -46,6 +46,7 @@ _PROFILE_DIRS = [
     "plans",
     "workspace",
     "cron",
+    "prompt",
     # Back-compat/Docker HOME for tool subprocesses. Host subprocesses keep
     # the user's real HOME by default so normal CLI credentials remain visible;
     # containers still use this directory for persistent HOME state.
@@ -66,6 +67,8 @@ _CLONE_CONFIG_FILES = [
 _CLONE_SUBDIR_FILES = [
     "memories/MEMORY.md",
     "memories/USER.md",
+    "prompt/system.md",
+    "prompt/prompt.lock.yaml",
 ]
 
 # Runtime files stripped after --clone-all (shouldn't carry over).
@@ -995,6 +998,9 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
+    prompt_preset: Optional[str] = None,
+    prompt_modules: Optional[List[str]] = None,
+    prompt_model_family: str = "generic",
 ) -> Path:
     """Create a new profile directory.
 
@@ -1155,6 +1161,23 @@ def create_profile(
     # explicit runtime/history stripping above.
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
+
+    # Clone keeps compiled bytes and lock unchanged. A legacy source without
+    # them gets a one-time compile, never a runtime rebuild.
+    from hermes_cli.prompt_compiler import (
+        ensure_profile_governance_config,
+        load_compiled_prompt,
+        write_compiled_prompt,
+    )
+    ensure_profile_governance_config(profile_dir)
+    if load_compiled_prompt(profile_dir) is None:
+        known_presets = {"lingjun", "companion", "ops", "research", "xp"}
+        write_compiled_prompt(
+            profile_dir,
+            preset=prompt_preset or (canon if canon in known_presets else "default"),
+            extra_modules=prompt_modules or (),
+            model_family=prompt_model_family,
+        )
 
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an

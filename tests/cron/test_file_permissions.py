@@ -129,6 +129,25 @@ class TestSecureHelpers(unittest.TestCase):
         from cron.jobs import _secure_dir
         _secure_dir(Path("/nonexistent/path"))  # Should not raise
 
+    def test_profile_group_access_marker_preserves_cron_access(self):
+        from cron.jobs import _secure_dir, _secure_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = Path(tmp) / ".hermes" / "profiles"
+            home = profiles / "lingjun"
+            cron_dir = home / "cron"
+            cron_dir.mkdir(parents=True)
+            (home / ".group_access").write_text("enabled\n", encoding="utf-8")
+            jobs_file = cron_dir / "jobs.json"
+            jobs_file.write_text("{}\n", encoding="utf-8")
+
+            with patch("hermes_cli.config.get_hermes_home", return_value=home):
+                _secure_dir(cron_dir)
+                _secure_file(jobs_file)
+
+            self.assertEqual(stat.S_IMODE(cron_dir.stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE(jobs_file.stat().st_mode), 0o660)
+
 
 if __name__ == "__main__":
     unittest.main()

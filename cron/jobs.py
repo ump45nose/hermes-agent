@@ -458,19 +458,30 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _secure_dir(path: Path):
-    """Set directory to owner-only access (0700). No-op on Windows."""
+def _profile_group_access_enabled(path: Path) -> bool:
+    """Delegate profile collaboration policy to the canonical config helper."""
     try:
-        os.chmod(path, 0o700)
+        from hermes_cli.config import _profile_group_access_enabled as enabled
+        return enabled(path)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _secure_dir(path: Path):
+    """Secure a cron directory without revoking opted-in profile access."""
+    try:
+        mode = 0o2770 if _profile_group_access_enabled(path) else 0o700
+        os.chmod(path, mode)
     except (OSError, NotImplementedError):
         pass  # Windows or other platforms where chmod is not supported
 
 
 def _secure_file(path: Path):
-    """Set file to owner-only read/write (0600). No-op on Windows."""
+    """Secure a cron file without revoking opted-in profile access."""
     try:
         if path.exists():
-            os.chmod(path, 0o600)
+            mode = 0o660 if _profile_group_access_enabled(path) else 0o600
+            os.chmod(path, mode)
     except (OSError, NotImplementedError):
         pass
 

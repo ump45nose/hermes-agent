@@ -2592,13 +2592,22 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
+            loaded = json.loads(
+                skill_view(
+                    normalize_skill_lookup_name(skill_name),
+                    platform="cron",
+                )
+            )
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+            if loaded.get("quarantined"):
+                raise CronPromptInjectionBlocked(
+                    f"prompt_injection: Skill '{skill_name}' was quarantined: {error}"
+                )
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
             continue

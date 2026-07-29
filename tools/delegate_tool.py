@@ -18,9 +18,10 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
-import contextvars
+import hashlib
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -52,6 +53,25 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        # A delegated child created inside a dispatcher worker shares the
+        # process-wide HERMES_KANBAN_TASK environment.  Without an explicit
+        # deny, model_tools interprets that inherited identity as ownership and
+        # gives every child the parent's task lifecycle surface.  A child can
+        # then complete/block the parent task while siblings are still running,
+        # which removes their shared workspace underneath them.  The parent
+        # worker owns the handoff; children return results through delegation.
+        "kanban_show",
+        "kanban_list",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "kanban_link",
+        "kanban_unblock",
+        "kanban_attach",
+        "kanban_attach_url",
+        "kanban_attachments",
     ]
 )
 
@@ -1247,6 +1267,11 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+    is_research_leaf = (
+        effective_role == "leaf"
+        and (getattr(parent_agent, "_prompt_lock", {}) or {}).get("preset")
+        == "research"
+    )
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1285,6 +1310,22 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    if is_research_leaf:
+        configured_allowlist = delegation_cfg.get("research_leaf_toolsets")
+        if not isinstance(configured_allowlist, list):
+            configured_allowlist = [
+                "web",
+                "browser",
+                "context7",
+                "smart-search",
+            ]
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [
+            name
+            for name in configured_allowlist
+            if name in expanded_parent or name in parent_toolsets
+        ]
+
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
     # carry useful tools too. Pass exact one-tool deny toolsets through to the
@@ -1306,6 +1347,20 @@ def _build_child_agent(
             inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
         )
     )
+    if is_research_leaf:
+        child_disabled_toolsets = list(
+            dict.fromkeys(
+                child_disabled_toolsets
+                + [
+                    "terminal",
+                    "code_execution",
+                    "delegation",
+                    "kanban",
+                    "memory",
+                    "shared-state",
+                ]
+            )
+        )
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -1501,49 +1556,64 @@ def _build_child_agent(
 
     from agent.delegation_context import delegated_child_context
 
-    with delegated_child_context():
-        child = AIAgent(
-            base_url=effective_base_url,
-            api_key=effective_api_key,
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            acp_command=effective_acp_command,
-            acp_args=effective_acp_args,
-            max_iterations=max_iterations,
-
-            reasoning_config=child_reasoning,
-            prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
-            enabled_toolsets=child_toolsets,
-            disabled_toolsets=child_disabled_toolsets,
-            quiet_mode=True,
-            ephemeral_system_prompt=child_prompt,
-            log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
-            skip_context_files=True,
-            skip_memory=True,
-            clarify_callback=None,
-            thinking_callback=child_thinking_cb,
-            session_db=getattr(parent_agent, "_session_db", None),
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            providers_allowed=child_providers_allowed,
-            providers_ignored=child_providers_ignored,
-            providers_order=child_providers_order,
-            provider_sort=child_provider_sort,
-            provider_require_parameters=child_provider_require_parameters,
-            provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
-            openrouter_min_coding_score=child_openrouter_min_coding_score,
-            tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
+        reasoning_config=child_reasoning,
+        prefill_messages=getattr(parent_agent, "prefill_messages", None),
+        fallback_model=parent_fallback,
+        enabled_toolsets=child_toolsets,
+        disabled_toolsets=child_disabled_toolsets,
+        quiet_mode=True,
+        ephemeral_system_prompt=child_prompt,
+        log_prefix=f"[subagent-{task_index}]",
+        platform="subagent",
+        runtime_role="research_leaf" if is_research_leaf else "subagent",
+        skip_context_files=True,
+        skip_memory=True,
+        clarify_callback=None,
+        thinking_callback=child_thinking_cb,
+        session_db=getattr(parent_agent, "_session_db", None),
+        parent_session_id=getattr(parent_agent, "session_id", None),
+        providers_allowed=child_providers_allowed,
+        providers_ignored=child_providers_ignored,
+        providers_order=child_providers_order,
+        provider_sort=child_provider_sort,
+        provider_require_parameters=child_provider_require_parameters,
+        provider_data_collection=child_provider_data_collection,
+        request_overrides=(
+            dict(override_request_overrides or {})
+            if override_provider
+            else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        ),
+        openrouter_min_coding_score=child_openrouter_min_coding_score,
+        tool_progress_callback=child_progress_cb,
+        iteration_budget=None,  # fresh budget per subagent
+        **child_optional_kwargs,
+    )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if is_research_leaf:
+        _research_names = {
+            name.lower() for name in getattr(child, "reachable_tool_names", set())
+        }
+        if not any(
+            token in name
+            for name in _research_names
+            for token in ("search", "fetch", "browser", "context7", "web")
+        ):
+            child.close()
+            raise RuntimeError(
+                "research leaf has no reachable research-grade retrieval tools; "
+                "terminal remains unavailable and the leaf was not started"
+            )
+        from hermes_constants import get_hermes_home
+
+        child._research_artifact_dir = (
+            get_hermes_home()
+            / "artifacts"
+            / "research"
+            / str(getattr(parent_agent, "session_id", "session"))
+            / subagent_id
+        )
+        child._research_artifact_dir.mkdir(parents=True, exist_ok=True)
+        child._research_artifact_dir.chmod(0o700)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1809,6 +1879,63 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
     except Exception as exc:
         logger.debug("Failed to spill subagent summary to file: %s", exc)
         return None
+
+
+def _write_research_evidence_bundle(
+    child: Any,
+    *,
+    goal: str,
+    summary: str,
+    messages: List[Dict[str, Any]],
+    status: str,
+) -> tuple[str, str, str]:
+    """Persist full leaf evidence and return (envelope, path, sha256)."""
+    directory = getattr(child, "_research_artifact_dir", None)
+    if directory is None:
+        return summary, "", ""
+    payload = {
+        "goal": goal,
+        "status": status,
+        "report": summary,
+        "messages": messages,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    path = directory / "evidence-bundle.json"
+    path.write_text(raw, encoding="utf-8")
+    path.chmod(0o600)
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    urls = sorted(set(re.findall(r"https?://[^\s<>\")\]]+", summary)))
+    try:
+        parsed = json.loads(summary)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        envelope = {
+            "claims": parsed.get("claims") or [],
+            "source_ids": parsed.get("source_ids") or urls,
+            "contradictions": parsed.get("contradictions") or [],
+            "unexpected_findings": parsed.get("unexpected_findings") or [],
+            "unresolved": parsed.get("unresolved") or [],
+        }
+    else:
+        envelope = {
+            "claims": [summary] if summary else [],
+            "source_ids": urls,
+            "contradictions": [],
+            "unexpected_findings": [],
+            "unresolved": [] if status == "completed" else [status],
+        }
+    envelope["artifact_path"] = str(path)
+    envelope["artifact_sha256"] = digest
+    rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) > 12000:
+        envelope["claims"] = [
+            str(claim)[:7000] for claim in envelope.get("claims", [])[:1]
+        ]
+        envelope["unresolved"] = list(envelope.get("unresolved", []))[:20]
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        rendered = rendered[:12000]
+    return rendered, str(path), digest
 
 
 def _trim_summary_with_footer(
@@ -2376,6 +2503,19 @@ def _run_single_child(
         else:
             exit_reason = "max_iterations"
 
+        research_artifact_path = ""
+        research_artifact_sha256 = ""
+        if getattr(child, "runtime_role", "") == "research_leaf":
+            summary, research_artifact_path, research_artifact_sha256 = (
+                _write_research_evidence_bundle(
+                    child,
+                    goal=goal,
+                    summary=summary,
+                    messages=messages if isinstance(messages, list) else [],
+                    status=status,
+                )
+            )
+
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
@@ -2398,6 +2538,8 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "artifact_path": research_artifact_path or None,
+            "artifact_sha256": research_artifact_sha256 or None,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.

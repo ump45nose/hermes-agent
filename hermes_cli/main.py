@@ -2479,6 +2479,14 @@ def _resolve_use_tui(args) -> bool:
 
 
 def cmd_chat(args):
+    """Run chat inside the selected profile's isolated secret scope."""
+    from agent.secret_scope import profile_secret_scope_if_unset
+
+    with profile_secret_scope_if_unset(get_hermes_home()):
+        return _cmd_chat_scoped(args)
+
+
+def _cmd_chat_scoped(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 
@@ -14178,6 +14186,9 @@ def cmd_profile(args):
                 no_alias=no_alias,
                 no_skills=no_skills,
                 description=getattr(args, "description", None),
+                prompt_preset=getattr(args, "prompt_preset", None),
+                prompt_modules=getattr(args, "prompt_module", None),
+                prompt_model_family=getattr(args, "prompt_model_family", "generic"),
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
 
@@ -14270,6 +14281,77 @@ def cmd_profile(args):
         except (ValueError, FileExistsError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    elif action == "prompt":
+        from hermes_constants import get_canonical_hermes_root, get_profile_home
+        from hermes_cli.profiles import normalize_profile_name
+        from hermes_cli.prompt_compiler import (
+            load_compiled_prompt,
+            render_prompt_diff,
+            verify_compiled_prompt,
+            write_compiled_prompt,
+        )
+
+        name = normalize_profile_name(args.profile_name)
+        profile_dir = get_profile_home(name, root=get_canonical_hermes_root())
+        prompt_action = args.prompt_action
+        if prompt_action == "verify":
+            result = verify_compiled_prompt(profile_dir)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            if not result.get("ok"):
+                sys.exit(1)
+        else:
+            diff = render_prompt_diff(
+                profile_dir,
+                preset=getattr(args, "prompt_preset", None),
+                extra_modules=getattr(args, "prompt_module", None) or (),
+                model_family=getattr(args, "prompt_model_family", None),
+            )
+            print(diff or "(no changes)")
+            if prompt_action == "upgrade":
+                if not getattr(args, "yes", False):
+                    print("Refusing to write without --yes after reviewing the diff.")
+                    sys.exit(2)
+                loaded = load_compiled_prompt(profile_dir)
+                old_lock = loaded[1] if loaded else {}
+                write_compiled_prompt(
+                    profile_dir,
+                    preset=(
+                        getattr(args, "prompt_preset", None)
+                        or old_lock.get("preset")
+                        or "default"
+                    ),
+                    extra_modules=getattr(args, "prompt_module", None) or (),
+                    model_family=(
+                        getattr(args, "prompt_model_family", None)
+                        or (old_lock.get("model_adapter") or {}).get("family")
+                        or "generic"
+                    ),
+                    backup=True,
+                )
+                print("Prompt upgraded; previous files were backed up.")
+
+    elif action == "request-snapshot":
+        from hermes_constants import get_canonical_hermes_root, get_profile_home
+        from hermes_cli.profiles import normalize_profile_name
+
+        name = normalize_profile_name(args.profile_name)
+        directory = (
+            get_profile_home(name, root=get_canonical_hermes_root())
+            / "observability"
+            / "request-snapshots"
+        )
+        if not directory.is_dir():
+            print("(no request snapshots)")
+        elif args.request_id:
+            path = directory / f"{args.request_id}.redacted.json"
+            if not path.is_file():
+                print(f"Error: snapshot '{args.request_id}' not found", file=sys.stderr)
+                sys.exit(1)
+            print(path.read_text(encoding="utf-8"))
+        else:
+            for path in sorted(directory.glob("*.manifest.json")):
+                print(path.stem.removesuffix(".manifest"))
 
     elif action == "delete":
         name = args.profile_name

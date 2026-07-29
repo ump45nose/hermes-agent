@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -82,6 +83,8 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    extract_skill_conditions as _extract_skill_conditions,
+    is_model_invocation_disabled as _is_model_invocation_disabled,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -616,14 +619,14 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 
-def _get_disabled_skill_names() -> Set[str]:
+def _get_disabled_skill_names(platform: str = None) -> Set[str]:
     """Load disabled skill names from config.
 
     Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
     as a public re-export so existing callers don't need updating.
     """
     from agent.skill_utils import get_disabled_skill_names
-    return get_disabled_skill_names()
+    return get_disabled_skill_names(platform=platform)
 
 
 def _get_session_platform() -> str:
@@ -654,6 +657,11 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         skills_cfg = config.get("skills", {})
         resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
         global_disabled = skills_cfg.get("disabled", [])
+        cron_only = skills_cfg.get("cron_only", [])
+        if isinstance(cron_only, str):
+            cron_only = [cron_only]
+        if resolved_platform != "cron" and name in cron_only:
+            return True
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
             if platform_disabled is not None:
@@ -666,7 +674,9 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *, skip_disabled: bool = False, platform: str = None
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -687,7 +697,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    if skip_disabled:
+        disabled = set()
+    elif platform is None:
+        # Keep the no-override call shape stable for plugins/tests that
+        # monkeypatch this compatibility helper.
+        disabled = _get_disabled_skill_names()
+    else:
+        disabled = _get_disabled_skill_names(platform=platform)
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -758,6 +775,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "conditions": _extract_skill_conditions(frontmatter),
+                    "quarantined": any(
+                        pattern in content.lower()
+                        for pattern in _INJECTION_PATTERNS
+                    ),
+                    "model_invocation_disabled": _is_model_invocation_disabled(
+                        frontmatter
+                    ),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -780,6 +805,53 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
+
+
+def search_skills(
+    query: str,
+    limit: int = 3,
+    *,
+    available_tools: Optional[Set[str]] = None,
+    available_toolsets: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return a compact, condition-aware Skill index for model invocation."""
+    from agent.prompt_builder import _skill_should_show
+
+    query_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]+", query or "")
+    }
+    if not query_tokens:
+        return []
+
+    scored: List[Tuple[int, str, Dict[str, Any]]] = []
+    for skill in _find_all_skills():
+        if skill.get("model_invocation_disabled") or skill.get("quarantined"):
+            continue
+        if not _skill_should_show(
+            skill.get("conditions") or {},
+            available_tools,
+            available_toolsets,
+        ):
+            continue
+        text = " ".join(
+            str(skill.get(key) or "")
+            for key in ("name", "description", "category")
+        ).lower()
+        score = sum(3 if token in str(skill.get("name") or "").lower() else 1
+                    for token in query_tokens if token in text)
+        if score:
+            scored.append((score, str(skill.get("name") or ""), skill))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {
+            "name": skill.get("name"),
+            "description": str(skill.get("description") or "")[:240],
+            "category": skill.get("category"),
+        }
+        for _, _, skill in scored[: max(1, min(int(limit), 3))]
+    ]
 
 
 def skills_list(category: str = None, task_id: str = None) -> str:
@@ -811,7 +883,11 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             )
 
         # Find all skills
-        all_skills = _find_all_skills()
+        all_skills = [
+            skill
+            for skill in _find_all_skills()
+            if not skill.get("model_invocation_disabled")
+        ]
 
         if not all_skills:
             return json.dumps(
@@ -861,6 +937,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    explicit_user_invocation: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -891,6 +968,21 @@ def _serve_plugin_skill(
     except Exception:
         pass
 
+    if (
+        _is_model_invocation_disabled(parsed_frontmatter)
+        and not explicit_user_invocation
+    ):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{namespace}:{bare}' is user-invoked only. "
+                    f"The user must load it explicitly with /{bare}."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
             {
@@ -901,12 +993,28 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    # Injection scan — log but still serve (matches local-skill behaviour)
+    # Quarantine injection-shaped plugin content from model-driven loads.
+    # Explicit slash/preload invocations are the existing user-approval path.
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
             namespace, bare,
         )
+        if not explicit_user_invocation:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{namespace}:{bare}' is quarantined because its "
+                        "content contains prompt-injection patterns. The user "
+                        "must invoke it explicitly."
+                    ),
+                    "content_hash": content_hash,
+                    "quarantined": True,
+                },
+                ensure_ascii=False,
+            )
 
     description = str(parsed_frontmatter.get("description", ""))
     if len(description) > MAX_DESCRIPTION_LENGTH:
@@ -963,6 +1071,8 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    platform: str = None,
+    _explicit_user_invocation: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -975,6 +1085,11 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        platform: Internal platform override used by scheduled jobs so
+            ``skills.cron_only`` remains hidden from interactive sessions.
+        _explicit_user_invocation: Internal slash/preload bypass for skills
+            declaring ``disable-model-invocation: true``. This parameter is
+            intentionally absent from the public tool schema.
 
     Returns:
         JSON string with skill content or error message
@@ -1042,6 +1157,7 @@ def skill_view(
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    explicit_user_invocation=_explicit_user_invocation,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1207,7 +1323,10 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = [
+                s["name"]
+                for s in _sort_skills(_find_all_skills(platform=platform))[:20]
+            ]
             return json.dumps(
                 {
                     "success": False,
@@ -1259,6 +1378,23 @@ def skill_view(
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
 
+        if _injection_detected and not _explicit_user_invocation:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is quarantined because its content "
+                        "contains prompt-injection patterns. The user must "
+                        "invoke it explicitly."
+                    ),
+                    "content_hash": hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    "quarantined": True,
+                },
+                ensure_ascii=False,
+            )
+
         parsed_frontmatter: Dict[str, Any] = {}
         try:
             parsed_frontmatter, _ = _parse_frontmatter(content)
@@ -1277,7 +1413,21 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
-        if _is_skill_disabled(resolved_name):
+        if (
+            _is_model_invocation_disabled(parsed_frontmatter)
+            and not _explicit_user_invocation
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{resolved_name}' is user-invoked only. "
+                        f"The user must load it explicitly with /{resolved_name}."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if _is_skill_disabled(resolved_name, platform=platform):
             return json.dumps(
                 {
                     "success": False,

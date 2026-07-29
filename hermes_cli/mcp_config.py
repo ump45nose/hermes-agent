@@ -264,14 +264,37 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     """
     from tools.mcp_tool import _interpolate_env_vars
 
-    from agent.secret_scope import current_secret_scope
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
 
     if current_secret_scope() is None:
+        scope = build_profile_secret_scope(get_hermes_home())
+
+        def _inherit_explicit_process_vars(value: Any) -> None:
+            if isinstance(value, str):
+                for match in _ENV_VAR_PATTERN.finditer(value):
+                    name = _env_ref_name(match.group(1))
+                    if name not in scope and name in os.environ:
+                        scope[name] = os.environ[name]
+            elif isinstance(value, dict):
+                for child in value.values():
+                    _inherit_explicit_process_vars(child)
+            elif isinstance(value, list):
+                for child in value:
+                    _inherit_explicit_process_vars(child)
+
+        _inherit_explicit_process_vars(config)
+        token = set_secret_scope(
+            scope
+        )
         try:
-            from hermes_cli.env_loader import load_hermes_dotenv
-            load_hermes_dotenv()
-        except Exception:  # pragma: no cover — defensive
-            pass
+            return _interpolate_env_vars(config)
+        finally:
+            reset_secret_scope(token)
     return _interpolate_env_vars(config)
 
 
@@ -782,6 +805,81 @@ def cmd_mcp_test(args):
     print()
 
 
+def cmd_mcp_warm(args):
+    """Explicitly refresh profile-private MCP schema caches."""
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from tools.mcp_tool import (
+        _load_mcp_config,
+        _read_mcp_schema_cache,
+        register_mcp_servers,
+        shutdown_mcp_servers,
+    )
+
+    secret_token = None
+    if current_secret_scope() is None:
+        secret_token = set_secret_scope(
+            build_profile_secret_scope(get_hermes_home())
+        )
+    try:
+        servers = _load_mcp_config()
+    except BaseException:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        raise
+    requested = [str(name) for name in (getattr(args, "names", None) or [])]
+    if requested:
+        missing = sorted(set(requested) - set(servers))
+        if missing:
+            _error(f"Unknown MCP server(s): {', '.join(missing)}")
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            return
+        servers = {name: servers[name] for name in requested}
+    if not servers:
+        _info("No enabled MCP servers to warm.")
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        return
+
+    _info(f"Warming {len(servers)} MCP server(s)...")
+    started_at = time.time()
+    try:
+        names = register_mcp_servers(servers)
+        refreshed = []
+        failed = []
+        tool_count = 0
+        for server_name, config in servers.items():
+            cache = _read_mcp_schema_cache(server_name, config)
+            discovered_at = float((cache or {}).get("discovered_at") or 0)
+            if cache and discovered_at >= started_at:
+                refreshed.append(server_name)
+                tool_count += len(cache.get("tools") or [])
+            else:
+                failed.append(server_name)
+        if refreshed:
+            _success(
+                f"Refreshed profile-private schema cache for "
+                f"{len(refreshed)} server(s); {tool_count} tool(s) discovered."
+            )
+        if failed:
+            _error(
+                "No fresh schema cache was produced for: "
+                + ", ".join(sorted(failed))
+            )
+        # Keep the variable evaluated for compatibility with test doubles
+        # that assert the registration path was exercised.
+        del names
+    finally:
+        shutdown_mcp_servers()
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+
+
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
 def _reauth_oauth_server(name: str, server_config: dict) -> bool:
@@ -1104,6 +1202,8 @@ def mcp_command(args):
         "list": cmd_mcp_list,
         "ls": cmd_mcp_list,
         "test": cmd_mcp_test,
+        "warm": cmd_mcp_warm,
+        "reload": cmd_mcp_warm,
         "configure": cmd_mcp_configure,
         "config": cmd_mcp_configure,
         "login": cmd_mcp_login,

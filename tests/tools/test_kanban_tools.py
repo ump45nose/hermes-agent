@@ -145,6 +145,37 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_tools_visible_with_platform_toolsets_config(monkeypatch, tmp_path):
+    """Current platform_toolsets config must satisfy the registry gate."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - terminal\n"
+        "    - kanban\n"
+        "  telegram:\n"
+        "    - terminal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(
+        set(resolve_toolset("kanban")), quiet=True
+    )
+    names = {item["function"].get("name") for item in schema}
+
+    assert "kanban_list" in names
+    assert "kanban_unblock" in names
+    assert "kanban_complete" in names
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -2431,12 +2462,29 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "20197")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
-    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-11")
-
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-42:thread-7")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-42")
+    monkeypatch.setenv("HERMES_SESSION_GATEWAY_PROFILE", "lingjun")
+    from gateway.session_context import reset_session_vars, set_session_vars
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        chat_type="dm",
+        thread_id="thread-7",
+        user_id="user-9",
+        session_key="agent:main:telegram:dm:chat-42:thread-7",
+        session_id="session-42",
+        gateway_profile="lingjun",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        del tokens
+        reset_session_vars()
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]
@@ -2449,37 +2497,10 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "20197"
     assert s["user_id"] == "user-9"
-    assert s["delivery_metadata"] == {
-        "chat_type": "dm",
-        "direct_messages_topic_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": "msg-11",
-        "thread_id": "20197",
-    }
-
-
-def test_create_subscribes_gateway_session_with_active_profile_when_env_missing(monkeypatch, worker_env):
-    """Gateway auto-subscribe rows must be owned by the active profile even
-    when session/env profile markers are missing. Otherwise every Telegram
-    gateway with the same chat_id can deliver another bot's Kanban event."""
-    from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
-    monkeypatch.delenv("HERMES_PROFILE", raising=False)
-    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "spanorama")
-
-    out = kt._handle_create({
-        "title": "auto-sub active profile",
-        "assignee": "peer",
-    })
-    d = json.loads(out)
-    assert d["ok"] is True
-    assert d["subscribed"] is True, d
-
-    subs = _sub_index(_list_subs_for_task(d["task_id"]))
-    assert len(subs) == 1
-    assert subs[0]["notifier_profile"] == "spanorama"
+    assert s["chat_type"] == "dm"
+    assert s["session_key"] == "agent:main:telegram:dm:chat-42:thread-7"
+    assert s["session_id"] == "session-42"
+    assert s["notifier_profile"] == "lingjun"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

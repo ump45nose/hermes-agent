@@ -174,6 +174,27 @@ def run_oneshot(
     toolsets: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
+    """Run one turn inside the selected profile's isolated secret scope."""
+    from agent.secret_scope import profile_secret_scope_if_unset
+    from hermes_constants import get_hermes_home
+
+    with profile_secret_scope_if_unset(get_hermes_home()):
+        return _run_oneshot_scoped(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            usage_file=usage_file,
+        )
+
+
+def _run_oneshot_scoped(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    usage_file: Optional[str] = None,
+) -> int:
     """Execute a single prompt and print only the final content block.
 
     Args:

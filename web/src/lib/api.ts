@@ -624,6 +624,9 @@ export const api = {
     description?: string;
     provider?: string;
     model?: string;
+    prompt_preset?: string;
+    prompt_modules?: string[];
+    prompt_model_family?: "generic" | "openai" | "anthropic" | "google";
     mcp_servers?: McpServerCreate[];
     keep_skills?: string[];
     hub_skills?: string[];
@@ -2206,6 +2209,7 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+  cron_only?: boolean;
 }
 
 export interface SkillContent {
@@ -2237,6 +2241,10 @@ export interface ToolsetProviderEnvVar {
   prompt: string;
   url: string | null;
   default: string | null;
+  scope: "profile" | "global";
+  secret: boolean;
+  /** Present only for non-secret fields. */
+  value?: string;
   is_set: boolean;
 }
 

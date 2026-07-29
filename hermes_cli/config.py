@@ -752,6 +752,26 @@ def _chown_to_hermes_uid(path) -> None:
         pass
 
 
+def _profile_group_access_enabled(path) -> bool:
+    """Return whether an explicit profile marker enables collaborative modes.
+
+    Named profile homes are normally forced back to 0700/0600 whenever their
+    skeleton is ensured. That also resets the effective ACL mask and silently
+    revokes a collaborator's access after a restart. A profile owner can opt in
+    to stable group access by creating ``.group_access`` in that profile root.
+    """
+    try:
+        home = get_hermes_home().resolve()
+        candidate = Path(path).resolve()
+        return (
+            home.parent.name == "profiles"
+            and (home / ".group_access").is_file()
+            and (candidate == home or candidate.is_relative_to(home))
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _secure_dir(path):
     """Set directory to owner-only access (0700 by default). No-op on Windows.
 
@@ -774,7 +794,12 @@ def _secure_dir(path):
         return
     try:
         mode_str = os.environ.get("HERMES_HOME_MODE", "").strip()
-        mode = int(mode_str, 8) if mode_str else 0o700
+        if mode_str:
+            mode = int(mode_str, 8)
+        elif _profile_group_access_enabled(path):
+            mode = 0o2770
+        else:
+            mode = 0o700
     except ValueError:
         mode = 0o700
     try:
@@ -822,7 +847,8 @@ def _secure_file(path):
         return
     try:
         if os.path.exists(str(path)):
-            os.chmod(path, 0o600)
+            mode = 0o660 if _profile_group_access_enabled(path) else 0o600
+            os.chmod(path, mode)
     except (OSError, NotImplementedError):
         pass
 

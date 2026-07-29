@@ -239,12 +239,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
-    # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
-    # empty tool_calls array): the interim narration-only assistant turn
-    # and the "issue the actual tool call now" user nudge exist only to
-    # drive the bounded retry. Persisting them would replay the internal
-    # retry instruction as user-authored context on resume.
-    "_dropped_toolcall_nudge",
+    "_capability_transient",
 )
 
 
@@ -499,7 +494,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
-        requested_provider: str = None,
+        runtime_role: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -577,6 +572,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            runtime_role=runtime_role,
         )
 
     def _get_session_db_for_recall(self):
@@ -2004,6 +2000,12 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
+            from agent.capability_history import (
+                project_message as _project_capability_message,
+                transient_call_ids as _transient_capability_call_ids,
+            )
+            _capability_transient_ids = _transient_capability_call_ids(messages)
+
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
                     continue
@@ -2017,6 +2019,7 @@ class AIAgent:
                 # context. Skip regardless of position: an answered nudge leaves
                 # the synthetic pair buried mid-list, not just at the tail.
                 if _is_ephemeral_scaffolding(msg):
+                    msg[_DB_PERSISTED_MARKER] = True
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue
@@ -2026,16 +2029,23 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
-                role = msg.get("role", "unknown")
-                content = msg.get("content")
+                _durable_msg = _project_capability_message(
+                    msg,
+                    transient_ids=_capability_transient_ids,
+                )
+                if _durable_msg is None:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                role = _durable_msg.get("role", "unknown")
+                content = _durable_msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
                 # so replay can reproduce the sent prefix byte-for-byte.
-                _row_api_content = msg.get("api_content")
+                _row_api_content = _durable_msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
-                _row_timestamp = msg.get("timestamp")
+                _row_timestamp = _durable_msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete
                 # clean replacement for an API-local noted payload. Preserve the
@@ -2114,26 +2124,28 @@ class AIAgent:
                             _txt.append("[screenshot]")
                     content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
-                if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
+                if hasattr(_durable_msg, "tool_calls") and isinstance(_durable_msg.tool_calls, list) and _durable_msg.tool_calls:
                     tool_calls_data = [
                         {"name": tc.function.name, "arguments": tc.function.arguments}
-                        for tc in msg.tool_calls
+                        for tc in _durable_msg.tool_calls
                     ]
-                elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
+                elif isinstance(_durable_msg.get("tool_calls"), list):
+                    tool_calls_data = _durable_msg["tool_calls"]
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
-                    tool_name=msg.get("tool_name"),
+                    tool_name=_durable_msg.get("tool_name"),
                     tool_calls=tool_calls_data,
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning") if role == "assistant" else None,
-                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
-                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
-                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
-                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    tool_call_id=_durable_msg.get("tool_call_id"),
+                    effect_disposition=_durable_msg.get("effect_disposition"),
+                    tool_receipt=_durable_msg.get("_tool_receipt"),
+                    finish_reason=_durable_msg.get("finish_reason"),
+                    reasoning=_durable_msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_content=_durable_msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details=_durable_msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=_durable_msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=_durable_msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -2839,8 +2851,9 @@ class AIAgent:
             return
 
         try:
+            from agent.capability_history import durable_projection
             cleaned = []
-            for msg in messages:
+            for msg in durable_projection(messages):
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
@@ -6776,10 +6789,14 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        from agent.portal_tags import (
-            get_conversation_context,
-            reset_conversation_context,
-            set_conversation_context,
+        if getattr(self, "_progressive_disclosure", False):
+            from agent.capability_history import durable_projection
+
+            messages = durable_projection(messages)
+        return compress_context(
+            self, messages, system_message,
+            approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+            force=force,
         )
         # Out-of-turn compaction entry points — ``/compact`` (cli.py), the
         # gateway ``/compress`` command and its hygiene sweep (both of which
@@ -6918,13 +6935,21 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _is_research_parent = (
+            (getattr(self, "_prompt_lock", {}) or {}).get("preset") == "research"
+        )
+        _must_join = (
+            _is_research_parent
+            or getattr(self, "runtime_role", "interactive")
+            in {"kanban_worker", "cron"}
+        )
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(not _is_subagent and not _must_join),
             parent_agent=self,
         )
 

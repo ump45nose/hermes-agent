@@ -6320,6 +6320,7 @@ class TestNewEndpoints:
                 return [
                     {"name": "active-skill", "description": "active", "category": "demo"},
                     {"name": "disabled-skill", "description": "disabled", "category": "demo"},
+                    {"name": "cron-skill", "description": "scheduled", "category": "demo"},
                 ]
             return [
                 {"name": "active-skill", "description": "active", "category": "demo"},
@@ -6327,7 +6328,17 @@ class TestNewEndpoints:
 
         monkeypatch.setattr(skills_tool, "_find_all_skills", _fake_find_all_skills)
         monkeypatch.setattr(skills_config, "get_disabled_skills", lambda config: {"disabled-skill"})
-        monkeypatch.setattr(web_server, "load_config", lambda: {"skills": {"disabled": ["disabled-skill"]}})
+        monkeypatch.setattr(skills_config, "get_cron_only_skills", lambda config: {"cron-skill"})
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {
+                "skills": {
+                    "disabled": ["disabled-skill"],
+                    "cron_only": ["cron-skill"],
+                }
+            },
+        )
 
         resp = self.client.get("/api/skills")
 
@@ -6337,6 +6348,7 @@ class TestNewEndpoints:
                 "name": "active-skill",
                 "description": "active",
                 "category": "demo",
+                "cron_only": False,
                 "enabled": True,
                 "usage": 0,
                 "provenance": "agent",
@@ -6345,6 +6357,16 @@ class TestNewEndpoints:
                 "name": "disabled-skill",
                 "description": "disabled",
                 "category": "demo",
+                "cron_only": False,
+                "enabled": False,
+                "usage": 0,
+                "provenance": "agent",
+            },
+            {
+                "name": "cron-skill",
+                "description": "scheduled",
+                "category": "demo",
+                "cron_only": True,
                 "enabled": False,
                 "usage": 0,
                 "provenance": "agent",

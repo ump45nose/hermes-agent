@@ -295,6 +295,44 @@ class TestGetDisabledSkillNames:
         result = get_disabled_skill_names()
         assert result == {"global-skill"}
 
+    def test_cron_only_hidden_without_platform_but_visible_to_cron(
+        self, tmp_path, monkeypatch
+    ):
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "skills:\n"
+            "  disabled: [global-skill]\n"
+            "  cron_only: [daily-review]\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+        from agent.skill_utils import get_disabled_skill_names
+
+        assert get_disabled_skill_names() == {"global-skill", "daily-review"}
+        assert get_disabled_skill_names(platform="telegram") == {
+            "global-skill",
+            "daily-review",
+        }
+        assert get_disabled_skill_names(platform="cron") == {"global-skill"}
+
+    def test_config_helper_keeps_cron_only_separate_from_disabled(self):
+        from hermes_cli.skills_config import (
+            get_cron_only_skills,
+            get_disabled_skills,
+        )
+
+        config = {
+            "skills": {
+                "disabled": ["global-skill"],
+                "cron_only": ["daily-review"],
+            }
+        }
+
+        assert get_disabled_skills(config) == {"global-skill"}
+        assert get_cron_only_skills(config) == {"daily-review"}
+
 
 # ---------------------------------------------------------------------------
 # _find_all_skills — disabled filtering

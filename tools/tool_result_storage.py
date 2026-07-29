@@ -28,6 +28,7 @@ import os
 import re
 import shlex
 import uuid
+from pathlib import Path
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -148,6 +149,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    artifact_dir: str | os.PathLike[str] | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -174,9 +176,27 @@ def maybe_persist_tool_result(
     if len(content) <= effective_threshold:
         return content
 
-    storage_dir = _resolve_storage_dir(env)
+    storage_dir = str(artifact_dir) if artifact_dir else _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+
+    if artifact_dir:
+        try:
+            local_dir = Path(artifact_dir)
+            local_dir.mkdir(parents=True, exist_ok=True)
+            local_dir.chmod(0o700)
+            local_path = local_dir / _safe_result_filename(tool_use_id)
+            local_path.write_text(content, encoding="utf-8")
+            local_path.chmod(0o600)
+            logger.info(
+                "Persisted large tool result: %s (%s, %d chars -> %s)",
+                tool_name, tool_use_id, len(content), local_path,
+            )
+            return _build_persisted_message(
+                preview, has_more, len(content), str(local_path)
+            )
+        except Exception as exc:
+            logger.warning("Persistent artifact write failed for %s: %s", tool_use_id, exc)
 
     if env is not None:
         try:
@@ -204,6 +224,7 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    artifact_dir: str | os.PathLike[str] | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -241,6 +262,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            artifact_dir=artifact_dir,
         )
         if replacement != content:
             total_size -= size

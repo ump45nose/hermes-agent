@@ -171,6 +171,19 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return frontmatter, body
 
 
+def is_model_invocation_disabled(frontmatter: Dict[str, Any]) -> bool:
+    """Return whether a skill is available only through explicit user loading.
+
+    ``disable-model-invocation`` is the Agent Skills/Codex frontmatter field.
+    Accept a YAML boolean or a conservative string form so malformed-but-common
+    community frontmatter does not accidentally expose a user-only skill.
+    """
+    value = frontmatter.get("disable-model-invocation", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── Platform matching ─────────────────────────────────────────────────────
 
 
@@ -374,10 +387,10 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     Args:
         platform: Explicit platform name (e.g. ``"telegram"``).  When
             *None*, resolves from ``HERMES_PLATFORM`` or
-            ``HERMES_SESSION_PLATFORM`` env vars.  Returns the global
-            disabled list, unioned with the platform-specific list when a
-            platform is resolved (a globally-disabled skill stays disabled
-            on every platform).
+            ``HERMES_SESSION_PLATFORM`` env vars. Returns the global disabled
+            list plus ``skills.cron_only`` outside cron, unioned with the
+            platform-specific list when a platform is resolved. A globally
+            disabled skill stays disabled on every platform.
 
     Reads the config file directly (no CLI config imports) to stay
     lightweight.
@@ -397,13 +410,17 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         or get_session_env("HERMES_SESSION_PLATFORM")
     )
     global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
+    cron_only = _normalize_string_set(skills_cfg.get("cron_only"))
+    disabled = set(global_disabled)
+    if resolved_platform != "cron":
+        disabled.update(cron_only)
     if resolved_platform:
         platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
             resolved_platform
         )
         if platform_disabled is not None:
-            return global_disabled | _normalize_string_set(platform_disabled)
-    return global_disabled
+            disabled.update(_normalize_string_set(platform_disabled))
+    return disabled
 
 
 def _normalize_string_set(values) -> Set[str]:

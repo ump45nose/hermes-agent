@@ -55,6 +55,9 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+CAPABILITY_PROMPT_VERSION = 2
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -149,6 +152,104 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _build_fixed_profile_prompt_parts(
+    agent: Any,
+    system_message: Optional[str],
+) -> Dict[str, str]:
+    """Build the lean runtime around a creation-time compiled prompt."""
+    from agent.runtime_role import (
+        CRON_OVERLAY,
+        KANBAN_WORKER_OVERLAY,
+        RESEARCH_LEAF_PROMPT,
+    )
+
+    role = getattr(agent, "runtime_role", "interactive")
+    manifest: List[Dict[str, Any]] = []
+    stable_parts: List[str] = []
+    if role == "research_leaf":
+        stable_parts.append(RESEARCH_LEAF_PROMPT)
+        manifest.append({"kind": "runtime_overlay", "id": "research-leaf"})
+    else:
+        compiled = str(getattr(agent, "_compiled_prompt", "") or "").strip()
+        if compiled:
+            stable_parts.append(compiled)
+            manifest.append(
+                {
+                    "kind": "compiled_prompt",
+                    "sha256": (
+                        getattr(agent, "_prompt_lock", {}).get("compiled_sha256")
+                    ),
+                }
+            )
+        soul = _ra().load_soul_md(None)
+        if soul:
+            stable_parts.append(soul)
+            manifest.append({"kind": "soul"})
+
+        if role == "kanban_worker" and getattr(
+            agent, "_runtime_role_verified", False
+        ):
+            stable_parts.append(KANBAN_WORKER_OVERLAY)
+            manifest.append({"kind": "runtime_overlay", "id": "kanban-worker"})
+        elif role == "cron":
+            stable_parts.append(CRON_OVERLAY)
+            manifest.append({"kind": "runtime_overlay", "id": "cron"})
+
+    platform_key = (getattr(agent, "platform", "") or "").lower().strip()
+    default_hint = PLATFORM_HINTS.get(platform_key, "")
+    platform_hint = _resolve_platform_hint(agent, platform_key, default_hint)
+    if platform_hint:
+        stable_parts.append(platform_hint)
+        manifest.append({"kind": "runtime_overlay", "id": f"platform:{platform_key}"})
+
+    context_parts: List[str] = []
+    if system_message:
+        context_parts.append(system_message)
+        manifest.append({"kind": "caller_system"})
+
+    volatile_parts: List[str] = []
+    if agent._memory_store and role != "research_leaf":
+        if agent._memory_enabled:
+            memory = agent._memory_store.format_for_system_prompt("memory")
+            if memory:
+                volatile_parts.append(memory)
+                manifest.append({"kind": "memory"})
+        if agent._user_profile_enabled:
+            user = agent._memory_store.format_for_system_prompt("user")
+            if user:
+                volatile_parts.append(user)
+                manifest.append({"kind": "user"})
+
+    if agent._memory_manager and role != "research_leaf":
+        try:
+            external = agent._memory_manager.build_system_prompt()
+            if external:
+                volatile_parts.append(external)
+                manifest.append({"kind": "external_memory"})
+        except Exception:
+            pass
+
+    scenario = str(getattr(agent, "_scenario_context", "") or "").strip()
+    if scenario and role != "research_leaf":
+        volatile_parts.append(scenario)
+        manifest.append({"kind": "scenario"})
+
+    from hermes_time import now as _hermes_now
+    timestamp = f"Conversation started: {_hermes_now().strftime('%A, %B %d, %Y')}"
+    if agent.model:
+        timestamp += f"\nModel: {agent.model}"
+    if agent.provider:
+        timestamp += f"\nProvider: {agent.provider}"
+    volatile_parts.append(timestamp)
+    manifest.append({"kind": "runtime_metadata"})
+    agent._prompt_source_manifest = manifest
+    return {
+        "stable": "\n\n".join(part.strip() for part in stable_parts if part.strip()),
+        "context": "\n\n".join(part.strip() for part in context_parts if part.strip()),
+        "volatile": "\n\n".join(part.strip() for part in volatile_parts if part.strip()),
+    }
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -167,6 +268,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    if getattr(agent, "_compiled_prompt", ""):
+        return _build_fixed_profile_prompt_parts(agent, system_message)
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
@@ -185,6 +289,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+    if getattr(agent, "_progressive_disclosure", False):
+        stable_parts.append(
+            f"Capability-Prompt-Version: {CAPABILITY_PROMPT_VERSION}"
+        )
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
@@ -242,7 +350,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
-        stable_parts.append(" ".join(tool_guidance))
+        stable_parts.append("\n\n".join(tool_guidance))
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
@@ -360,12 +468,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_system_prompt_parts
 
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
-                platform=agent.platform,
-                cwd=resolve_context_cwd(),
-                model=agent.model,
-            )
-            stable_parts.extend(coding_prefix_parts)
+            if getattr(agent, "_coding_context", True):
+                stable_parts.extend(
+                    coding_system_blocks(
+                        platform=agent.platform,
+                        cwd=resolve_context_cwd(),
+                        model=agent.model,
+                    )
+                )
         except Exception:
             # Coding-context probing must never block prompt build.
             pass
@@ -409,20 +519,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     except Exception:
         active_profile = "default"
     if active_profile == "default":
-        post_workspace_parts.append(
+        from hermes_constants import get_canonical_hermes_root
+        _root = get_canonical_hermes_root()
+        stable_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "under " + str(_root) + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
         )
     else:
-        post_workspace_parts.append(
+        from hermes_constants import get_canonical_hermes_root, get_profile_home
+        _root = get_canonical_hermes_root()
+        _profile_home = get_profile_home(active_profile, root=_root)
+        stable_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {_profile_home}/. The default "
+            f"profile's data lives at {_root}/skills/, {_root}/plugins/, "
+            f"{_root}/cron/, {_root}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "

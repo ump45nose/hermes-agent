@@ -9,6 +9,9 @@ Saves per-platform tool configuration to ~/.hermes/config.yaml under
 the `platform_toolsets` key.
 """
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+
 import json as _json
 import logging
 import os
@@ -34,6 +37,42 @@ from tools.tool_backend_helpers import fal_key_is_configured
 from utils import base_url_hostname, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _provider_env_scope(env_var: dict):
+    """Apply an env-var schema's profile or machine-global storage scope."""
+    if env_var.get("scope") != "global":
+        yield
+        return
+
+    from hermes_constants import (
+        get_default_hermes_root,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def get_provider_env_value(env_var: dict) -> Optional[str]:
+    """Read one provider env field while honoring its declared scope."""
+    with _provider_env_scope(env_var):
+        if env_var.get("scope") == "global":
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            return get_env_value_prefer_dotenv(env_var["key"])
+        return get_env_value(env_var["key"])
+
+
+def save_provider_env_value(env_var: dict, value: str) -> None:
+    """Write one provider env field while honoring its declared scope."""
+    with _provider_env_scope(env_var):
+        save_env_value(env_var["key"], value)
 
 
 def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
@@ -1885,6 +1924,124 @@ def _exempt_explicit_platform_native(
             default_off.discard(ts)
 
 
+@dataclass(frozen=True)
+class PlatformToolExposure:
+    """Resolved permission and schema-exposure policy for one platform."""
+
+    mode: str
+    direct: frozenset[str]
+    deferred: frozenset[str]
+
+    @property
+    def reachable(self) -> frozenset[str]:
+        return self.direct | self.deferred
+
+    @property
+    def progressive(self) -> bool:
+        return self.mode == "progressive"
+
+
+def _get_platform_tool_exposure(config: dict, platform: str) -> PlatformToolExposure:
+    """Resolve legacy or V2 platform capability configuration.
+
+    A mapping-shaped ``platform_toolsets.<platform>`` is deliberately strict:
+    malformed groups, overlaps, and unknown names fail closed instead of
+    silently expanding to the platform default.
+    """
+    from toolsets import validate_toolset
+
+    platform_map = config.get("platform_toolsets") or {}
+    raw = platform_map.get(platform)
+    if not isinstance(raw, dict):
+        disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+        if isinstance(disclosure, dict) and disclosure.get("mode") == "progressive":
+            if disclosure.get("schema_scope", "turn") != "turn":
+                raise ValueError(
+                    "progressive disclosure currently requires schema_scope: turn"
+                )
+            # V2 separates permission from exposure and is allowlist-based.
+            # An unlisted platform therefore has no reachable functional
+            # capabilities; only the four runtime bridges remain visible.
+            return PlatformToolExposure(
+                mode="progressive",
+                direct=frozenset(),
+                deferred=frozenset(),
+            )
+        legacy = _get_platform_tools(config, platform)
+        return PlatformToolExposure(
+            mode="legacy",
+            direct=frozenset(legacy),
+            deferred=frozenset(),
+        )
+
+    disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+    if not isinstance(disclosure, dict):
+        disclosure = {}
+    if disclosure.get("mode") != "progressive":
+        raise ValueError(
+            f"platform_toolsets.{platform} uses V2 structure but "
+            "tools.disclosure.mode is not 'progressive'"
+        )
+    if disclosure.get("schema_scope", "turn") != "turn":
+        raise ValueError("progressive disclosure currently requires schema_scope: turn")
+
+    def _group(name: str) -> frozenset[str]:
+        value = raw.get(name, [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise ValueError(
+                f"platform_toolsets.{platform}.{name} must be a list of names"
+            )
+        return frozenset(item.strip() for item in value)
+
+    unknown_keys = set(raw) - {"direct", "deferred"}
+    if unknown_keys:
+        raise ValueError(
+            f"unknown platform_toolsets.{platform} keys: "
+            + ", ".join(sorted(unknown_keys))
+        )
+
+    direct = _group("direct")
+    deferred = _group("deferred")
+    overlap = direct & deferred
+    if overlap:
+        raise ValueError(
+            f"platform_toolsets.{platform} direct/deferred overlap: "
+            + ", ".join(sorted(overlap))
+        )
+
+    configured_mcp = enabled_mcp_server_names(config)
+    unknown = {
+        name
+        for name in direct | deferred
+        if not validate_toolset(name) and name not in configured_mcp
+    }
+    if unknown:
+        raise ValueError(
+            f"platform_toolsets.{platform} contains unknown capabilities: "
+            + ", ".join(sorted(unknown))
+        )
+
+    # Worker-only Kanban is an explicit profile policy. It augments reachability
+    # only in a dispatcher worker, never in normal chat.
+    kanban_cfg = ((config.get("tools") or {}).get("kanban") or {})
+    from agent.runtime_role import _verified_worker_from_env
+    _worker_verified = _verified_worker_from_env().verified
+    if (
+        _worker_verified
+        and isinstance(kanban_cfg, dict)
+        and kanban_cfg.get("worker_only") is True
+    ):
+        deferred = frozenset(set(deferred) | {"kanban"})
+
+    return PlatformToolExposure(
+        mode="progressive",
+        direct=direct,
+        deferred=deferred,
+    )
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
@@ -1895,6 +2052,15 @@ def _get_platform_tools(
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
+    disclosure = ((config.get("tools") or {}).get("disclosure") or {})
+    if (
+        isinstance(platform_toolsets.get(platform), dict)
+        or (
+            isinstance(disclosure, dict)
+            and disclosure.get("mode") == "progressive"
+        )
+    ):
+        return set(_get_platform_tool_exposure(config, platform).reachable)
     toolset_names = platform_toolsets.get(platform)
     # Track whether the user explicitly saved a toolset list for this platform
     # (vs. falling back to the platform default). An explicit composite (e.g.
@@ -2285,7 +2451,24 @@ def _toolset_has_keys(
         except Exception:
             return False
 
-    if ts_key in {"web", "image_gen", "video_gen", "tts", "browser"}:
+    plugins_cfg = config.get("plugins")
+    disabled_plugins = (
+        set(plugins_cfg.get("disabled", []))
+        if isinstance(plugins_cfg, dict)
+        and isinstance(plugins_cfg.get("disabled"), list)
+        else set()
+    )
+    fal_image_disabled = (
+        ts_key == "image_gen"
+        and (
+            "image_gen/fal" in disabled_plugins
+            or "fal" in disabled_plugins
+        )
+    )
+    if (
+        ts_key in {"web", "image_gen", "video_gen", "tts", "browser"}
+        and not fal_image_disabled
+    ):
         features = get_nous_subscription_features(config, force_fresh=force_fresh)
         feature = features.features.get(ts_key)
         if feature and (feature.available or feature.managed_by_nous):
@@ -2298,7 +2481,7 @@ def _toolset_has_keys(
             env_vars = provider.get("env_vars", [])
             if not env_vars:
                 return True  # No-key provider (e.g. Local Browser, Edge TTS)
-            if all(get_env_value(e["key"]) for e in env_vars):
+            if all(get_provider_env_value(e) for e in env_vars):
                 return True
         return False
 
@@ -2736,6 +2919,16 @@ def _visible_providers(
     login + entitlement check (see ``_configure_provider``); the row only
     *activates* the gateway once paid access is confirmed.
     """
+    plugins_cfg = config.get("plugins")
+    disabled_plugins = set()
+    if isinstance(plugins_cfg, dict) and isinstance(plugins_cfg.get("disabled"), list):
+        disabled_plugins = {
+            str(item).strip()
+            for item in plugins_cfg["disabled"]
+            if str(item).strip()
+        }
+    fal_disabled = "image_gen/fal" in disabled_plugins or "fal" in disabled_plugins
+
     features = get_nous_subscription_features(config, force_fresh=force_fresh)
     acct = features.account_info
     # Pool-only users (entitled to managed tools via the free tool pool but with
@@ -2751,6 +2944,9 @@ def _visible_providers(
     )
     visible = []
     for provider in cat.get("providers", []):
+        # The managed image row is another UI for the bundled FAL backend.
+        if fal_disabled and provider.get("managed_nous_feature") == "image_gen":
+            continue
         # Nous-managed Tool Gateway rows stay visible regardless of auth —
         # selecting one drives an inline Portal login. A `requires_nous_auth`
         # row that is NOT a managed gateway feature (pure pre-auth UX) is
@@ -2774,7 +2970,14 @@ def _visible_providers(
     # Inject plugin-registered image_gen backends (OpenAI today, more
     # later) so the picker lists them alongside FAL / Nous Subscription.
     if cat.get("name") == "Image Generation":
-        visible.extend(_plugin_image_gen_providers())
+        visible.extend(
+            row
+            for row in _plugin_image_gen_providers()
+            if (
+                row.get("image_gen_plugin_name") not in disabled_plugins
+                and f"image_gen/{row.get('image_gen_plugin_name')}" not in disabled_plugins
+            )
+        )
 
     # Inject plugin-registered video_gen backends. Unlike image_gen,
     # video_gen has NO hardcoded providers — every backend is a plugin.
@@ -2941,7 +3144,7 @@ def provider_readiness_status(
     """
     env_vars = provider.get("env_vars", [])
     if env_vars:
-        if all(get_env_value(e["key"]) for e in env_vars):
+        if all(get_provider_env_value(e) for e in env_vars):
             return "ready"
         return "needs_keys"
 
@@ -3134,7 +3337,7 @@ def _configure_tool_category(
             tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            if not env_vars or all(get_provider_env_value(v) for v in env_vars):
                 if _is_provider_active(p, config, force_fresh=force_fresh):
                     configured = " [active]"
                 elif not env_vars:
@@ -3261,7 +3464,7 @@ def _detect_active_provider_index(
             return i
         # Fallback: env vars present → likely configured
         env_vars = p.get("env_vars", [])
-        if env_vars and all(get_env_value(v["key"]) for v in env_vars):
+        if env_vars and all(get_provider_env_value(v) for v in env_vars):
             return i
     return 0
 
@@ -3839,7 +4042,7 @@ def _configure_provider(
         _print_info("  Available through Nous Portal subscription.")
 
     for var in env_vars:
-        existing = get_env_value(var["key"])
+        existing = get_provider_env_value(var)
         if existing:
             _print_success(f"  {var['key']}: already configured")
             # Don't ask to update - this is a new enable flow.
@@ -3853,10 +4056,13 @@ def _configure_provider(
             if default_val:
                 value = _prompt(f"    {var.get('prompt', var['key'])}", default_val)
             else:
-                value = _prompt(f"    {var.get('prompt', var['key'])}", password=True)
+                value = _prompt(
+                    f"    {var.get('prompt', var['key'])}",
+                    password=bool(var.get("secret", True)),
+                )
 
             if value:
-                save_env_value(var["key"], value)
+                save_provider_env_value(var, value)
                 _print_success("    Saved")
             else:
                 _print_warning("    Skipped")
@@ -4187,7 +4393,7 @@ def _configure_tool_category_for_reconfig(
             tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            if not env_vars or all(get_provider_env_value(v) for v in env_vars):
                 if _is_provider_active(p, config, force_fresh=force_fresh):
                     configured = " [active]"
                 elif not env_vars:
@@ -4319,16 +4525,19 @@ def _reconfigure_provider(
         return
 
     for var in env_vars:
-        existing = get_env_value(var["key"])
+        existing = get_provider_env_value(var)
         if existing:
             _print_info(f"  {var['key']}: configured ({existing[:8]}...)")
         url = var.get("url", "")
         if url:
             _print_info(f"  Get yours at: {url}")
         default_val = var.get("default", "")
-        value = _prompt(f"    {var.get('prompt', var['key'])} (Enter to keep current)", password=not default_val)
+        value = _prompt(
+            f"    {var.get('prompt', var['key'])} (Enter to keep current)",
+            password=bool(var.get("secret", True)),
+        )
         if value and value.strip():
-            save_env_value(var["key"], value.strip())
+            save_provider_env_value(var, value.strip())
             _print_success("    Updated")
         else:
             _print_info("    Kept current")

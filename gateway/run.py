@@ -13184,6 +13184,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        pinned_session_key = str(
+            (getattr(event, "metadata", None) or {}).get("gateway_session_key")
+            or ""
+        ).strip()
+        if pinned_session_key and pinned_session_key != session_key:
+            logger.warning(
+                "Async completion canonical session-key mismatch: expected %s, "
+                "resolved %s — dropping injection instead of waking a fresh "
+                "conversation.",
+                pinned_session_key,
+                session_key,
+            )
+            return
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -13773,6 +13786,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    skip_context_files=True,
+                                    load_soul_identity=True,
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -16244,6 +16259,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
+                    skip_context_files=True,
+                    load_soul_identity=True,
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
@@ -17836,12 +17853,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 str(context.source.chat_type) if context.source.chat_type else ""
             ),
             chat_name=context.source.chat_name or "",
+            chat_type=context.source.chat_type or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            gateway_profile=self._active_profile_name(),
             async_delivery=_async_delivery,
         )
 
@@ -22134,6 +22154,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=getattr(self._session_db, "_db", self._session_db),
+                    skip_context_files=True,
+                    load_soul_identity=True,
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )

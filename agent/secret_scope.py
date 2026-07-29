@@ -23,9 +23,10 @@ Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A)
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, Iterator, Mapping, Optional
 
 
 # ── multiplex-active flag ────────────────────────────────────────────────
@@ -212,24 +213,48 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build the effective secret mapping for a Hermes home.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    A named profile at ``<root>/profiles/<name>`` inherits the shared secret
+    baseline from ``<root>/.env`` and then overlays its own ``.env``. The
+    profile layer is therefore able to carry identity-specific credentials
+    while shared provider credentials remain root-owned. A non-profile home
+    keeps the legacy behavior of loading only its own ``.env``.
+
+    Returns a fresh dict (safe to install via ``set_secret_scope``) without
+    mutating ``os.environ``. Genuinely global vars are intentionally NOT copied
+    in — ``get_secret`` reads those from ``os.environ`` directly.
     """
     home = Path(hermes_home)
-    secrets = load_env_file(home / ".env")
+    shared_home = home.parent.parent if home.parent.name == "profiles" else home
 
-    try:
-        from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(home)
-    except Exception:
-        external_secrets = {}
-
-    for key, value in external_secrets.items():
-        if _is_global_env(key):
-            continue
-        secrets[key] = value
-
+    secrets = load_env_file(shared_home / ".env")
+    if shared_home != home:
+        secrets.update(load_env_file(home / ".env"))
     return secrets
+
+
+@contextmanager
+def profile_secret_scope_if_unset(hermes_home: Path) -> Iterator[Mapping[str, str]]:
+    """Install a root-baseline + profile-overlay scope for standalone callers.
+
+    Gateway multiplexing already establishes the active profile scope around
+    each routed request.  Standalone CLI entrypoints do not have that outer
+    request wrapper, so a named profile would otherwise see only whichever
+    values happened to be loaded into ``os.environ``.  Install a temporary
+    scope only when the caller is currently unscoped, and always restore it.
+
+    This deliberately does not mutate ``os.environ`` and therefore cannot
+    union credentials from multiple profiles in a long-running process.
+    """
+    existing = current_secret_scope()
+    if existing is not None:
+        yield existing
+        return
+
+    scope = build_profile_secret_scope(Path(hermes_home))
+    token = set_secret_scope(scope)
+    try:
+        yield scope
+    finally:
+        reset_secret_scope(token)

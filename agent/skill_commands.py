@@ -202,7 +202,12 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         normalized = normalize_skill_lookup_name(raw_identifier)
 
         loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
+            skill_view(
+                normalized,
+                task_id=task_id,
+                preprocess=False,
+                _explicit_user_invocation=True,
+            )
         )
     except Exception:
         return None

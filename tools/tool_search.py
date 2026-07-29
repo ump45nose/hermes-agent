@@ -37,10 +37,12 @@ for the full rationale):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import re
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -53,8 +55,14 @@ logger = logging.getLogger("tools.tool_search")
 TOOL_SEARCH_NAME = "tool_search"
 TOOL_DESCRIBE_NAME = "tool_describe"
 TOOL_CALL_NAME = "tool_call"
+SKILL_SEARCH_NAME = "skill_search"
 
-BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
+BRIDGE_TOOL_NAMES = frozenset({
+    TOOL_SEARCH_NAME,
+    TOOL_DESCRIBE_NAME,
+    TOOL_CALL_NAME,
+    SKILL_SEARCH_NAME,
+})
 
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
@@ -225,7 +233,11 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    progressive: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -241,7 +253,9 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if progressive:
+            deferrable.append(td)
+        elif is_deferrable_tool_name(name):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -268,6 +282,72 @@ def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
         except (TypeError, ValueError):
             total_chars += len(str(td))
     return int(math.ceil(total_chars / CHARS_PER_TOKEN))
+
+
+def compact_tool_schema(
+    tool_def: Dict[str, Any],
+    *,
+    target_bytes: int = 3072,
+    hard_limit_bytes: int = 4096,
+) -> Dict[str, Any]:
+    """Remove tutorial prose while preserving executable JSON constraints."""
+    compact = copy.deepcopy(tool_def)
+
+    def _walk(node: Any, *, root_description: bool = False) -> None:
+        if isinstance(node, dict):
+            node.pop("examples", None)
+            node.pop("$comment", None)
+            desc = node.get("description")
+            if isinstance(desc, str):
+                cap = 600 if root_description else 240
+                if len(desc) > cap:
+                    node["description"] = desc[: cap - 1].rstrip() + "…"
+            for key, value in list(node.items()):
+                _walk(value, root_description=(key == "function"))
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value)
+
+    _walk(compact)
+
+    def _size() -> int:
+        return len(
+            json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode()
+        )
+
+    if _size() <= target_bytes:
+        return compact
+
+    descriptions: List[Tuple[Dict[str, Any], str]] = []
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("description"), str):
+                descriptions.append((node, node["description"]))
+            for value in node.values():
+                _collect(value)
+        elif isinstance(node, list):
+            for value in node:
+                _collect(value)
+
+    _collect(compact)
+    for node, description in sorted(
+        descriptions, key=lambda item: len(item[1]), reverse=True
+    ):
+        if _size() <= target_bytes:
+            break
+        node["description"] = description[:119].rstrip() + "…"
+    for node, _ in descriptions:
+        if _size() <= hard_limit_bytes:
+            break
+        node.pop("description", None)
+
+    compact_name = str((compact.get("function") or {}).get("name") or "")
+    if _size() > hard_limit_bytes and not compact_name.startswith("mcp__"):
+        raise ValueError(
+            f"tool schema exceeds hard limit after compaction: {_size()} bytes"
+        )
+    return compact
 
 
 def should_activate(
@@ -324,6 +404,7 @@ class CatalogEntry:
     schema: Dict[str, Any]  # The full {"type":"function", "function": {...}} entry.
     source: str  # "mcp" | "plugin" | "other"
     source_name: str  # Toolset name, e.g. "mcp-github" or "kanban"
+    schema_hash: str = ""
 
     # Pre-tokenized fields for BM25.
     _tokens: List[str] = field(default_factory=list)
@@ -390,6 +471,7 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
             schema=td,
             source=source,
             source_name=source_name,
+            schema_hash=_schema_hash(td),
             _tokens=_tokenize(_entry_search_text(td)),
         )
         catalog.append(entry)
@@ -475,159 +557,15 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
 # ---------------------------------------------------------------------------
 
 
-_SENTENCE_END_RE = re.compile(r"[.!?\n]")
+def _schema_hash(schema: Dict[str, Any]) -> str:
+    """Return a stable, short content identity for one sanitized schema."""
+    payload = json.dumps(
+        schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
-def _short_desc(description: str, max_chars: int = 60) -> str:
-    """First sentence of a tool description, clipped to ``max_chars``.
-
-    Mirrors the skills-listing convention: one terse line per capability.
-    Whitespace is collapsed; a hard clip never cuts mid-word unless the
-    first word itself exceeds the budget.
-    """
-    text = " ".join((description or "").split())
-    if not text:
-        return ""
-    m = _SENTENCE_END_RE.search(text)
-    if m:
-        text = text[:m.start() + (1 if text[m.start()] == "." else 0)]
-    if len(text) <= max_chars:
-        return text
-    clipped = text[:max_chars]
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0]
-    return clipped.rstrip(",;: ") + "…"
-
-
-def _listing_group_label(source_name: str) -> str:
-    """Human-facing group heading for a toolset, e.g. ``mcp-github`` -> ``github``."""
-    label = source_name or "other"
-    if label.startswith("mcp-"):
-        label = label[4:]
-    return label
-
-
-def build_catalog_listing(
-    deferrable: List[Dict[str, Any]],
-    *,
-    max_tokens: int = 20000,
-) -> Optional[str]:
-    """Render a skills-style manifest of the deferred catalog.
-
-    One line per tool — ``name: short description`` — grouped under a
-    heading per source (MCP server / plugin toolset), exactly like the
-    bundled-skills listing in the system prompt:
-
-        github tools: (44)
-        - create_issue: Open a new issue in a GitHub repository.
-        - merge_pull_request: Merge an open pull request.
-        ...
-
-    Ordering is deterministic (groups and tools sorted by name) so the
-    rendered block is byte-stable across assemblies of the same catalog —
-    this keeps the request prefix cacheable across turns.
-
-    Token-budget fallbacks (cheap chars/4 estimate, same rule as the
-    activation gate):
-      1. full listing (names + short descriptions)
-      2. names-only listing, still grouped
-      3. server-level summary — one line per MCP server / plugin toolset
-         (name + tool count), so the model always knows WHICH domains are
-         reachable through the bridge even when per-tool names don't fit
-      4. ``None`` — only when the summary itself exceeds the budget
-    """
-    text, _form = build_catalog_listing_with_form(deferrable, max_tokens=max_tokens)
-    return text
-
-
-def build_catalog_listing_with_form(
-    deferrable: List[Dict[str, Any]],
-    *,
-    max_tokens: int = 20000,
-) -> Tuple[Optional[str], str]:
-    """Like :func:`build_catalog_listing` but also reports the form used.
-
-    Returns ``(text, form)`` where ``form`` is ``"full"`` (names + short
-    descriptions), ``"names"`` (names-only fallback), ``"mixed"`` (per-server
-    degradation: small servers keep per-tool lines, oversized servers
-    collapse to a name + tool-count summary line), ``"groups"`` (every
-    server summarized), or ``"none"`` (over budget in every form).
-
-    Degradation is PER SERVER, not global: one huge server (Cloudflare's
-    3,320 flat tools) must not cost a small co-attached server (Linear's 24)
-    its listing. Greedy fit, smallest rendered group first, is deterministic
-    for a given catalog — byte-stable across assemblies, cache-safe.
-    """
-    if not deferrable:
-        return None, "none"
-
-    groups: Dict[str, List[Tuple[str, str]]] = {}
-    for td in deferrable:
-        fn = td.get("function") or {}
-        name = fn.get("name", "")
-        if not name:
-            continue
-        source, source_name = _classify_source(name)
-        label = _listing_group_label(source_name if source != "other" else "other")
-        groups.setdefault(label, []).append((name, _short_desc(fn.get("description", ""))))
-
-    if not groups:
-        return None, "none"
-
-    def render_group(label: str, mode: str) -> str:
-        """Render one server's block. mode: 'full' | 'names' | 'summary'."""
-        tools = sorted(groups[label])
-        if mode == "summary":
-            return (f"{label} ({len(tools)} tools — names not listed; "
-                    f"discover via `{TOOL_SEARCH_NAME}`)")
-        lines = [f"{label} tools ({len(tools)}):"]
-        if mode == "full":
-            for name, desc in tools:
-                lines.append(f"- {name}: {desc}" if desc else f"- {name}")
-        else:
-            lines.append(", ".join(name for name, _ in tools))
-        return "\n".join(lines)
-
-    header = ("Deferred tool catalog (call schemas via "
-              f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):")
-
-    def assemble(modes: Dict[str, str]) -> str:
-        return "\n".join([header] + [render_group(lbl, modes[lbl])
-                                     for lbl in sorted(groups)])
-
-    def fits(text: str) -> bool:
-        return math.ceil(len(text) / CHARS_PER_TOKEN) <= max_tokens
-
-    # 1. Everything full.
-    modes = {lbl: "full" for lbl in groups}
-    if fits(assemble(modes)):
-        return assemble(modes), "full"
-
-    # 2. Everything names-only.
-    modes = {lbl: "names" for lbl in groups}
-    if fits(assemble(modes)):
-        return assemble(modes), "names"
-
-    # 3. Per-server degradation: collapse the LARGEST rendered groups to
-    #    summary lines first, keeping per-tool names for small servers.
-    #    Deterministic: size then label. One oversized server (Cloudflare)
-    #    must not cost a small co-attached server (Linear) its listing.
-    by_size = sorted(groups, key=lambda lbl: (-len(render_group(lbl, "names")), lbl))
-    for lbl in by_size:
-        modes[lbl] = "summary"
-        if fits(assemble(modes)):
-            form = "groups" if all(m == "summary" for m in modes.values()) else "mixed"
-            return assemble(modes), form
-
-    # 4. Even the all-summary form is over budget.
-    return None, "none"
-
-
-def bridge_tool_schemas(
-    deferred_count: int,
-    listing: Optional[str] = None,
-    listing_form: str = "",
-) -> List[Dict[str, Any]]:
+def bridge_tool_schemas(deferred_count: Optional[int] = None) -> List[Dict[str, Any]]:
     """Build the bridge tool schemas to inject in place of deferred tools.
 
     The schemas are intentionally short — every byte added here is a byte
@@ -643,12 +581,14 @@ def bridge_tool_schemas(
     sees the exact name; the server-summary form ("groups") tells it which
     DOMAINS are reachable and that search is mandatory for tool discovery.
     """
+    # Keep these descriptions byte-for-byte stable across turns. In
+    # particular, do not interpolate the number of currently reachable tools:
+    # that would invalidate the provider prompt-cache prefix whenever an MCP
+    # server or a check_fn changed.
     desc_search = (
-        f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Returns up to ``limit`` matches with name and description. Follow "
-        f"with `{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, "
-        f"then `{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
-        "system prompt are already available and do not need to be searched."
+        "Search tools available to this session. Returns short matches without "
+        f"parameters. Use `{TOOL_DESCRIBE_NAME}` for one schema, then "
+        f"`{TOOL_CALL_NAME}` to invoke it."
     )
     if listing and listing_form == "groups":
         desc_search += (
@@ -677,9 +617,12 @@ def bridge_tool_schemas(
         f"Required before `{TOOL_CALL_NAME}` if the tool's parameters are unknown."
     )
     desc_call = (
-        "Invoke a deferred tool by name with the given arguments. Argument shape "
-        f"matches the tool's schema (see `{TOOL_DESCRIBE_NAME}`). Policy, hooks, "
-        "and approvals run exactly as for any directly-listed tool."
+        "Invoke an available tool by name. Arguments must match the schema from "
+        f"`{TOOL_DESCRIBE_NAME}`. Normal policy and approval checks still apply."
+    )
+    desc_skill = (
+        "Search up to three task-relevant Skills available to this session. "
+        "Returns a short index; load a selected Skill with tool_call(skill_view)."
     )
 
     return [
@@ -742,6 +685,23 @@ def bridge_tool_schemas(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": SKILL_SEARCH_NAME,
+                "description": desc_skill,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Keywords describing the task or guidance needed.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
     ]
 
 
@@ -772,6 +732,7 @@ def assemble_tool_defs(
     *,
     context_length: Optional[int] = None,
     config: Optional[ToolSearchConfig] = None,
+    progressive: bool = False,
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
@@ -792,7 +753,16 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(incoming, progressive=progressive)
+    if progressive:
+        deferred_tokens = estimate_tokens_from_schemas(deferrable)
+        return AssemblyResult(
+            tool_defs=bridge_tool_schemas(),
+            activated=True,
+            deferred_count=len(deferrable),
+            deferred_tokens=deferred_tokens,
+            threshold_tokens=0,
+        )
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -854,15 +824,17 @@ def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
+        "schema_hash": entry.schema_hash,
         # Cap description so a chatty MCP server doesn't blow up the result.
-        "description": (entry.description or "")[:400],
+        "description": (entry.description or "")[:240],
     }
 
 
 def dispatch_tool_search(args: Dict[str, Any],
                          *,
                          current_tool_defs: List[Dict[str, Any]],
-                         config: Optional[ToolSearchConfig] = None) -> str:
+                         config: Optional[ToolSearchConfig] = None,
+                         progressive: bool = False) -> str:
     """Execute the ``tool_search`` bridge tool. Returns a JSON string."""
     if config is None:
         config = load_config()
@@ -876,7 +848,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, progressive=progressive)
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
     return json.dumps({
@@ -888,33 +860,41 @@ def dispatch_tool_search(args: Dict[str, Any],
 
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: List[Dict[str, Any]],
+                           progressive: bool = False) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
         return json.dumps({"error": "name is required"}, ensure_ascii=False)
-    if not is_deferrable_tool_name(name):
+    if not progressive and not is_deferrable_tool_name(name):
         return json.dumps({
             "error": (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
                 "already, call it directly; otherwise check the spelling against tool_search."
             ),
         }, ensure_ascii=False)
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, progressive=progressive)
     for td in deferrable:
         fn = td.get("function") or {}
         if fn.get("name") == name:
+            delivered = td if name.startswith("mcp__") else compact_tool_schema(td)
+            delivered_fn = delivered.get("function") or {}
             return json.dumps({
                 "name": name,
-                "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {}),
+                "description": delivered_fn.get("description", ""),
+                "parameters": delivered_fn.get("parameters", {}),
+                "schema_hash": _schema_hash(td),
             }, ensure_ascii=False)
     return json.dumps({
         "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
     }, ensure_ascii=False)
 
 
-def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+def scoped_deferrable_names(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    progressive: bool = False,
+) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
@@ -929,67 +909,16 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     names: set[str] = set()
     for td in tool_defs:
         name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
+        if name and (progressive or is_deferrable_tool_name(name)):
             names.add(name)
     return frozenset(names)
 
 
-def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
-    """Probe-validate ``tool_call`` arguments against the deferred tool's schema.
-
-    A deferred tool's parameter schema is invisible to the model until it
-    calls ``tool_describe`` — so models routinely invoke deferred tools
-    "blind" by name alone, omitting required arguments. Dispatching such a
-    call produces an opaque downstream failure (``KeyError: 'document_id'``)
-    that tells the model nothing about what the tool expects, and cheap
-    models loop on it until the iteration budget dies.
-
-    Port of the describe-first probe-validation fix from nearai/ironclaw#5149:
-    when required arguments are missing, return the tool's parameter schema
-    instead of dispatching blind — the model repairs the call in one
-    round-trip. Valid calls (and any call we can't confidently validate)
-    dispatch untouched, so this can never block a legitimate invocation.
-
-    Only *key absence* of schema-``required`` fields counts as invalid.
-    No type checking, no null rejection — nullable/typed edge cases are the
-    tool's own business, and ``coerce_tool_args`` already handles type repair
-    downstream. Returns a JSON error string when invalid, ``None`` when the
-    call should dispatch.
-    """
-    try:
-        from tools.registry import registry as _registry
-        schema = _registry.get_schema(name)
-        if not isinstance(schema, dict):
-            return None
-        fn = schema.get("function") if schema.get("type") == "function" else schema
-        if not isinstance(fn, dict):
-            return None
-        params = fn.get("parameters")
-        if not isinstance(params, dict):
-            return None
-        required = params.get("required")
-        if not isinstance(required, list) or not required:
-            return None
-        missing = [r for r in required if isinstance(r, str) and r not in args]
-        if not missing:
-            return None
-        return json.dumps({
-            "error": (
-                f"tool_call to '{name}' is missing required argument(s): "
-                f"{', '.join(missing)}. The tool was NOT invoked."
-            ),
-            "parameters": params,
-            "hint": (
-                "Retry tool_call with 'arguments' matching the parameters "
-                "schema above."
-            ),
-        }, ensure_ascii=False)
-    except Exception:  # pragma: no cover — never block dispatch on validator bugs
-        logger.debug("validate_deferred_call_args failed for %s", name, exc_info=True)
-        return None
-
-
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    *,
+    progressive: bool = False,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1014,7 +943,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    if not progressive and not is_deferrable_tool_name(name):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
@@ -1022,10 +951,39 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     return name, raw_args, None
 
 
+def dispatch_skill_search(
+    args: Dict[str, Any],
+    *,
+    available_tools: Optional[set[str]] = None,
+    available_toolsets: Optional[set[str]] = None,
+) -> str:
+    """Search the current profile's Skill metadata without loading bodies."""
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return json.dumps({"error": "query is required"}, ensure_ascii=False)
+    try:
+        from tools.skills_tool import search_skills
+
+        matches = search_skills(
+            query=query,
+            limit=3,
+            available_tools=available_tools,
+            available_toolsets=available_toolsets,
+        )
+    except Exception as exc:
+        logger.warning("skill_search failed: %s", exc)
+        matches = []
+    return json.dumps(
+        {"query": query, "matches": matches[:3]},
+        ensure_ascii=False,
+    )
+
+
 __all__ = [
     "TOOL_SEARCH_NAME",
     "TOOL_DESCRIBE_NAME",
     "TOOL_CALL_NAME",
+    "SKILL_SEARCH_NAME",
     "BRIDGE_TOOL_NAMES",
     "ToolSearchConfig",
     "CatalogEntry",
@@ -1045,6 +1003,7 @@ __all__ = [
     "is_bridge_tool",
     "dispatch_tool_search",
     "dispatch_tool_describe",
+    "dispatch_skill_search",
     "resolve_underlying_call",
     "scoped_deferrable_names",
     "validate_deferred_call_args",

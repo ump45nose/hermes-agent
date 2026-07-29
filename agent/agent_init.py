@@ -517,7 +517,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
-    requested_provider: str = None,
+    runtime_role: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -601,6 +601,17 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
+    from agent.runtime_role import resolve_runtime_role
+    _role_resolution = resolve_runtime_role(runtime_role, platform=platform)
+    agent.runtime_role = _role_resolution.role
+    agent._runtime_role_verified = _role_resolution.verified
+    agent._runtime_role_reason = _role_resolution.reason
+    if not _role_resolution.verified:
+        _ra().logger.warning(
+            "runtime role failed closed to %s: %s",
+            _role_resolution.role,
+            _role_resolution.reason,
+        )
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1382,6 +1393,45 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Resolve V2 permission/exposure separately from the model-visible schema
+    # list. Entry points still pass ``enabled_toolsets`` for legacy sessions;
+    # a structured platform config is authoritative and fail-closed here.
+    agent._progressive_disclosure = False
+    agent.direct_toolsets = frozenset()
+    agent.deferred_toolsets = frozenset()
+    try:
+        from hermes_cli.config import load_config as _load_config
+        from hermes_cli.tools_config import _get_platform_tool_exposure
+
+        _progressive_cfg = _load_config() or {}
+        _platform_key = platform or "cli"
+        _exposure = _get_platform_tool_exposure(
+            _progressive_cfg,
+            _platform_key,
+        )
+        if _exposure.progressive:
+            agent._progressive_disclosure = True
+            _platform_map = _progressive_cfg.get("platform_toolsets") or {}
+            _explicit_child_ceiling = (
+                _platform_key == "subagent"
+                and enabled_toolsets is not None
+                and _platform_key not in _platform_map
+            )
+            if _explicit_child_ceiling:
+                agent.direct_toolsets = frozenset()
+                agent.deferred_toolsets = frozenset(enabled_toolsets)
+            else:
+                agent.direct_toolsets = _exposure.direct
+                agent.deferred_toolsets = _exposure.deferred
+                enabled_toolsets = sorted(_exposure.reachable)
+            agent.enabled_toolsets = enabled_toolsets
+    except ValueError:
+        # Invalid V2 configuration is a startup error, not a reason to fall
+        # back to the much broader legacy platform defaults.
+        raise
+    except Exception as exc:
+        logger.debug("Could not resolve platform capability exposure: %s", exc)
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
@@ -1390,10 +1440,23 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    agent.reachable_tools = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+        progressive_disclosure=agent._progressive_disclosure,
+    )
+    agent.reachable_tool_names = {
+        tool["function"]["name"] for tool in agent.reachable_tools
+    }
+    agent.reachable_toolsets = frozenset(enabled_toolsets or [])
+
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        progressive_disclosure=agent._progressive_disclosure,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1411,15 +1474,13 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
+    # Tool visibility is not identity. Only a verified dispatcher lease may
+    # activate the worker protocol.
+    from agent.runtime_role import KANBAN_WORKER_OVERLAY
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_WORKER_OVERLAY
+        if agent.runtime_role == "kanban_worker" and agent._runtime_role_verified
+        else ""
     )
 
     # Check tool requirements
@@ -1458,6 +1519,13 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
+    from hermes_constants import get_hermes_home as _artifact_home
+    agent._tool_artifact_dir = (
+        _artifact_home()
+        / "artifacts"
+        / "tool-results"
+        / str(agent.session_id)
+    )
 
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
@@ -1743,6 +1811,43 @@ def init_agent(
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
     agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._coding_context = bool(_agent_section.get("coding_context", True))
+    agent._context_files_enabled = bool(_agent_section.get("context_files", True))
+    _editor_cfg = _agent_cfg.get("tool_context_editor") or {}
+    if not isinstance(_editor_cfg, dict):
+        _editor_cfg = {}
+    agent._tool_context_editor_mode = str(
+        _editor_cfg.get("mode", "report_only")
+    ).lower()
+    if not agent._context_files_enabled:
+        agent.skip_context_files = True
+        agent.load_soul_identity = True
+
+    agent._compiled_prompt = ""
+    agent._prompt_lock = {}
+    try:
+        from hermes_cli.prompt_compiler import (
+            infer_model_family,
+            load_compiled_prompt,
+        )
+
+        _compiled = load_compiled_prompt(get_hermes_home())
+        if _compiled is not None:
+            agent._compiled_prompt, agent._prompt_lock = _compiled
+            _created_family = (
+                (agent._prompt_lock.get("model_adapter") or {}).get("family")
+                or "generic"
+            )
+            _runtime_family = infer_model_family(agent.model)
+            if _created_family not in {"generic", _runtime_family}:
+                _ra().logger.warning(
+                    "compiled prompt model-family mismatch: created=%s runtime=%s; "
+                    "run `hermes profile prompt <profile> diff/upgrade` to change it",
+                    _created_family,
+                    _runtime_family,
+                )
+    except Exception as exc:
+        _ra().logger.warning("could not load compiled profile prompt: %s", exc)
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -2498,9 +2603,19 @@ def init_agent(
             or "context_engine" in agent.enabled_toolsets
         )
     ):
+        _context_tool_target = (
+            agent.reachable_tools
+            if agent._progressive_disclosure
+            else agent.tools
+        )
+        _context_name_target = (
+            agent.reachable_tool_names
+            if agent._progressive_disclosure
+            else agent.valid_tool_names
+        )
         _existing_tool_names = {
             t.get("function", {}).get("name")
-            for t in agent.tools
+            for t in _context_tool_target
             if isinstance(t, dict)
         }
         from agent.memory_manager import normalize_tool_schema as _normalize_tool_schema
@@ -2520,8 +2635,8 @@ def init_agent(
             if _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}
-            agent.tools.append(_wrapped)
-            agent.valid_tool_names.add(_tname)
+            _context_tool_target.append(_wrapped)
+            _context_name_target.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 

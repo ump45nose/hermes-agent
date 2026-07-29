@@ -15011,6 +15011,9 @@ class ProfileCreate(BaseModel):
     description: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
+    prompt_preset: Optional[str] = None
+    prompt_modules: List[str] = []
+    prompt_model_family: str = "generic"
     # Profile-builder additions — all optional, all applied best-effort AFTER
     # the profile directory exists, so a hiccup in any of them never 500s the
     # create (the user can fix it from the relevant dashboard page afterward).
@@ -15295,6 +15298,9 @@ async def create_profile_endpoint(body: ProfileCreate):
             clone_config=clone_config,
             no_skills=body.no_skills,
             description=body.description,
+            prompt_preset=body.prompt_preset,
+            prompt_modules=body.prompt_modules,
+            prompt_model_family=body.prompt_model_family,
         )
         # Match the CLI's profile-create flow: fresh named profiles get the
         # bundled skills installed. When cloning from default, create_profile()
@@ -15724,7 +15730,7 @@ class SkillToggle(BaseModel):
 @app.get("/api/skills")
 async def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
-    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_cli.skills_config import get_cron_only_skills, get_disabled_skills
     from tools.skill_usage import (
         _read_bundled_manifest_names,
         _read_hub_installed_names,
@@ -15734,6 +15740,7 @@ async def get_skills(profile: Optional[str] = None):
     with _profile_scope(profile):
         config = load_config()
         disabled = get_disabled_skills(config)
+        cron_only = get_cron_only_skills(config)
         skills = _find_all_skills(skip_disabled=True)
         usage = load_usage()
         # Set-based provenance (same classification as skill_usage.provenance,
@@ -15743,7 +15750,8 @@ async def get_skills(profile: Optional[str] = None):
         bundled_names = _read_bundled_manifest_names()
         hub_names = _read_hub_installed_names()
     for s in skills:
-        s["enabled"] = s["name"] not in disabled
+        s["cron_only"] = s["name"] in cron_only
+        s["enabled"] = s["name"] not in disabled and not s["cron_only"]
         s["usage"] = activity_count(usage.get(s["name"], {}))
         s["provenance"] = (
             "hub" if s["name"] in hub_names
@@ -15958,12 +15966,12 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
     from hermes_cli.tools_config import (
         TOOL_CATEGORIES,
         _get_effective_configurable_toolsets,
+        get_provider_env_value,
         _is_provider_active,
         _visible_providers,
         provider_readiness_status,
         web_provider_capabilities,
     )
-    from hermes_cli.config import get_env_value
     from hermes_cli.nous_subscription import get_nous_subscription_features
 
     valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
@@ -15983,16 +15991,22 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
             # re-probing per row.
             features = get_nous_subscription_features(config, force_fresh=True)
             for prov in _visible_providers(cat, config, force_fresh=True):
-                env_vars = [
-                    {
-                        "key": e["key"],
-                        "prompt": e.get("prompt", e["key"]),
-                        "url": e.get("url"),
-                        "default": e.get("default"),
-                        "is_set": bool(get_env_value(e["key"])),
+                env_vars = []
+                for env_schema in prov.get("env_vars", []):
+                    current_value = get_provider_env_value(env_schema)
+                    is_secret = bool(env_schema.get("secret", True))
+                    env_row = {
+                        "key": env_schema["key"],
+                        "prompt": env_schema.get("prompt", env_schema["key"]),
+                        "url": env_schema.get("url"),
+                        "default": env_schema.get("default"),
+                        "scope": env_schema.get("scope", "profile"),
+                        "secret": is_secret,
+                        "is_set": bool(current_value),
                     }
-                    for e in prov.get("env_vars", [])
-                ]
+                    if not is_secret:
+                        env_row["value"] = current_value or ""
+                    env_vars.append(env_row)
                 # Surface the same active-provider determination the CLI picker
                 # uses (``_is_provider_active``) so the GUI highlights the provider
                 # actually written to config (e.g. web.backend), not just the first
@@ -16373,22 +16387,22 @@ class ToolsetEnvUpdate(BaseModel):
 
 @app.put("/api/tools/toolsets/{name}/env")
 async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[str] = None):
-    """Persist API keys for a toolset's provider env vars.
+    """Persist a toolset's provider env fields.
 
-    Writes each ``key: value`` to ``~/.hermes/.env`` via ``save_env_value`` —
-    the same store ``hermes tools`` writes when it prompts for keys. Keys are
-    validated against the env-var allowlist for the toolset's category (the
-    union of every visible provider's ``env_vars``), so the GUI can't write an
-    arbitrary env var through this endpoint. A blank value is treated as
-    "leave unchanged" and skipped. Returns the saved/skipped key lists and the
-    refreshed ``is_set`` status. Returns 400 for unknown toolset or env keys.
+    Uses the same scope-aware helper as ``hermes tools``: fields default to the
+    selected profile's ``.env``, while schemas marked ``scope: global`` always
+    target the root Hermes ``.env``. Keys are validated against the visible
+    provider allowlist, so the GUI cannot write arbitrary environment
+    variables. A blank value means "leave unchanged". Returns 400 for unknown
+    toolsets or fields.
     """
     from hermes_cli.tools_config import (
         TOOL_CATEGORIES,
         _get_effective_configurable_toolsets,
+        get_provider_env_value,
+        save_provider_env_value,
         _visible_providers,
     )
-    from hermes_cli.config import get_env_value, save_env_value
 
     valid_ts = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
     if name not in valid_ts:
@@ -16397,11 +16411,11 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
     with _profile_scope(body.profile or profile):
         config = load_config()
         cat = TOOL_CATEGORIES.get(name)
-        allowed: set[str] = set()
+        allowed: Dict[str, dict] = {}
         if cat:
             for prov in _visible_providers(cat, config, force_fresh=True):
                 for e in prov.get("env_vars", []):
-                    allowed.add(e["key"])
+                    allowed[e["key"]] = e
 
         unknown = [k for k in body.env if k not in allowed]
         if unknown:
@@ -16415,14 +16429,17 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
         for key, value in body.env.items():
             if value and value.strip():
                 try:
-                    save_env_value(key, value.strip())
+                    save_provider_env_value(allowed[key], value.strip())
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc))
                 saved.append(key)
             else:
                 skipped.append(key)
 
-        status = {k: bool(get_env_value(k)) for k in allowed}
+        status = {
+            key: bool(get_provider_env_value(env_schema))
+            for key, env_schema in allowed.items()
+        }
     return {"ok": True, "name": name, "saved": saved, "skipped": skipped, "is_set": status}
 
 

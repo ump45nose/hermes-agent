@@ -80,6 +80,17 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
     mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
     mcp_test_p.add_argument("name", help="Server name to test")
 
+    mcp_warm_p = mcp_sub.add_parser(
+        "warm",
+        aliases=["reload"],
+        help="Connect selected servers, refresh schema caches, then disconnect",
+    )
+    mcp_warm_p.add_argument(
+        "names",
+        nargs="*",
+        help="Server names (default: every enabled configured server)",
+    )
+
     mcp_cfg_p = mcp_sub.add_parser(
         "configure", aliases=["config"], help="Toggle tool selection"
     )

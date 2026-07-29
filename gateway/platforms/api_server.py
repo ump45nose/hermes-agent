@@ -2623,10 +2623,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = (
-            None
-            if confirmed_runtime_lock
-            else GatewayRunner._load_fallback_model()
+        fallback_model = GatewayRunner._load_fallback_model()
+
+        agent = AIAgent(
+            model=model,
+            **runtime_kwargs,
+            max_iterations=max_iterations,
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt=ephemeral_system_prompt or None,
+            enabled_toolsets=enabled_toolsets,
+            session_id=session_id,
+            platform="api_server",
+            stream_delta_callback=stream_delta_callback,
+            tool_progress_callback=tool_progress_callback,
+            tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback,
+            session_db=self._ensure_session_db(),
+            skip_context_files=True,
+            load_soul_identity=True,
+            fallback_model=fallback_model,
+            reasoning_config=reasoning_config,
+            gateway_session_key=gateway_session_key,
         )
 
         agent_kwargs = {

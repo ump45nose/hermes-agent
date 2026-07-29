@@ -614,23 +614,11 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
-    # Detect cwd drift: if the stored prompt was built in a different working
-    # directory, reuse would silently inject a stale path into the prefix cache.
-    # Compare against resolve_agent_cwd() — the SAME resolver used to build the
-    # prompt — so gateway/TUI sessions that set TERMINAL_CWD are not falsely
-    # rejected (they would always differ from the launch dir's os.getcwd()).
-    stored_cwd = host_info_value("Current working directory")
-    if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
-            return False
+    if getattr(agent, "_progressive_disclosure", False):
+        from agent.system_prompt import CAPABILITY_PROMPT_VERSION
 
-    # Detect runtime-surface drift: the stored prompt records which platform it
-    # was built for (e.g. "desktop" vs "cli"). Reusing a desktop-built prompt on
-    # a terminal session (or vice versa) would inject the wrong runtime hints.
-    stored_platform = line_value("Platform")
-    current_platform = str(getattr(agent, "platform", "") or "").strip()
-    if stored_platform and current_platform and stored_platform != current_platform:
-        return False
+        if line_value("Capability-Prompt-Version") != str(CAPABILITY_PROMPT_VERSION):
+            return False
 
     return True
 
@@ -1597,25 +1585,46 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Per-turn context selection hook (additive, no-op by default).
-        # Lets a context engine select/replace which context enters the
-        # prompt for THIS call only — retrieval, topic routing, role/branch
-        # switching — distinct from compression and independent of
-        # should_compress(). Request-only: persisted history is untouched, so
-        # caching/sanitization below operate on whatever the engine selected.
-        # Fail-open (see _apply_context_engine_selection).
-        _sel_incoming = (
-            messages[current_turn_user_idx]
-            if 0 <= current_turn_user_idx < len(messages)
-            else None
-        )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        # Clear already-consumed, provably useless tool bodies before provider
+        # adaptation. Internal receipts never leave the process.
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "report_only")
+        try:
+            from agent.tool_context_editor import (
+                edit_tool_context,
+                strip_internal_tool_metadata,
+            )
+            if _editor_mode != "off":
+                api_messages, _tool_edit_report = edit_tool_context(
+                    api_messages,
+                    report_only=_editor_mode == "report_only",
+                    phase=(
+                        _editor_mode
+                        if _editor_mode in {"readonly", "failures", "active"}
+                        else "active"
+                    ),
+                )
+                if _tool_edit_report:
+                    request_logger.info(
+                        "Tool Context Editor mode=%s actions=%s",
+                        _editor_mode,
+                        _tool_edit_report,
+                    )
+            strip_internal_tool_metadata(api_messages)
+        except Exception as exc:
+            request_logger.warning("Tool Context Editor skipped: %s", exc)
+
+        # Apply Anthropic prompt caching for Claude models on native
+        # Anthropic, OpenRouter, and third-party Anthropic-compatible
+        # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
+        # inject cache_control breakpoints (system + last 3 messages)
+        # to reduce input token costs by ~75% on multi-turn
+        # conversations.
+        if agent._use_prompt_caching:
+            api_messages = apply_anthropic_cache_control(
+                api_messages,
+                cache_ttl=agent._cache_ttl,
+                native_anthropic=agent._use_native_cache_layout,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2157,6 +2166,17 @@ def run_conversation(
                 except Exception:
                     pass
 
+                try:
+                    from agent.request_snapshot import capture_request_snapshot
+
+                    capture_request_snapshot(
+                        agent,
+                        api_kwargs,
+                        request_id=api_request_id,
+                    )
+                except Exception as exc:
+                    request_logger.warning("request snapshot capture failed: %s", exc)
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -2256,59 +2276,30 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                _model_request_active = getattr(agent, "_model_request_active", None)
-                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
-                    _model_request_active.set()
-                _redirect_crossed_response = False
-                try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
-                finally:
-                    if _redirect_lock is not None:
-                        with _redirect_lock:
-                            if _model_request_active is not None:
-                                _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
-                if _redirect_crossed_response:
-                    # The response and redirect can cross on different threads:
-                    # redirect() observed the request as active just before this
-                    # call returned. Discard that now-stale response and rebuild
-                    # from the correction rather than silently losing it.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
-                    if agent.thinking_callback:
-                        agent.thinking_callback("")
-                    if agent.clear_interrupt(preserve_redirect=True):
-                        _retry.restart_with_redirected_messages = True
-                    else:
-                        interrupted = True
-                    break
+                response = run_llm_execution_middleware(
+                    api_kwargs,
+                    _perform_api_call,
+                    original_request=_original_api_kwargs,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    session_id=agent.session_id or "",
+                    platform=agent.platform or "",
+                    model=agent.model,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    api_mode=agent.api_mode,
+                    api_call_count=api_call_count,
+                    middleware_trace=list(_llm_middleware_trace),
+                )
+                from agent.tool_context_editor import mark_tool_results_consumed
+
+                mark_tool_results_consumed(
+                    messages,
+                    consumed_turn=api_call_count,
+                    session_db=getattr(agent, "_session_db", None),
+                    session_id=agent.session_id or "",
+                )
                 
                 api_duration = time.time() - api_start_time
                 

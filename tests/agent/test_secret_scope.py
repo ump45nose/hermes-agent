@@ -137,6 +137,37 @@ class TestScopeIsolation:
             ss.reset_secret_scope(t1)
 
 
+class TestStandaloneProfileScope:
+    """Standalone CLI callers get an isolated temporary profile scope."""
+
+    def test_installs_root_baseline_and_profile_overlay_then_restores(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "companion"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("SHARED_KEY=shared\nOVERRIDE=root\n")
+        (profile_home / ".env").write_text("OVERRIDE=profile\nIDENTITY=companion\n")
+
+        assert ss.current_secret_scope() is None
+        with ss.profile_secret_scope_if_unset(profile_home) as scope:
+            assert scope == {
+                "SHARED_KEY": "shared",
+                "OVERRIDE": "profile",
+                "IDENTITY": "companion",
+            }
+            assert ss.get_secret("SHARED_KEY") == "shared"
+            assert ss.get_secret("OVERRIDE") == "profile"
+        assert ss.current_secret_scope() is None
+
+    def test_preserves_existing_gateway_scope(self, tmp_path):
+        token = ss.set_secret_scope({"IDENTITY": "gateway"})
+        try:
+            with ss.profile_secret_scope_if_unset(tmp_path) as scope:
+                assert scope == {"IDENTITY": "gateway"}
+                assert ss.get_secret("IDENTITY") == "gateway"
+            assert ss.current_secret_scope() == {"IDENTITY": "gateway"}
+        finally:
+            ss.reset_secret_scope(token)
+
+
 class TestEnvFileParsing:
     """load_env_file parses without mutating os.environ."""
 
@@ -176,36 +207,45 @@ class TestEnvFileParsing:
             "ANTHROPIC_API_KEY": "sk-profile"
         }
 
-    def test_build_profile_secret_scope_includes_home_external_secrets(
-        self, tmp_path, monkeypatch
-    ):
-        (tmp_path / ".env").write_text("XIAOMI_API_KEY=placeholder\n")
-        from hermes_cli import env_loader
-
-        home_key = str(tmp_path.resolve())
-        monkeypatch.setitem(
-            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
-            home_key,
-            {"XIAOMI_API_KEY": "sk-from-bitwarden"},
+    def test_named_profile_inherits_root_shared_secrets(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "lingjun"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text(
+            "HERMES_PROVIDER_COMPANY_PROXY_API_KEY=shared-provider\n"
+        )
+        (profile_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=lingjun-identity\n"
         )
 
-        assert ss.build_profile_secret_scope(tmp_path) == {
-            "XIAOMI_API_KEY": "sk-from-bitwarden"
+        assert ss.build_profile_secret_scope(profile_home) == {
+            "HERMES_PROVIDER_COMPANY_PROXY_API_KEY": "shared-provider",
+            "TELEGRAM_BOT_TOKEN": "lingjun-identity",
         }
 
-    def test_build_profile_secret_scope_ignores_other_home_external_secrets(
-        self, tmp_path, monkeypatch
-    ):
-        profile = tmp_path / "profile"
-        other = tmp_path / "other"
-        profile.mkdir()
-        other.mkdir()
-        from hermes_cli import env_loader
+    def test_named_profile_layer_overrides_root_baseline(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "lingjun"
+        profile_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("TOKEN=root-value\n")
+        (profile_home / ".env").write_text("TOKEN=profile-value\n")
 
-        monkeypatch.setitem(
-            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
-            str(other.resolve()),
-            {"XIAOMI_API_KEY": "sk-other-profile"},
+        assert ss.build_profile_secret_scope(profile_home)["TOKEN"] == (
+            "profile-value"
         )
 
-        assert ss.build_profile_secret_scope(profile) == {}
+    def test_named_profile_scopes_do_not_mix_identity_secrets(self, tmp_path):
+        lingjun_home = tmp_path / "profiles" / "lingjun"
+        companion_home = tmp_path / "profiles" / "companion"
+        lingjun_home.mkdir(parents=True)
+        companion_home.mkdir(parents=True)
+        (tmp_path / ".env").write_text("SHARED_KEY=shared\n")
+        (lingjun_home / ".env").write_text("IDENTITY_KEY=lingjun\n")
+        (companion_home / ".env").write_text("IDENTITY_KEY=companion\n")
+
+        lingjun = ss.build_profile_secret_scope(lingjun_home)
+        companion = ss.build_profile_secret_scope(companion_home)
+
+        assert lingjun == {"SHARED_KEY": "shared", "IDENTITY_KEY": "lingjun"}
+        assert companion == {
+            "SHARED_KEY": "shared",
+            "IDENTITY_KEY": "companion",
+        }

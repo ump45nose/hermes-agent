@@ -168,6 +168,13 @@ class TestConfigPrompt:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("FAL_KEY", raising=False)
+        # This test owns the registry contents. Do not discover bundled
+        # providers, including machine-global custom image slots, from the
+        # developer's real Hermes root.
+        monkeypatch.setattr(
+            "hermes_cli.plugins._ensure_plugins_discovered",
+            lambda: None,
+        )
 
         image_gen_registry.register_provider(_FakeProvider("unavail-img", available=False))
 

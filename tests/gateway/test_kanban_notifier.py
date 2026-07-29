@@ -20,6 +20,15 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class WakeRecordingAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wake_events = []
+
+    async def handle_message(self, event):
+        self.wake_events.append(event)
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -52,7 +61,10 @@ def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="notify once", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
         kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
@@ -110,32 +122,19 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     assert adapter2.sent == []
 
 
-def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
-    db_path = tmp_path / "dm-topic-metadata.db"
+def test_kanban_notifier_wrong_gateway_cannot_claim_owned_subscription(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "strict-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn,
-            title="dm topic task",
-            assignee="worker",
-            session_id="agent:main:telegram:dm:chat-1",
-        )
+        tid = kb.create_task(conn, title="owned", assignee="worker")
         kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-1",
-            thread_id="20197",
-            delivery_metadata={
-                "chat_type": "dm",
-                "direct_messages_topic_id": "20197",
-                "telegram_dm_topic_reply_fallback": True,
-                "telegram_reply_to_message_id": "462",
-                "thread_id": "20197",
-            },
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="lingjun",
         )
         kb.complete_task(conn, tid, summary="done")
     finally:
@@ -143,19 +142,99 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
 
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "companion"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
-        "chat_type": "dm",
-        "direct_messages_topic_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": "462",
-        "thread_id": "20197",
-    }
-    assert len(adapter.handled) == 1
-    assert adapter.handled[0].source.chat_type == "dm"
-    assert adapter.handled[0].source.thread_id == "20197"
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) == 0
+
+
+def test_kanban_notifier_ownerless_legacy_subscription_fails_closed(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "ownerless.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy ownerless", assignee="worker")
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, created_at) VALUES (?, ?, ?, ?)",
+            (tid, "telegram", "chat-1", 1),
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) == 0
+
+
+def test_kanban_notifier_wakes_exact_originating_dm_session(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "exact-session.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    expected_key = "agent:main:telegram:dm:chat-1:topic-7"
+    expected_id = "session-origin-1"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="exact wake", assignee="worker",
+            session_id=expected_id,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            thread_id="topic-7",
+            user_id="user-1",
+            source_profile=None,
+            notifier_profile="lingjun",
+            session_key=expected_key,
+            session_id=expected_id,
+            message_id="msg-1",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "lingjun"
+    runner._profile_adapters = {}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.wake_events) == 1
+    event = adapter.wake_events[0]
+    assert event.source.chat_type == "dm"
+    assert event.source.thread_id == "topic-7"
+    assert event.source.profile is None
+    assert event.metadata["gateway_session_key"] == expected_key
+    assert event.metadata["gateway_session_id"] == expected_id
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
@@ -220,7 +299,10 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
     finally:
         conn.close()
 
@@ -322,7 +404,10 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cycle test", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
         # First crash — fired by the dispatcher when the worker PID dies.
         kb._append_event(conn, tid, kind="crashed")
     finally:

@@ -460,6 +460,9 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    result_status: str = "unknown",
+    artifact_ref: str | None = None,
+    supersedes: str | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -497,6 +500,15 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    from agent.tool_context_editor import build_receipt
+    message["_tool_receipt"] = build_receipt(
+        name,
+        content,
+        result_status=result_status,
+        effect=effect_disposition,
+        artifact_ref=artifact_ref,
+        supersedes=supersedes,
+    ).to_dict()
     return message
 
 

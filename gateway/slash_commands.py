@@ -490,7 +490,7 @@ class GatewaySlashCommandsMixin:
                         platform.value if hasattr(platform, "value") else str(platform or "")
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
-                    chat_type = str(getattr(source, "chat_type", "") or "") or None
+                    chat_type = str(getattr(source, "chat_type", "") or "")
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
                     delivery_metadata = self._thread_metadata_for_source(
@@ -501,6 +501,17 @@ class GatewaySlashCommandsMixin:
                         if chat_type:
                             delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
+                        session_entry = await self.async_session_store.get_or_create_session(
+                            source
+                        )
+                        session_key = str(session_entry.session_key or "")
+                        session_id = str(session_entry.session_id or "")
+                        source_profile = (
+                            str(getattr(source, "profile", "") or "") or None
+                        )
+                        message_id = str(
+                            getattr(source, "message_id", "") or ""
+                        )
                         def _sub():
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
@@ -511,8 +522,14 @@ class GatewaySlashCommandsMixin:
                                     chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                    delivery_metadata=delivery_metadata,
+                                    source_profile=source_profile,
+                                    notifier_profile=(
+                                        getattr(self, "_kanban_notifier_profile", None)
+                                        or self._active_profile_name()
+                                    ),
+                                    session_key=session_key,
+                                    session_id=session_id,
+                                    message_id=message_id,
                                 )
                             finally:
                                 conn.close()
@@ -3995,6 +4012,8 @@ class GatewaySlashCommandsMixin:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
+                skip_context_files=True,
+                load_soul_identity=True,
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
             # Keep the real source platform during construction so external

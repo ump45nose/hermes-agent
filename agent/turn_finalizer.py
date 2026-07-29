@@ -247,7 +247,16 @@ def finalize_turn(
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        _trajectory_messages = messages
+        if getattr(agent, "_progressive_disclosure", False):
+            from agent.capability_history import durable_projection
+
+            _trajectory_messages = durable_projection(messages)
+        agent._save_trajectory(
+            _trajectory_messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
     except Exception as _save_err:
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
@@ -353,6 +362,14 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    # The live API loop may use discovery payloads for this request, but the
+    # continuation returned to gateways/CLI is the same clean projection that
+    # was written durably.
+    if getattr(agent, "_progressive_disclosure", False):
+        from agent.capability_history import durable_projection
+
+        messages = durable_projection(messages)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.

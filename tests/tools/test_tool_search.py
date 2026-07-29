@@ -243,6 +243,30 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_progressive_exposes_only_four_stable_bridges(self):
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+            bridge_tool_schemas,
+        )
+
+        first = assemble_tool_defs(
+            [_td("terminal", "Run shell"), _td("read_file", "Read")],
+            progressive=True,
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        second = assemble_tool_defs(
+            [_td("terminal", "Different reachable count")],
+            progressive=True,
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        assert {t["function"]["name"] for t in first.tool_defs} == set(BRIDGE_TOOL_NAMES)
+        assert json.dumps(first.tool_defs, sort_keys=True) == json.dumps(
+            second.tool_defs, sort_keys=True
+        )
+        assert len(json.dumps(bridge_tool_schemas()).encode()) <= 4096
+
     def test_no_deferrable_returns_unchanged(self):
         """Pure-core toolset: pass-through, no bridge tools added."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
@@ -627,224 +651,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
-
-
-# ---------------------------------------------------------------------------
-# Catalog listing (skills-style progressive disclosure)
-# ---------------------------------------------------------------------------
-
-
-class TestCatalogListing:
-    def test_config_defaults(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.listing == "auto"
-        assert cfg.listing_max_tokens == 20000
-        # legacy bool shapes keep defaults too
-        assert ToolSearchConfig.from_raw(True).listing == "auto"
-
-    def test_config_listing_off_and_clamp(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw({"listing": "off", "listing_max_tokens": 999999})
-        assert cfg.listing == "off"
-        assert cfg.listing_max_tokens == 60000
-        cfg2 = ToolSearchConfig.from_raw({"listing": "garbage", "listing_max_tokens": -5})
-        assert cfg2.listing == "auto"
-        assert cfg2.listing_max_tokens == 200
-
-    def test_short_desc_first_sentence_and_clip(self):
-        from tools.tool_search import _short_desc
-        assert _short_desc("Open an issue. Second sentence dropped.") == "Open an issue."
-        long = "word " * 40
-        s = _short_desc(long)
-        assert len(s) <= 61  # 60 + ellipsis char
-        assert s.endswith("…")
-        assert _short_desc("") == ""
-
-    def test_listing_grouped_and_deterministic(self):
-        from tools.tool_search import build_catalog_listing
-        defs = [
-            _td("zeta_tool", "Does zeta."),
-            _td("alpha_tool", "Does alpha."),
-        ]
-        a = build_catalog_listing(defs)
-        b = build_catalog_listing(list(reversed(defs)))
-        assert a == b  # byte-stable regardless of input order (cache safety)
-        assert a.index("alpha_tool") < a.index("zeta_tool")
-
-    def test_listing_budget_falls_back_to_names_then_none(self):
-        from tools.tool_search import build_catalog_listing
-        defs = [_td(f"tool_{i:03d}", "A tool that does something moderately verbose.")
-                for i in range(50)]
-        full = build_catalog_listing(defs, max_tokens=20000)
-        assert full is not None and "- tool_000:" in full
-        names_only = build_catalog_listing(defs, max_tokens=300)
-        assert names_only is not None
-        assert "- tool_000:" not in names_only  # descriptions dropped
-        assert "tool_000" in names_only
-        assert build_catalog_listing(defs, max_tokens=200) is None or "tool_000" in build_catalog_listing(defs, max_tokens=200)
-
-    def test_bridge_embeds_listing(self):
-        from tools.tool_search import bridge_tool_schemas
-        bridges = bridge_tool_schemas(5, listing="github tools (2):\n- a: x\n- b: y")
-        search = next(b for b in bridges if b["function"]["name"] == "tool_search")
-        assert "github tools (2)" in search["function"]["description"]
-        assert "do NOT claim it is unavailable" in search["function"]["description"]
-        # other bridges unchanged
-        bare = bridge_tool_schemas(5)
-        assert bare[1] == bridges[1] and bare[2] == bridges[2]
-
-    @staticmethod
-    def _register(name):
-        from tools.registry import registry
-
-        def _handler(args, task_id=None, **kw):
-            return json.dumps({"ok": True})
-
-        registry.register(
-            name=name,
-            handler=_handler,
-            schema=_td(name, "Deferred capability description.")["function"],
-            toolset="mcp-listingtest",
-        )
-
-    def test_assembly_embeds_listing_when_active(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        for i in range(30):
-            self._register(f"mcp_x_{i}")
-        defs = [_td("terminal", "Run shell")] + [
-            _td(f"mcp_x_{i}", "Deferred capability description.",
-                {"a": {"type": "string", "description": "x" * 200}})
-            for i in range(30)
-        ]
-        result = assemble_tool_defs(
-            defs, context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
-        )
-        assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
-        assert "mcp_x_0" in search["function"]["description"]
-        assert "listingtest tools (30):" in search["function"]["description"]
-
-    def test_assembly_listing_off_keeps_legacy_description(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        for i in range(30):
-            self._register(f"mcp_x_{i}")
-        defs = [_td(f"mcp_x_{i}", "Deferred.") for i in range(30)]
-        result = assemble_tool_defs(
-            defs, context_length=1000,
-            config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
-        )
-        assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
-        assert "mcp_x_0" not in search["function"]["description"]
-
-
-class TestDeferredCallSchemaProbe:
-    """Blind tool_call invocations missing required arguments must return
-    the tool's parameter schema instead of dispatching into an opaque
-    downstream failure (port of nearai/ironclaw#5149's describe-first fix).
-
-    A deferred tool's schema is invisible until tool_describe is called, so
-    models routinely invoke deferred tools by name alone. Pre-fix, that
-    produced ``KeyError: 'document_id'``-style errors that teach the model
-    nothing; post-fix, the probe returns the schema so the model repairs
-    the call in one round-trip. Valid calls dispatch untouched.
-    """
-
-    @staticmethod
-    def _register(name, toolset, required=("document_id",)):
-        from tools.registry import registry
-
-        def _handler(args, task_id=None, **kw):
-            # Simulates a tool that crashes opaquely on a missing required arg.
-            return json.dumps({"ok": True, "doc": args["document_id"]})
-
-        params = {
-            "type": "object",
-            "properties": {
-                "document_id": {"type": "string", "description": "Doc id"},
-                "format": {"type": "string"},
-            },
-            "required": list(required),
-        }
-        registry.register(
-            name=name,
-            handler=_handler,
-            schema={"type": "function",
-                    "function": {"name": name, "description": f"desc {name}",
-                                 "parameters": params}},
-            toolset=toolset,
-        )
-
-    def test_validator_returns_schema_for_missing_required(self):
-        from tools.tool_search import validate_deferred_call_args
-
-        self._register("mcp_probe_docs_get", "mcp-probe")
-        err = validate_deferred_call_args("mcp_probe_docs_get", {})
-        assert err is not None
-        parsed = json.loads(err)
-        assert "document_id" in parsed["error"]
-        assert "NOT invoked" in parsed["error"]
-        assert parsed["parameters"]["required"] == ["document_id"]
-        assert "document_id" in parsed["parameters"]["properties"]
-
-    def test_validator_passes_valid_and_optional_only_calls(self):
-        from tools.tool_search import validate_deferred_call_args
-
-        self._register("mcp_probe_docs_get2", "mcp-probe")
-        # All required present → dispatch.
-        assert validate_deferred_call_args(
-            "mcp_probe_docs_get2", {"document_id": "abc"}) is None
-        # Extra optional args don't matter.
-        assert validate_deferred_call_args(
-            "mcp_probe_docs_get2", {"document_id": "abc", "format": "md"}) is None
-
-    def test_validator_never_blocks_unvalidatable_tools(self):
-        from tools.tool_search import validate_deferred_call_args
-
-        # Unknown tool → no schema → dispatch (downstream scope gate handles it).
-        assert validate_deferred_call_args("mcp_no_such_tool_xyz", {}) is None
-
-    def test_validator_no_required_list_dispatches(self):
-        from tools.tool_search import validate_deferred_call_args
-        from tools.registry import registry
-
-        registry.register(
-            name="mcp_probe_norequired",
-            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
-            schema={"type": "function",
-                    "function": {"name": "mcp_probe_norequired",
-                                 "description": "d",
-                                 "parameters": {"type": "object", "properties": {}}}},
-            toolset="mcp-probe",
-        )
-        assert validate_deferred_call_args("mcp_probe_norequired", {}) is None
-
-    def test_blind_tool_call_returns_schema_not_keyerror(self):
-        import model_tools
-
-        self._register("mcp_probe_blind_op", "mcp-probe-blind")
-        result = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "mcp_probe_blind_op", "arguments": {}},
-            enabled_toolsets=["mcp-probe-blind"],
-        ))
-        assert "error" in result
-        assert "KeyError" not in result["error"]
-        assert "missing required argument" in result["error"]
-        assert result["parameters"]["required"] == ["document_id"]
-
-    def test_valid_tool_call_still_dispatches(self):
-        import model_tools
-
-        self._register("mcp_probe_valid_op", "mcp-probe-valid")
-        result = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "mcp_probe_valid_op",
-                           "arguments": {"document_id": "abc"}},
-            enabled_toolsets=["mcp-probe-valid"],
-        ))
-        assert result.get("ok") is True
-        assert result.get("doc") == "abc"

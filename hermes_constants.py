@@ -190,6 +190,50 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def get_canonical_hermes_root(home: str | Path | None = None) -> Path:
+    """Return the deployment root for a default or named-profile home.
+
+    Unlike :func:`get_default_hermes_root`, this helper also honors the
+    context-local home used by the multiplex gateway.  All profile-aware code
+    should use this function instead of appending ``profiles/<name>`` to the
+    current ``HERMES_HOME``.
+    """
+    candidate = Path(home) if home is not None else get_hermes_home()
+    if candidate.parent.name == "profiles":
+        return candidate.parent.parent
+    return candidate
+
+
+def get_profile_home(
+    profile: str,
+    *,
+    root: str | Path | None = None,
+) -> Path:
+    """Resolve one profile home from a canonical Hermes root."""
+    canonical_root = (
+        Path(root) if root is not None else get_canonical_hermes_root()
+    )
+    name = str(profile or "default").strip()
+    return canonical_root if name == "default" else canonical_root / "profiles" / name
+
+
+def _get_packaged_data_dir(name: str) -> Path | None:
+    """Return an installed data-files directory if one exists.
+
+    Used to discover bundled skills/optional-skills when Hermes is installed
+    from a wheel that emitted them via setuptools data_files.
+    """
+    candidates = []
+    for scheme in ("data", "purelib", "platlib"):
+        raw = sysconfig.get_path(scheme)
+        if raw:
+            candidates.append(Path(raw) / name)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 

@@ -407,7 +407,7 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 | `auto_decompose_per_tick` | `3` | 每个调度器 tick 的分解上限。超出部分推迟到下一个 tick。 |
 | `orchestrator_profile` | `""` | 拥有分解权的配置文件。空 = 回退到活动默认配置文件。 |
 | `default_assignee` | `""` | LLM 选择未知配置文件时子任务的落地位置。空 = 回退到活动默认配置文件。 |
-| `auto_subscribe_on_create` | `true` | 当 worker 在具有持久投递通道的会话（消息网关或 TUI）内调用 `kanban_create` 时，原始会话会自动订阅新任务的完成/阻塞事件。调度器仍负责驱动投递 —— 此设置只决定调用者的聊天/密钥是否出现在通知订阅表中。设为 `false` 则要求对每个任务显式调用 `kanban_notify-subscribe`。 |
+| `auto_subscribe_on_create` | `true` | 当 worker 从持久 gateway/TUI 会话调用 `kanban_create` 时，Hermes 会记录 notifier gateway 所有者和原会话的精确身份。只有所有者 gateway 能领取终态事件；它发送人类通知并唤醒同一会话，让编排器调用 `kanban_show` 汇总交接。设为 `false` 则要求显式订阅。 |
 
 以及两个辅助 LLM 槽：
 
@@ -594,7 +594,7 @@ Gateway 通常在 agent 仍在思考时将斜杠命令和用户消息排队 —�
 
 ### `/kanban create` 时自动订阅（仅限 gateway）
 
-当你从 gateway 使用 `/kanban create "…"` 创建任务时，发起聊天（平台 + 聊天 id + 线程 id）会自动订阅该任务的终端事件（`completed`、`blocked`、`gave_up`、`crashed`、`timed_out`）。每个终端事件你会收到一条消息回复 —— 包括 `completed` 时 worker 结果摘要的第一行 —— 无需轮询或记住任务 id。
+当你从 gateway 使用 `/kanban create "…"` 创建任务时，Hermes 会同时记录通知目的地与精确原会话（chat type、canonical session key/id、source profile 和 notifier gateway 所有者）。只有所有者 gateway 能领取任务的终态事件（`completed`、`blocked`、`gave_up`、`crashed`、`timed_out`）。它会发送人类通知并唤醒同一会话；编排器随后必须调用 `kanban_show(task_id)`，以完整 run handoff 为准做归纳，不能把通知预览当作结果。
 
 ```
 you> /kanban create "transcribe today's podcast" --assignee transcriber
@@ -607,7 +607,7 @@ bot> ✓ t_9fc1a3 completed by transcriber
      transcribed 42 minutes, saved to podcast/2026-05-04.md
 ```
 
-订阅在任务达到 `done` 或 `archived` 后自动移除。如果你用 `--json`（机器输出）脚本化创建，则跳过自动订阅 —— 假设脚本化调用者希望通过 `/kanban notify-subscribe` 显式管理订阅。
+订阅在任务达到 `done` 或 `archived` 后自动移除。如果你用 `--json`（机器输出）脚本化创建，则跳过自动订阅 —— 假设脚本化调用者希望通过 `/kanban notify-subscribe` 显式管理订阅。没有 canonical session identity 的 CLI 显式订阅只能发通知，不能唤醒 agent 会话。
 
 ### 消息中的输出截断
 

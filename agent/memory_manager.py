@@ -110,7 +110,14 @@ def memory_provider_tools_enabled(
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
     memory_manager = getattr(agent, "_memory_manager", None)
-    tools = getattr(agent, "tools", None)
+    # Require the concrete runtime flag. Test doubles and partially
+    # constructed agents often return a truthy MagicMock for unknown attrs.
+    progressive = getattr(agent, "_progressive_disclosure", False) is True
+    tools = getattr(
+        agent,
+        "reachable_tools" if progressive else "tools",
+        None,
+    )
     if not memory_manager or tools is None:
         return 0
 
@@ -130,10 +137,11 @@ def inject_memory_provider_tools(agent: Any) -> int:
     if not callable(get_schemas):
         return 0
 
-    valid_tool_names = getattr(agent, "valid_tool_names", None)
+    names_attr = "reachable_tool_names" if progressive else "valid_tool_names"
+    valid_tool_names = getattr(agent, names_attr, None)
     if valid_tool_names is None:
         valid_tool_names = set()
-        agent.valid_tool_names = valid_tool_names
+        setattr(agent, names_attr, valid_tool_names)
 
     added = 0
     for raw_schema in get_schemas():

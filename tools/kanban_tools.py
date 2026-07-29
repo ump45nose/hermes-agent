@@ -56,8 +56,22 @@ def _profile_has_kanban_toolset() -> bool:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        # ``toolsets`` is the legacy root field. Current multi-platform
+        # profiles store the effective selection under
+        # ``platform_toolsets.<platform>``. The registry check does not receive
+        # the active platform, but returning true when any configured platform
+        # enables kanban is safe: model_tools has already intersected schemas
+        # with the caller's enabled toolsets before registry check_fn filtering.
+        if "kanban" in (cfg.get("toolsets", []) or []):
+            return True
+        platform_toolsets = cfg.get("platform_toolsets", {}) or {}
+        if not isinstance(platform_toolsets, dict):
+            return False
+        return any(
+            "kanban" in (toolsets or [])
+            for toolsets in platform_toolsets.values()
+            if isinstance(toolsets, (list, tuple, set))
+        )
     except Exception:
         return False
 
@@ -1136,20 +1150,16 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    # Stamp the originating session id when the agent loop runs under
-    # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
-    # CLI / dashboard paths and on legacy hosts that don't set the env.
-    # Prefer the request-scoped api_server origin binding: HERMES_SESSION_ID
-    # is clobbered with a subagent's internal id whenever a child agent is
-    # constructed in-process (agent_init calls set_current_session_id), which
-    # would stamp — and later wake — the wrong session.
-    from tools.async_delegation import _current_origin_session_id
-
-    session_id = (
-        args.get("session_id")
-        or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
-    )
+    # Stamp the task-local originating session id. The gateway is concurrent,
+    # so process-global os.environ may hold a stale cron/other-session value.
+    try:
+        from gateway.session_context import get_session_env
+        _current_session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        def get_session_env(name: str, default: str = "") -> str:
+            return os.environ.get(name, default)
+        _current_session_id = os.environ.get("HERMES_SESSION_ID", "")
+    session_id = args.get("session_id") or _current_session_id or None
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1234,7 +1244,12 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                    or "worker"
+                ),
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -1333,33 +1348,24 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        source_profile = get_session_env("HERMES_SESSION_PROFILE", "") or None
+        notifier_profile = get_session_env("HERMES_SESSION_GATEWAY_PROFILE", "")
+        if platform == "tui":
+            chat_type = chat_type or "local"
+            session_id = session_id or session_key
+            notifier_profile = (
+                notifier_profile
+                or os.environ.get("HERMES_PROFILE")
+                or "default"
+            )
         if not notifier_profile:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                notifier_profile = get_active_profile_name() or "default"
-            except Exception:
-                notifier_profile = "default"
-        delivery_metadata: dict[str, Any] = {}
-        if thread_id:
-            delivery_metadata["thread_id"] = thread_id
-        if chat_type:
-            delivery_metadata["chat_type"] = chat_type
-        if (
-            platform.lower() == "telegram"
-            and thread_id
-            and (chat_type or "").lower() in {"dm", "direct", "private"}
-        ):
-            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
-            if str(thread_id) not in {"", "1"}:
-                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
-            if message_id:
-                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
+            return False
+        if not chat_type or not session_key or not session_id:
+            return False
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
@@ -1368,8 +1374,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform=platform, chat_id=chat_id,
             chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
+            source_profile=source_profile,
             notifier_profile=notifier_profile,
-            delivery_metadata=delivery_metadata or None,
+            session_key=session_key,
+            session_id=session_id,
+            message_id=message_id,
         )
         return True
     except Exception as _exc:
