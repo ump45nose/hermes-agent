@@ -510,7 +510,7 @@ class GatewaySlashCommandsMixin:
                             str(getattr(source, "profile", "") or "") or None
                         )
                         message_id = str(
-                            getattr(source, "message_id", "") or ""
+                            getattr(event, "message_id", "") or ""
                         )
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -530,6 +530,7 @@ class GatewaySlashCommandsMixin:
                                     session_key=session_key,
                                     session_id=session_id,
                                     message_id=message_id,
+                                    delivery_metadata=delivery_metadata,
                                 )
                             finally:
                                 conn.close()

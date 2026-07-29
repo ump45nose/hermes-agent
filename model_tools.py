@@ -1501,7 +1501,10 @@ def handle_function_call(
                                     _dedupe_abort_error,
                                 )
                         raise
-            from hermes_cli.middleware import run_tool_execution_middleware
+            if skip_tool_execution_middleware:
+                result = _dispatch(function_args)
+            else:
+                from hermes_cli.middleware import run_tool_execution_middleware
 
                 result = run_tool_execution_middleware(
                     function_name,

@@ -92,6 +92,8 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import errno
+import fnmatch
 import hashlib
 import inspect
 import json
@@ -3539,6 +3541,32 @@ _server_registration_locks: Dict[str, threading.Lock] = {}
 _current_server_connect_attempt: contextvars.ContextVar[object | None] = (
     contextvars.ContextVar("mcp_server_connect_attempt", default=None)
 )
+# Back off repeatedly failing startup discovery so one broken server cannot
+# respawn on every worker/session initialization.
+_server_connect_retry_after: Dict[str, float] = {}
+_server_connect_failures: Dict[str, int] = {}
+_CONNECT_RETRY_BASE_BACKOFF_SEC = 30.0
+_CONNECT_RETRY_MAX_BACKOFF_SEC = 600.0
+
+
+def _record_connect_failure(server_name: str) -> None:
+    failures = _server_connect_failures.get(server_name, 0) + 1
+    _server_connect_failures[server_name] = failures
+    backoff = min(
+        _CONNECT_RETRY_BASE_BACKOFF_SEC * (2 ** (failures - 1)),
+        _CONNECT_RETRY_MAX_BACKOFF_SEC,
+    )
+    _server_connect_retry_after[server_name] = time.monotonic() + backoff
+
+
+def _clear_connect_failure(server_name: str) -> None:
+    _server_connect_failures.pop(server_name, None)
+    _server_connect_retry_after.pop(server_name, None)
+
+
+def _connect_cooldown_active(server_name: str) -> bool:
+    deadline = _server_connect_retry_after.get(server_name)
+    return deadline is not None and time.monotonic() < deadline
 
 
 def _retire_connect_attempt(
@@ -3607,6 +3635,7 @@ def _record_connect_attempt_result(
             if _server_connect_attempts.get(server_name) is not attempt_token:
                 return
             _server_connect_errors[server_name] = message
+            _record_connect_failure(server_name)
         command = config.get("command")
         logger.warning(
             "Failed to connect to MCP server '%s'%s: %s",
@@ -3619,6 +3648,9 @@ def _record_connect_attempt_result(
     # Successful discovery publishes the server and clears its attempt token
     # inside _discover_and_register_server. The outer finally retires only the
     # matching flight, so there is no state/flight gap for a retry to enter.
+    with _lock:
+        if server_name in _servers:
+            _clear_connect_failure(server_name)
 
 
 # Circuit breaker: consecutive error counts per server.  After
@@ -5842,12 +5874,11 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
 
 def _registered_mcp_tool_names_for_server(server_name: str) -> set[str]:
     """Return a snapshot of registered MCP names attributed to one server."""
-    safe_server_name = sanitize_mcp_name_component(server_name)
     with _lock:
         return {
             tool_name
             for tool_name, registered_server in _mcp_tool_server_names.items()
-            if registered_server == safe_server_name
+            if registered_server == server_name
         }
 
 
@@ -5861,7 +5892,10 @@ def _reconcile_mcp_server_tool_names(
 
     stale_names = previously_registered - set(live_registered)
     for tool_name in stale_names:
-        registry.deregister(tool_name)
+        # Provenance can outlive a registry swap in tests or a dynamic reload.
+        # Never delete a name that is currently owned by another MCP server.
+        if registry.get_toolset_for_tool(tool_name) == f"mcp-{server_name}":
+            registry.deregister(tool_name)
         _forget_mcp_tool_server(tool_name)
 
 
@@ -6002,27 +6036,17 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             continue
 
         schema = _convert_mcp_schema(name, mcp_tool)
-        tool_name_prefixed = schema["name"]
-
-        # Guard against collisions with built-in (non-MCP) tools.
-        existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
-        if existing_toolset and not existing_toolset.startswith("mcp-"):
-            logger.warning(
-                "MCP server '%s': tool '%s' (→ '%s') collides with built-in "
-                "tool in toolset '%s' — skipping to preserve built-in",
-                name, mcp_tool.name, tool_name_prefixed, existing_toolset,
-            )
-            continue
-
-        registry.register(
-            name=tool_name_prefixed,
-            toolset=toolset_name,
-            schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
-            check_fn=_make_check_fn(name),
-            is_async=False,
-            description=schema["description"],
-            effect_disposition=_mcp_effect_disposition(mcp_tool, config),
+        candidates.append(
+            {
+                "registry_name": schema["name"],
+                "origin": f"tool {mcp_tool.name!r}",
+                "schema": schema,
+                "handler": _make_tool_handler(
+                    name, mcp_tool.name, server.tool_timeout
+                ),
+                "check_fn": check_fn,
+                "effect_disposition": _mcp_effect_disposition(mcp_tool, config),
+            }
         )
 
     # Generated resource/prompt utility tools share the same namespace as raw
@@ -6045,6 +6069,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "effect_disposition": "none",
             }
         )
 
@@ -6119,8 +6144,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             handler=candidate["handler"],
             check_fn=candidate["check_fn"],
             is_async=False,
-            description=schema["description"],
-            effect_disposition="none",
+            description=candidate["schema"]["description"],
+            effect_disposition=candidate["effect_disposition"],
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -6580,6 +6605,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if (
                 k not in _servers
                 and k not in _server_connecting
+                and not _connect_cooldown_active(k)
                 and _parse_boolish(v.get("enabled", True), default=True)
             )
         }
@@ -6745,15 +6771,62 @@ def discover_mcp_tools() -> List[str]:
         )
         return names
 
-    with _lock:
-        new_server_names = [
-            name
-            for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
-        ]
+    # Cross-process discovery guard (#62771). A lock loser waits for the
+    # holder, then performs its own process-local discovery. If locking is
+    # unavailable or the bounded wait expires, preserve fail-soft discovery.
+    cookie = _try_acquire_mcp_discovery_lock()
+    if cookie is None:
+        logger.debug(
+            "Another process holds MCP discovery lock -- retrying with backoff"
+        )
+        for _ in range(_MCP_DISCOVERY_LOCK_MAX_RETRIES):
+            time.sleep(_MCP_DISCOVERY_LOCK_RETRY_DELAY_S)
+            cookie = _try_acquire_mcp_discovery_lock()
+            if cookie is not None:
+                break
+
+        if cookie is None:
+            logger.warning(
+                "MCP discovery lock still held after %d retries -- "
+                "running discovery unguarded",
+                _MCP_DISCOVERY_LOCK_MAX_RETRIES,
+            )
+        elif cookie is not _LOCK_UNAVAILABLE:
+            logger.debug("Retry succeeded -- acquired MCP discovery lock")
+
+    try:
+        with _lock:
+            new_server_names = [
+                name
+                for name, cfg in servers.items()
+                if name not in _servers
+                and _parse_boolish(cfg.get("enabled", True), default=True)
+            ]
+
+        tool_names = register_mcp_servers(servers)
+        if not new_server_names:
+            return tool_names
+
+        with _lock:
+            connected_server_names = [
+                name for name in new_server_names if name in _servers
+            ]
+            new_tool_count = sum(
+                len(getattr(_servers[name], "_registered_tool_names", []))
+                for name in connected_server_names
+            )
+
+        failed_count = len(new_server_names) - len(connected_server_names)
+        if new_tool_count or failed_count:
+            summary = (
+                f"  MCP: {new_tool_count} tool(s) from "
+                f"{len(connected_server_names)} server(s)"
+            )
+            if failed_count:
+                summary += f" ({failed_count} failed)"
+            logger.info(summary)
 
         return tool_names
-
     finally:
         if cookie not in (None, _LOCK_UNAVAILABLE):
             cookie.release()

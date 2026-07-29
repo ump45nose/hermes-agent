@@ -337,68 +337,100 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = str(
-                                    sub.get("notifier_profile") or ""
-                                ).strip()
-                                # Strict single-owner claim. An ownerless
-                                # legacy row is intentionally fail-closed:
-                                # allowing every live gateway to race for it
-                                # recreates the cross-profile misdelivery this
-                                # identity stamp is designed to prevent.
-                                if not owner_profile or owner_profile != notifier_profile:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s owned by %s; current gateway owner is %s, skipping",
-                                        sub.get("task_id"),
-                                        owner_profile or "<missing>",
-                                        notifier_profile,
-                                    )
-                                    continue
-                                platform = (sub.get("platform") or "").lower()
-                                if (
-                                    platform != "session"
-                                    and platform not in active_platforms
-                                ):
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
-                                    continue
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
-                                )
-                                if not events:
-                                    continue
-                                task = _kb.get_task(conn, sub["task_id"])
-                                batch_tasks = []
-                                if task and task.controller_batch_id:
-                                    batch_tasks = [
-                                        item
-                                        for item in _kb.list_tasks(
-                                            conn,
-                                            include_archived=True,
-                                            limit=500,
+                                try:
+                                    owner_profile = str(
+                                        sub.get("notifier_profile") or ""
+                                    ).strip()
+                                    # Ownerless legacy rows fail closed. A
+                                    # multiplex gateway may still deliver for a
+                                    # secondary profile when that profile has its
+                                    # own connected adapter; the delivery-side
+                                    # lookup below remains profile-exact.
+                                    if not owner_profile:
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s has no "
+                                            "owner; current gateway owner is %s, skipping",
+                                            sub.get("task_id"),
+                                            notifier_profile,
                                         )
-                                        if item.controller_batch_id
-                                        == task.controller_batch_id
-                                    ]
-                                logger.debug(
-                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
-                                )
-                                deliveries.append({
-                                    "sub": sub,
-                                    "old_cursor": old_cursor,
-                                    "cursor": cursor,
-                                    "events": events,
-                                    "task": task,
-                                    "batch_tasks": batch_tasks,
-                                    "board": slug,
-                                })
+                                        continue
+                                    if owner_profile != notifier_profile:
+                                        owner_adapters = (
+                                            getattr(self, "_profile_adapters", {}) or {}
+                                        ).get(owner_profile)
+                                        if not owner_adapters:
+                                            logger.debug(
+                                                "kanban notifier: subscription for %s owned by "
+                                                "%s; current gateway %s has no adapter for it, "
+                                                "skipping",
+                                                sub.get("task_id"),
+                                                owner_profile,
+                                                notifier_profile,
+                                            )
+                                            continue
+                                    platform = (sub.get("platform") or "").lower()
+                                    if (
+                                        platform != "session"
+                                        and platform not in active_platforms
+                                    ):
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s on %s "
+                                            "skipped; adapter not connected",
+                                            sub.get("task_id"),
+                                            platform or "<missing>",
+                                        )
+                                        continue
+                                    old_cursor, cursor, events = (
+                                        _kb.claim_unseen_events_for_sub(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            platform=sub["platform"],
+                                            chat_id=sub["chat_id"],
+                                            thread_id=sub.get("thread_id") or "",
+                                            kinds=TERMINAL_KINDS,
+                                        )
+                                    )
+                                    if not events:
+                                        continue
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    batch_tasks = []
+                                    if task and task.controller_batch_id:
+                                        batch_tasks = [
+                                            item
+                                            for item in _kb.list_tasks(
+                                                conn,
+                                                include_archived=True,
+                                                limit=500,
+                                            )
+                                            if item.controller_batch_id
+                                            == task.controller_batch_id
+                                        ]
+                                    logger.debug(
+                                        "kanban notifier: claimed %d event(s) for %s "
+                                        "on board %s cursor %s→%s",
+                                        len(events),
+                                        sub["task_id"],
+                                        slug,
+                                        old_cursor,
+                                        cursor,
+                                    )
+                                    deliveries.append({
+                                        "sub": sub,
+                                        "old_cursor": old_cursor,
+                                        "cursor": cursor,
+                                        "events": events,
+                                        "task": task,
+                                        "batch_tasks": batch_tasks,
+                                        "board": slug,
+                                    })
+                                except Exception as sub_exc:
+                                    logger.warning(
+                                        "kanban notifier: subscription for %s on "
+                                        "board %s failed: %s",
+                                        sub.get("task_id"),
+                                        slug,
+                                        sub_exc,
+                                    )
                         finally:
                             conn.close()
                     return deliveries
@@ -505,9 +537,12 @@ class GatewayKanbanWatchersMixin:
                     # may own delivery for a source routed to "research";
                     # a single-profile "lingjun" gateway owns delivery while
                     # its primary adapter still has source.profile=None.
-                    adapter = self._authorization_adapter(
-                        plat, source_profile or None
+                    adapter_profile = source_profile or (
+                        owner_profile
+                        if owner_profile and owner_profile != notifier_profile
+                        else None
                     )
+                    adapter = self._authorization_adapter(plat, adapter_profile)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",

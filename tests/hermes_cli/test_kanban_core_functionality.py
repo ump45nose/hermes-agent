@@ -539,6 +539,10 @@ def test_notify_sub_crud(kanban_home):
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
             notifier_profile="default",
+            delivery_metadata={
+                "chat_type": "dm",
+                "telegram_reply_to_message_id": "43",
+            },
         )
         assert len(kb.list_notify_subs(conn, tid)) == 1
         assert kb.list_notify_subs(conn, tid)[0]["delivery_metadata"][
@@ -604,6 +608,11 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         kb.add_notify_sub(
             conn1, task_id=tid, platform="telegram", chat_id="123",
             notifier_profile="default",
+        )
+        # New subscriptions start at the task's current event cursor so
+        # historical activity is not replayed.
+        initial_cursor = int(
+            kb.list_notify_subs(conn1, tid)[0]["last_event_id"]
         )
         kb.complete_task(conn1, tid, result="ok")
 

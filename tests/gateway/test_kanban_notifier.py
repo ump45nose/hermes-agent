@@ -152,7 +152,9 @@ def test_kanban_notifier_wrong_gateway_cannot_claim_owned_subscription(
     finally:
         conn.close()
     assert len(subs) == 1
-    assert int(subs[0]["last_event_id"]) == 0
+    # Subscription creation snaps to the then-current event cursor, but the
+    # wrong gateway must not advance it through the later completion.
+    assert int(subs[0]["last_event_id"]) == 1
 
 
 def test_kanban_notifier_ownerless_legacy_subscription_fails_closed(
@@ -732,6 +734,8 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
             platform="telegram",
             chat_id="chat-dm",
             chat_type="dm",
+            session_key="agent:main:telegram:dm:chat-dm",
+            session_id="origin-session",
         )
         kb.complete_task(conn, tid, summary="done")
     finally:
@@ -773,6 +777,9 @@ def test_auto_subscribe_persists_session_chat_type(tmp_path, monkeypatch):
         platform="telegram",
         chat_id="chat-dm",
         chat_type="dm",
+        gateway_profile="default",
+        session_key="agent:main:telegram:dm:chat-dm",
+        session_id="origin-session",
     )
     conn = kb.connect()
     try:

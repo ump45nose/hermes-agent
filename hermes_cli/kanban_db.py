@@ -1319,6 +1319,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     session_key   TEXT NOT NULL DEFAULT '',
     session_id    TEXT NOT NULL DEFAULT '',
     message_id    TEXT NOT NULL DEFAULT '',
+    delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -2500,10 +2501,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "message_id",
                 "message_id TEXT NOT NULL DEFAULT ''",
             )
-        if "chat_type" not in notify_cols:
-            _add_column_if_missing(
-                conn, "kanban_notify_subs", "chat_type", "chat_type TEXT"
-            )
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
@@ -2634,7 +2631,8 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, source_profile TEXT,"
         " notifier_profile TEXT NOT NULL DEFAULT '',"
         " session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',"
-        " message_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,"
+        " message_id TEXT NOT NULL DEFAULT '', delivery_metadata TEXT,"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -3193,11 +3191,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        controller_batch_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            branch_name, project_id, tenant, idempotency_key,
+                            max_runtime_seconds,
+                            skills, max_retries, model_override, provider_override,
+                            goal_mode, goal_max_turns, session_id,
+                            controller_batch_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -9496,7 +9495,7 @@ def add_notify_sub(
     task_id: str,
     platform: str,
     chat_id: str,
-    notifier_profile: str,
+    notifier_profile: str = "default",
     chat_type: str = "",
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -9504,6 +9503,7 @@ def add_notify_sub(
     session_key: str = "",
     session_id: str = "",
     message_id: str = "",
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -9523,7 +9523,7 @@ def add_notify_sub(
     canonical_key = str(session_key or "").strip()
     durable_session_id = str(session_id or "").strip()
     source_chat_type = str(chat_type or "").strip()
-    if any((canonical_key, durable_session_id, source_chat_type)) and not all(
+    if any((canonical_key, durable_session_id)) and not all(
         (canonical_key, durable_session_id, source_chat_type)
     ):
         raise ValueError(
@@ -9549,13 +9549,15 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
                  source_profile, notifier_profile, session_key, session_id,
-                 message_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 message_id, delivery_metadata, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
                 task_id, platform, chat_id, source_chat_type, thread_id or "",
                 user_id, source_profile, owner, canonical_key,
-                durable_session_id, str(message_id or ""), now,
+                durable_session_id, str(message_id or ""), metadata_json, now,
+                task_id,
             ),
         )
         # Re-subscribing refreshes the exact continuation address and
@@ -9575,6 +9577,19 @@ def add_notify_sub(
                 chat_id, thread_id or "",
             ),
         )
+        if metadata_json:
+            # Refresh platform-specific routing anchors on a duplicate
+            # subscription without erasing existing metadata when omitted.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET delivery_metadata = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (
+                    metadata_json, task_id, platform, chat_id, thread_id or "",
+                ),
+            )
 
 
 def list_notify_subs(

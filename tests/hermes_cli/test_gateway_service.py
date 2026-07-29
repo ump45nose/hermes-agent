@@ -238,6 +238,13 @@ class TestSystemdServiceRefresh:
             return True
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
+        # run_gateway intentionally hard-exits after graceful teardown so
+        # service restarts cannot wedge on non-daemon worker threads. Keep this
+        # unit test in-process; hard-exit behavior has dedicated coverage in
+        # test_gateway_run_hard_exit.py.
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown", lambda code: None
+        )
 
         gateway_cli.run_gateway()
 

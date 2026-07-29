@@ -1263,7 +1263,6 @@ class TestBlockedTools(unittest.TestCase):
             "clarify",
             "memory",
             "send_message",
-            "execute_code",
             "kanban_complete",
             "kanban_block",
             "kanban_heartbeat",

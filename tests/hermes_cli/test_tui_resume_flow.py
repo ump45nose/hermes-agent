@@ -1,4 +1,5 @@
 from argparse import Namespace
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -7,6 +8,14 @@ import textwrap
 import types
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def restore_logging_disable_threshold():
+    """Keep direct one-shot calls from muting later tests in this process."""
+    previous = logging.Logger.manager.disable
+    yield
+    logging.disable(previous)
 
 
 def _args(**overrides):

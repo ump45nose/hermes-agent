@@ -150,11 +150,15 @@ def test_run_agent_close_persists_session_end(monkeypatch, tmp_path):
 
     _stub_runtime(monkeypatch, SessionOwningAgent, session_db)
 
+    response, _result = oneshot._run_agent("persist this session")
+    # The current oneshot contract closes its internally owned SessionDB before
+    # returning so a hard process exit cannot leave WAL state behind. Reopen the
+    # database to verify the persisted lifecycle row.
+    verification_db = SessionDB(tmp_path / "state.db")
     try:
-        response, _result = oneshot._run_agent("persist this session")
-        row = session_db.get_session(session_id)
+        row = verification_db.get_session(session_id)
     finally:
-        session_db.close()
+        verification_db.close()
 
     assert response == "done"
     assert row is not None

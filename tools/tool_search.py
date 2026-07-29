@@ -552,6 +552,114 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     return [e for _, e in scored[:limit]]
 
 
+def _short_desc(description: str, max_chars: int = 60) -> str:
+    """Return a stable single-line catalog description."""
+    text = " ".join(str(description or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _listing_group_label(source_name: str) -> str:
+    label = source_name or "other"
+    return label[4:] if label.startswith("mcp-") else label
+
+
+def build_catalog_listing(
+    deferrable: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 20000,
+) -> Optional[str]:
+    text, _form = build_catalog_listing_with_form(
+        deferrable,
+        max_tokens=max_tokens,
+    )
+    return text
+
+
+def build_catalog_listing_with_form(
+    deferrable: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 20000,
+) -> Tuple[Optional[str], str]:
+    """Render a deterministic, budgeted deferred-tool catalog."""
+    if not deferrable:
+        return None, "none"
+
+    groups: Dict[str, List[Tuple[str, str]]] = {}
+    for td in deferrable:
+        fn = td.get("function") or {}
+        name = fn.get("name", "")
+        if not name:
+            continue
+        source, source_name = _classify_source(name)
+        label = _listing_group_label(
+            source_name if source != "other" else "other"
+        )
+        groups.setdefault(label, []).append(
+            (name, _short_desc(fn.get("description", "")))
+        )
+
+    if not groups:
+        return None, "none"
+
+    def render_group(label: str, mode: str) -> str:
+        tools = sorted(groups[label])
+        if mode == "summary":
+            return (
+                f"{label} ({len(tools)} tools — names not listed; "
+                f"discover via `{TOOL_SEARCH_NAME}`)"
+            )
+        lines = [f"{label} tools ({len(tools)}):"]
+        if mode == "full":
+            for name, desc in tools:
+                lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+        else:
+            lines.append(", ".join(name for name, _ in tools))
+        return "\n".join(lines)
+
+    header = (
+        "Deferred tool catalog (call schemas via "
+        f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):"
+    )
+
+    def assemble(modes: Dict[str, str]) -> str:
+        return "\n".join(
+            [header]
+            + [render_group(label, modes[label]) for label in sorted(groups)]
+        )
+
+    def fits(text: str) -> bool:
+        return math.ceil(len(text) / CHARS_PER_TOKEN) <= max_tokens
+
+    modes = {label: "full" for label in groups}
+    rendered = assemble(modes)
+    if fits(rendered):
+        return rendered, "full"
+
+    modes = {label: "names" for label in groups}
+    rendered = assemble(modes)
+    if fits(rendered):
+        return rendered, "names"
+
+    by_size = sorted(
+        groups,
+        key=lambda label: (-len(render_group(label, "names")), label),
+    )
+    for label in by_size:
+        modes[label] = "summary"
+        rendered = assemble(modes)
+        if fits(rendered):
+            form = (
+                "groups"
+                if all(mode == "summary" for mode in modes.values())
+                else "mixed"
+            )
+            return rendered, form
+
+    return None, "none"
+
+
 # ---------------------------------------------------------------------------
 # Bridge tool schemas
 # ---------------------------------------------------------------------------
@@ -565,7 +673,11 @@ def _schema_hash(schema: Dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def bridge_tool_schemas(deferred_count: Optional[int] = None) -> List[Dict[str, Any]]:
+def bridge_tool_schemas(
+    deferred_count: Optional[int] = None,
+    listing: Optional[str] = None,
+    listing_form: str = "",
+) -> List[Dict[str, Any]]:
     """Build the bridge tool schemas to inject in place of deferred tools.
 
     The schemas are intentionally short — every byte added here is a byte
@@ -912,6 +1024,51 @@ def scoped_deferrable_names(
         if name and (progressive or is_deferrable_tool_name(name)):
             names.add(name)
     return frozenset(names)
+
+
+def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Probe-validate ``tool_call`` arguments against the deferred tool schema.
+
+    Only absent schema-required keys are rejected. Calls that cannot be
+    validated confidently continue to the underlying tool unchanged.
+    """
+    try:
+        from tools.registry import registry as _registry
+
+        schema = _registry.get_schema(name)
+        if not isinstance(schema, dict):
+            return None
+        fn = schema.get("function") if schema.get("type") == "function" else schema
+        if not isinstance(fn, dict):
+            return None
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            return None
+        required = params.get("required")
+        if not isinstance(required, list) or not required:
+            return None
+        missing = [key for key in required if isinstance(key, str) and key not in args]
+        if not missing:
+            return None
+        return json.dumps(
+            {
+                "error": (
+                    f"tool_call to '{name}' is missing required argument(s): "
+                    f"{', '.join(missing)}. The tool was NOT invoked."
+                ),
+                "parameters": params,
+                "hint": (
+                    "Retry tool_call with 'arguments' matching the parameters "
+                    "schema above."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    except Exception:  # pragma: no cover - validation must never block dispatch
+        logger.debug(
+            "validate_deferred_call_args failed for %s", name, exc_info=True
+        )
+        return None
 
 
 def resolve_underlying_call(

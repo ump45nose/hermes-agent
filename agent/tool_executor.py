@@ -59,6 +59,30 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _ensure_file_checkpoint(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> None:
+    """Checkpoint the workspace path the file tool will mutate."""
+    file_path = function_args.get("path", "")
+    if not file_path:
+        return
+
+    from tools.file_tools import _resolve_path_for_task
+
+    resolved_path = _resolve_path_for_task(
+        file_path, effective_task_id or "default"
+    )
+    work_dir = agent._checkpoint_mgr.get_working_dir_for_path(
+        str(resolved_path)
+    )
+    agent._checkpoint_mgr.ensure_checkpoint(
+        work_dir, f"before {function_name}"
+    )
+
+
 def _record_capability_metric(agent, tool_name: str, result: Any) -> None:
     """Emit compact per-turn progressive-disclosure telemetry."""
     if not getattr(agent, "_progressive_disclosure", False):
@@ -422,6 +446,35 @@ def _managed_values(
         outcome.middleware_trace,
         outcome.blocked,
     )
+
+
+def _apply_tool_request_middleware_for_agent(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: str,
+) -> tuple[dict, list[dict[str, Any]]]:
+    try:
+        from hermes_cli.middleware import apply_tool_request_middleware
+
+        result = apply_tool_request_middleware(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+        payload = (
+            result.payload if isinstance(result.payload, dict) else function_args
+        )
+        return payload, list(result.trace)
+    except Exception as exc:
+        logger.debug("tool_request middleware error: %s", exc)
+        return function_args, []
 
 
 def _run_agent_tool_execution_middleware(
@@ -804,134 +857,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
-
-        # ── Block evaluation (BEFORE checkpoint preflight) ───────────
-        # We must know whether the tool will execute before touching
-        # checkpoint state (dedup slot, real snapshots).
-        block_result = None
-        blocked_by_guardrail = False
-        try:
-            from agent.controller_protocol import runtime_protocol_tool_policy_block
-
-            _runtime_policy_block = runtime_protocol_tool_policy_block(
-                agent,
-                function_name,
-            )
-        except Exception:
-            _runtime_policy_block = None
-
-        if _ts_scope_block is not None:
-            # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
-            block_result = _ts_scope_block
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=block_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="tool_scope_block",
-                error_message=_ts_scope_block,
-                middleware_trace=list(middleware_trace),
-            )
-        elif _runtime_policy_block is not None:
-            _policy_protocol, _policy_next_tool, _policy_error = (
-                _runtime_policy_block
-            )
-            block_result = json.dumps(
-                {
-                    "error": _policy_error,
-                    "protocol": _policy_protocol,
-                    "required_next_tool": _policy_next_tool,
-                },
-                ensure_ascii=False,
-            )
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=block_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="runtime_protocol_block",
-                error_message=_policy_error,
-                middleware_trace=list(middleware_trace),
-            )
-        else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-                _emit_terminal_post_tool_call(
-                    agent,
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=block_result,
-                    effective_task_id=effective_task_id,
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(middleware_trace),
-                )
-            else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
-                    _emit_terminal_post_tool_call(
-                        agent,
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=block_result,
-                        effective_task_id=effective_task_id,
-                        tool_call_id=getattr(tool_call, "id", "") or "",
-                        status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
-                        middleware_trace=list(middleware_trace),
-                    )
-
-        # ── Checkpoint preflight (only for tools that will execute) ──
-        if block_result is None:
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
-                try:
-                    file_path = function_args.get("path", "")
-                    if file_path:
-                        work_dir = agent._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
-                except Exception:
-                    pass
-
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
-                try:
-                    cmd = function_args.get("command", "")
-                    if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        agent._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
-                except Exception:
-                    pass
-
-        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
@@ -1410,13 +1335,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
         _record_capability_metric(agent, name, function_result)
-
-        if not blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(name, args) or args
-                agent.tool_complete_callback(tc.id, name, display_args, function_result)
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
 
         display_function_result = function_result
         function_result = maybe_persist_tool_result(

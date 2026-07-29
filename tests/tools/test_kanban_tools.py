@@ -2532,7 +2532,8 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     s = subs[0]
     assert s["platform"] == "telegram"
     assert s["chat_id"] == "chat-42"
-    assert s["thread_id"] == "20197"
+    # Live session ContextVars are authoritative over process-global env.
+    assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
     assert s["chat_type"] == "dm"
     assert s["session_key"] == "agent:main:telegram:dm:chat-42:thread-7"

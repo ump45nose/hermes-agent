@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextvars
 import hashlib
 import json
 import logging
@@ -1566,38 +1567,48 @@ def _build_child_agent(
 
     from agent.delegation_context import delegated_child_context
 
-        reasoning_config=child_reasoning,
-        prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
-        enabled_toolsets=child_toolsets,
-        disabled_toolsets=child_disabled_toolsets,
-        quiet_mode=True,
-        ephemeral_system_prompt=child_prompt,
-        log_prefix=f"[subagent-{task_index}]",
-        platform="subagent",
-        runtime_role="research_leaf" if is_research_leaf else "subagent",
-        skip_context_files=True,
-        skip_memory=True,
-        clarify_callback=None,
-        thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
-        providers_allowed=child_providers_allowed,
-        providers_ignored=child_providers_ignored,
-        providers_order=child_providers_order,
-        provider_sort=child_provider_sort,
-        provider_require_parameters=child_provider_require_parameters,
-        provider_data_collection=child_provider_data_collection,
-        request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
-        ),
-        openrouter_min_coding_score=child_openrouter_min_coding_score,
-        tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
-        **child_optional_kwargs,
-    )
+    with delegated_child_context():
+        child = AIAgent(
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            acp_command=effective_acp_command,
+            acp_args=effective_acp_args,
+            max_iterations=max_iterations,
+            reasoning_config=child_reasoning,
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
+            fallback_model=parent_fallback,
+            enabled_toolsets=child_toolsets,
+            disabled_toolsets=child_disabled_toolsets,
+            quiet_mode=True,
+            ephemeral_system_prompt=child_prompt,
+            log_prefix=f"[subagent-{task_index}]",
+            platform="subagent",
+            runtime_role="research_leaf" if is_research_leaf else "subagent",
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=None,
+            thinking_callback=child_thinking_cb,
+            session_db=getattr(parent_agent, "_session_db", None),
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            providers_allowed=child_providers_allowed,
+            providers_ignored=child_providers_ignored,
+            providers_order=child_providers_order,
+            provider_sort=child_provider_sort,
+            provider_require_parameters=child_provider_require_parameters,
+            provider_data_collection=child_provider_data_collection,
+            request_overrides=(
+                dict(override_request_overrides or {})
+                if override_provider
+                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            ),
+            openrouter_min_coding_score=child_openrouter_min_coding_score,
+            tool_progress_callback=child_progress_cb,
+            iteration_budget=None,  # fresh budget per subagent
+            **child_optional_kwargs,
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     if is_research_leaf:
         _research_names = {
@@ -2412,6 +2423,13 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
+            with delegated_child_context():
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
+
         # The actual child conversation runs in a second worker thread so a
         # hard timeout can abandon it. ContextVars do not cross that boundary
         # automatically; copy the profile secret scope and HERMES_HOME context
@@ -2595,6 +2613,7 @@ def _run_single_child(
                         entry_t = {
                             "tool": fn.get("name", "unknown"),
                             "args_bytes": len(arguments.encode("utf-8")),
+                            "input_summary": _summarize_tool_arguments(arguments),
                         }
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
@@ -3278,6 +3297,16 @@ def delegate_task(
             override_acp_args=creds.get("args"),
             role=effective_role,
         )
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            current_secret_scope,
+        )
+        from hermes_constants import get_hermes_home
+
+        child._delegate_secret_scope = dict(
+            current_secret_scope()
+            or build_profile_secret_scope(get_hermes_home())
+        )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3288,33 +3317,8 @@ def delegate_task(
             child.tool_progress_callback = wrap_progress_callback(
                 getattr(child, "tool_progress_callback", None), _writer
             )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            from agent.secret_scope import (
-                build_profile_secret_scope,
-                current_secret_scope,
-            )
-            from hermes_constants import get_hermes_home
-
-            child._delegate_secret_scope = dict(
-                current_secret_scope()
-                or build_profile_secret_scope(get_hermes_home())
-            )
-            # Tee the child's progress events into its live transcript log.
-            # wrap_progress_callback preserves the inner callback contract
-            # (including the _flush attribute) and never lets writer failures
-            # reach the agent loop. When no parent display exists the inner
-            # callback is None and the wrapper still records events.
-            _writer = live_writers[i] if i < len(live_writers) else None
-            if _writer is not None:
-                child.tool_progress_callback = wrap_progress_callback(
-                    getattr(child, "tool_progress_callback", None), _writer
-                )
-                child._live_transcript_path = str(_writer.path)
-            children.append((i, t, child))
-    finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+            child._live_transcript_path = str(_writer.path)
+        children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,

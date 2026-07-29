@@ -572,6 +572,17 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     kb.create_board("projx")
 
     runner = object.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(
+                session_key="agent:main:telegram:dm:chat1:topic-20197",
+                session_id="origin-session",
+            )
+        )
+    )
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
         chat_id="chat1",
