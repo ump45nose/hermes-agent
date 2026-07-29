@@ -114,6 +114,88 @@ def test_finalizer_restores_clean_api_local_text_before_return(monkeypatch):
     assert result["messages"][0]["content"] == "clean prompt"
 
 
+def test_finalizer_canonicalizes_transient_and_consumed_tool_history(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._progressive_disclosure = True
+    agent._tool_context_editor_mode = "failures"
+    messages = [
+        {"role": "user", "content": "research"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "search-1",
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "arguments": '{"query":"web"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "search-1",
+            "tool_name": "tool_search",
+            "content": "large capability index",
+            "_tool_receipt": {
+                "tool_name": "tool_search",
+                "result_status": "success",
+                "effect": "none",
+                "consumed_turn": 1,
+            },
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "web-1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "web-1",
+            "tool_name": "web_search",
+            "content": "raw evidence " * 1_000,
+            "_tool_receipt": {
+                "tool_name": "web_search",
+                "result_status": "success",
+                "effect": "none",
+                "artifact_ref": None,
+                "consumed_turn": 2,
+                "steer_present": False,
+                "supersedes": None,
+            },
+        },
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="research",
+        original_user_message="research",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    rendered = str(result["messages"])
+    assert "large capability index" not in rendered
+    assert "raw evidence raw evidence" not in rendered
+    assert "tool read result consumed" in rendered
+    assert agent._session_messages == result["messages"]
+    assert agent.persisted_messages == result["messages"]
+
+
 def test_finalizer_restores_clean_api_local_multimodal_before_return(monkeypatch):
     """A queued note does not remain in the next-turn native image payload."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])

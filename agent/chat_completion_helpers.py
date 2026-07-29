@@ -2056,11 +2056,34 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     messages.append({"role": "user", "content": summary_request})
 
     try:
+        # The forced-summary request is still a real provider call. It must
+        # use the same transient/result projection as the main loop instead
+        # of resurrecting every consumed Tool result at the largest point in
+        # the turn.
+        from agent.tool_context_editor import project_tool_context_for_provider
+
+        _summary_source_messages, _summary_projection_report = (
+            project_tool_context_for_provider(
+                messages,
+                progressive_disclosure=getattr(
+                    agent, "_progressive_disclosure", False
+                ),
+                editor_mode=getattr(
+                    agent, "_tool_context_editor_mode", "failures"
+                ),
+            )
+        )
+        if any(_summary_projection_report.values()):
+            logger.info(
+                "Forced-summary Tool Context projection actions=%s",
+                _summary_projection_report,
+            )
+
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
-        for msg in messages:
+        for msg in _summary_source_messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):

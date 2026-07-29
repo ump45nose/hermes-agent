@@ -2426,6 +2426,42 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_controller_specialist_tool_is_blocked_before_dispatch(self, agent):
+        agent._prompt_lock = {"protocols": ["kanban-controller@1"]}
+        agent.runtime_role = "interactive"
+        tc = _mock_tool_call(
+            name="web_search",
+            arguments='{"q":"Hangzhou agent jobs"}',
+            call_id="controller-block-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        with patch("run_agent.handle_function_call") as mock_hfc:
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+        mock_hfc.assert_not_called()
+        payload = messages[0]["content"]
+        assert '"protocol": "kanban-controller@1"' in payload
+        assert '"required_next_tool": "kanban_roster"' in payload
+        assert "Controller protocol blocked" in payload
+
+    def test_research_parent_source_tool_is_blocked_before_dispatch(self, agent):
+        agent._prompt_lock = {"protocols": ["research-parent@1"]}
+        agent.runtime_role = "kanban_worker"
+        tc = _mock_tool_call(
+            name="mcp__github__get_file_contents",
+            arguments='{"owner":"o","repo":"r","path":"README.md"}',
+            call_id="research-parent-block-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        with patch("run_agent.handle_function_call") as mock_hfc:
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+        mock_hfc.assert_not_called()
+        payload = messages[0]["content"]
+        assert '"protocol": "research-parent@1"' in payload
+        assert '"required_next_tool": "delegate_task"' in payload
+        assert "Research parent protocol blocked" in payload
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(

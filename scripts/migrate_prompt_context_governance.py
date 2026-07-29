@@ -67,7 +67,7 @@ def _set_config(name: str, home: Path) -> None:
     ensure_profile_governance_config(home)
     path = home / "config.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    config.setdefault("tool_context_editor", {})["mode"] = "report_only"
+    config.setdefault("tool_context_editor", {})["mode"] = "failures"
     config.setdefault("observability", {}).setdefault("request_snapshot", "off")
     config.setdefault("episode_store", {}).update(
         {

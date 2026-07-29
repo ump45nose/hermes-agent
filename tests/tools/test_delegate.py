@@ -2188,6 +2188,14 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
                 task_count=1,
             )
             research_artifact_dir = Path(mock_child._research_artifact_dir)
+            self.assertEqual(
+                research_artifact_dir.parent.stat().st_mode & 0o777,
+                0o700,
+            )
+            self.assertEqual(
+                research_artifact_dir.stat().st_mode & 0o777,
+                0o700,
+            )
 
         kwargs = MockAgent.call_args[1]
         self.assertEqual(kwargs["runtime_role"], "research_leaf")

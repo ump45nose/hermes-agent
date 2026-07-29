@@ -166,6 +166,16 @@ def _build_fixed_profile_prompt_parts(
     role = getattr(agent, "runtime_role", "interactive")
     manifest: List[Dict[str, Any]] = []
     stable_parts: List[str] = []
+    if getattr(agent, "_progressive_disclosure", False):
+        stable_parts.append(
+            f"Capability-Prompt-Version: {CAPABILITY_PROMPT_VERSION}"
+        )
+        manifest.append(
+            {
+                "kind": "capability_protocol",
+                "version": CAPABILITY_PROMPT_VERSION,
+            }
+        )
     if role == "research_leaf":
         stable_parts.append(RESEARCH_LEAF_PROMPT)
         manifest.append({"kind": "runtime_overlay", "id": "research-leaf"})

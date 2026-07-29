@@ -34,7 +34,34 @@ NO_EFFECT_TOOL_PREFIXES = (
 )
 
 
+def declared_tool_effect(tool_name: str) -> str | None:
+    """Return authoritative registry/MCP effect metadata when available."""
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        entry = None
+    effect = getattr(entry, "effect_disposition", None)
+    return effect if effect in {"none", "unknown"} else None
+
+
+def declared_tool_retention(tool_name: str) -> str | None:
+    """Return a tool name that must be called before this body can be pruned."""
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        entry = None
+    value = getattr(entry, "retain_result_until", None)
+    return str(value) if value else None
+
+
 def tool_may_have_side_effect(tool_name: str) -> bool:
+    declared = declared_tool_effect(tool_name)
+    if declared is not None:
+        return declared != "none"
     return (
         tool_name not in NO_EFFECT_TOOL_NAMES
         and not any(tool_name.startswith(prefix) for prefix in NO_EFFECT_TOOL_PREFIXES)

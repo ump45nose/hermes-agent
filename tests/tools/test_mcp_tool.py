@@ -36,6 +36,28 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     return tool
 
 
+def test_mcp_read_only_hint_is_advisory_without_local_opt_in():
+    from tools.mcp_tool import _mcp_effect_disposition
+
+    tool = _make_mcp_tool(name="lookup")
+    tool.annotations = SimpleNamespace(readOnlyHint=True)
+
+    assert _mcp_effect_disposition(tool, {}) is None
+    assert _mcp_effect_disposition(
+        tool, {"trust_read_only_annotations": True}
+    ) == "none"
+
+
+def test_mcp_local_tool_effect_policy_is_authoritative():
+    from tools.mcp_tool import _mcp_effect_disposition
+
+    tool = _make_mcp_tool(name="lookup")
+    assert _mcp_effect_disposition(
+        tool,
+        {"tool_effects": {"read_only": ["lookup"]}},
+    ) == "none"
+
+
 def _make_call_result(text="file contents here", is_error=False):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)

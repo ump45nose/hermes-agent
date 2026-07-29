@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from agent.local_context import LocalContextStore
@@ -27,7 +28,10 @@ from agent.tool_result_classification import tool_may_have_side_effect
 from agent.prompt_builder import format_steer_marker
 from hermes_cli.prompt_compiler import (
     compile_profile_prompt,
+    extra_modules_from_lock,
     load_compiled_prompt,
+    render_prompt_diff,
+    validate_runtime_prompt_protocols,
     verify_compiled_prompt,
     write_compiled_prompt,
 )
@@ -53,8 +57,147 @@ def test_compiled_prompt_is_fixed_and_verifiable(tmp_path):
     assert saved_lock["compiled_sha256"] == hashlib.sha256(text.encode()).hexdigest()
     assert lock["model_adapter"]["family"] == "openai"
     assert verify_compiled_prompt(tmp_path)["ok"]
-    assert "Git" not in text
+    assert "git commit" not in text.lower()
+    assert "编辑代码" not in text
     assert "依赖安装" not in text
+
+
+def test_controller_lock_v2_provisions_protocol_capabilities(tmp_path):
+    lock = write_compiled_prompt(
+        tmp_path,
+        preset="lingjun",
+        model_family="openai",
+    )
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+    assert lock["schema_version"] == 2
+    assert lock["protocols"] == ["kanban-controller@1"]
+    assert lock["runtime_overlays"] == ["platform", "cron"]
+    for surface in ("cli", "telegram", "weixin", "api_server"):
+        assert "kanban" in config["platform_toolsets"][surface]["deferred"]
+    assert verify_compiled_prompt(tmp_path)["ok"]
+
+    runtime = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="interactive",
+        reachable_toolsets={"kanban"},
+    )
+    assert runtime["ok"]
+    assert runtime["protocols"] == ["kanban-controller@1"]
+
+    missing = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="interactive",
+        reachable_toolsets=set(),
+    )
+    assert not missing["ok"]
+    assert missing["missing"] == ["kanban.create", "kanban.roster"]
+
+
+def test_controller_module_is_generic_control_protocol_not_incident_patch():
+    text, lock = compile_profile_prompt("lingjun")
+
+    assert "职责\n" in text
+    assert "自己处理\n" in text
+    assert "走 Kanban\n" in text
+    assert "边界\n" in text
+    assert "复杂链路范例\n" in text
+    assert "先调用 kanban_roster，再调用 kanban_create" in text
+    assert "派单成功后停止当前执行，由 Harness Park 当前会话" in text
+    assert "存在未终态的相关任务时，不得提前给出最终答案" in text
+    assert "Harness 负责能力校验" in text
+    assert "需要专业领域判断或执行、外部或多来源取证" in text
+    for incident_term in ("GitHub MCP", "市场/JD", "样本描述成频率"):
+        assert incident_term not in text
+    controller = next(
+        module for module in lock["modules"] if module["id"] == "controller"
+    )
+    assert controller["version"] == 5
+    assert controller["protocols"] == ["kanban-controller@1"]
+
+
+def test_research_lock_requires_delegation_and_rejects_unlisted_overlay(tmp_path):
+    lock = write_compiled_prompt(tmp_path, preset="research")
+    assert lock["protocols"] == ["research-parent@1"]
+    assert "github.read" in lock["required_capabilities"]
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    github = config["mcp_servers"]["github"]
+    include = set(github["tools"]["include"])
+    declared_read_only = set(github["tool_effects"]["read_only"])
+    assert github["enabled"] is True
+    assert "get_file_contents" in include
+    assert "search_repositories" in include
+    assert "create_or_update_file" not in include
+    assert include == declared_read_only
+    assert "github" in config["platform_toolsets"]["subagent"]["deferred"]
+    assert "github" in config["delegation"]["research_leaf_toolsets"]
+    runtime = validate_runtime_prompt_protocols(
+        lock,
+        platform="cron",
+        runtime_role="cron",
+        reachable_toolsets={"delegation", "github"},
+    )
+    assert runtime["ok"]
+
+    forbidden = validate_runtime_prompt_protocols(
+        lock,
+        platform="telegram",
+        runtime_role="subagent",
+        reachable_toolsets={"delegation", "github"},
+    )
+    # A generic subagent overlay is not declared by this fixed Profile.
+    assert not forbidden["ok"]
+    assert forbidden["missing"] == ["runtime_overlay:subagent"]
+
+
+def test_prompt_upgrade_preserves_locked_extra_modules_and_shows_config_diff(
+    tmp_path,
+):
+    write_compiled_prompt(
+        tmp_path,
+        preset="lingjun",
+        extra_modules=("citation-rigor",),
+    )
+    loaded = load_compiled_prompt(tmp_path)
+    assert loaded is not None
+    assert extra_modules_from_lock(loaded[1]) == ("citation-rigor",)
+
+    # Simulate an old config which has lost the protocol dependency.
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    diff = render_prompt_diff(tmp_path)
+    assert "config.yaml.new" in diff
+    assert "kanban" in diff
+
+
+def test_fixed_prompt_runtime_shell_carries_capability_version(monkeypatch):
+    import agent.system_prompt as system_prompt
+
+    monkeypatch.setattr(
+        system_prompt,
+        "_ra",
+        lambda: SimpleNamespace(load_soul_md=lambda _limit: "SOUL"),
+    )
+    agent = SimpleNamespace(
+        runtime_role="interactive",
+        _progressive_disclosure=True,
+        _compiled_prompt="compiled duties",
+        _prompt_lock={"compiled_sha256": "locked"},
+        platform="telegram",
+        _memory_store=None,
+        _memory_manager=None,
+        _scenario_context="",
+        model="model-a",
+        provider="provider-a",
+    )
+    parts = system_prompt._build_fixed_profile_prompt_parts(agent, None)
+    assert parts["stable"].startswith("Capability-Prompt-Version: 2\n\n")
+    assert "compiled duties" in parts["stable"]
+    assert agent._prompt_source_manifest[0] == {
+        "kind": "capability_protocol",
+        "version": 2,
+    }
 
 
 def _worker_db(path: Path, *, claim: str = "claim", expires: float | None = None):
@@ -177,6 +320,10 @@ def test_research_leaf_spills_large_smart_search_before_first_injection():
         _budget_for_agent(failures_parent).resolve_threshold(
             "mcp__smart_search__smart_fetch"
         )
+        == 16_000
+    )
+    assert (
+        _budget_for_agent(failures_parent).resolve_threshold("session_search")
         == 16_000
     )
 
@@ -417,6 +564,36 @@ def test_tool_editor_report_only_reports_read_receipt_without_mutation():
     assert report[0]["action"] == "read_receipt"
 
 
+def test_tool_editor_bounds_unresolved_consumed_failure():
+    messages = [
+        _assistant("old"),
+        _tool("old", "upstream failed\n" + ("x" * 8_000), status="error"),
+        {"role": "assistant", "content": "I need another approach."},
+    ]
+    edited, report = edit_tool_context(messages, phase="failures")
+    assert len(edited[1]["content"]) < 700
+    assert "unresolved tool blocker" in edited[1]["content"]
+    assert "upstream failed" in edited[1]["content"]
+    assert report[0]["action"] == "blocker_receipt"
+
+
+def test_consumed_large_read_is_saved_before_receipt(tmp_path):
+    message = _tool("large", "e" * 16_001, status="success")
+    message["_tool_receipt"]["consumed_turn"] = None
+    messages = [_assistant("large"), message]
+    mark_tool_results_consumed(
+        messages,
+        consumed_turn=7,
+        artifact_dir=str(tmp_path),
+        persist_artifacts=True,
+    )
+    receipt = messages[1]["_tool_receipt"]
+    assert receipt["artifact_ref"]
+    artifact = Path(receipt["artifact_ref"])
+    assert artifact.read_text(encoding="utf-8") == "e" * 16_001
+    assert artifact.stat().st_mode & 0o777 == 0o600
+
+
 def test_tool_editor_does_not_receiptize_unconsumed_read_result():
     message = _tool("old", "not consumed")
     message["_tool_receipt"]["consumed_turn"] = None
@@ -474,7 +651,7 @@ def test_tool_editor_never_removes_assistant_reasoning_with_pair():
 
 
 def test_mark_consumed_persists_large_read_result_artifact(tmp_path):
-    content = "evidence\n" * 700
+    content = "evidence\n" * 2_000
     message = _tool("read-1", content)
     message["_tool_receipt"]["consumed_turn"] = None
     mark_tool_results_consumed(
@@ -580,6 +757,9 @@ def test_smart_search_and_context7_mcp_tools_are_explicitly_read_only():
 
 
 def test_research_leaf_prompt_has_short_dedupe_and_partial_handoff_protocol():
+    assert "运行时会自动" in RESEARCH_LEAF_PROMPT
+    assert "不要自行创建、写入或选择 evidence 文件路径" in RESEARCH_LEAF_PROMPT
+    assert "先广度覆盖任务中每个明确对象" in RESEARCH_LEAF_PROMPT
     assert "canonical 参数不得重复检索" in RESEARCH_LEAF_PROMPT
     assert "duplicate receipt" in RESEARCH_LEAF_PROMPT
     assert "预留最终 handoff" in RESEARCH_LEAF_PROMPT
@@ -672,6 +852,120 @@ def test_tool_editor_active_replaces_consumed_side_effect_with_receipt():
     )
     assert "tool action receipt" in edited[1]["content"]
     assert report[0]["action"] == "action_receipt"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "terminal",
+        "mcp__github__search_code",
+        "mcp__mixed_server__unknown_tool",
+    ],
+)
+def test_tool_editor_failures_preserves_consumed_unknown_result(tool_name):
+    body = "read result\n" + ("x" * 40_000)
+    message = _tool("old", body)
+    message["name"] = message["tool_name"] = tool_name
+    message["_tool_receipt"].update(
+        {"tool_name": tool_name, "effect": "unknown"}
+    )
+    edited, report = edit_tool_context(
+        [
+            _assistant("old", tool_name),
+            message,
+            {"role": "assistant", "content": "Evidence consumed."},
+        ],
+        phase="failures",
+    )
+    assert edited[1]["content"] == body
+    assert report == []
+
+
+def test_tool_editor_active_action_receipt_is_idempotent():
+    message = _tool("old", "created external object")
+    message["_tool_receipt"]["effect"] = "unknown"
+    first, report = edit_tool_context(
+        [
+            _assistant("old", "send_message"),
+            message,
+            {"role": "assistant", "content": "done"},
+        ],
+        phase="active",
+    )
+    first_text = first[1]["content"]
+    assert report[0]["action"] == "action_receipt"
+
+    second, second_report = edit_tool_context(first, phase="active")
+    assert second[1]["content"] == first_text
+    assert second[1]["_tool_context_form"] == "action_receipt"
+    assert second_report == []
+
+
+def test_tool_editor_retains_roster_until_create_transition():
+    roster = _tool(
+        "roster",
+        '{"profiles":[{"name":"research","description":"research"}]}',
+    )
+    roster["_tool_receipt"]["retain_until"] = "kanban_create"
+    before_create = [
+        _assistant("roster", "kanban_roster"),
+        roster,
+        {"role": "assistant", "content": "considering roster"},
+    ]
+    retained, report = edit_tool_context(before_create, phase="failures")
+    assert retained[1]["content"] == roster["content"]
+    assert report == []
+
+    after_create = [
+        *before_create,
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "create",
+                    "function": {
+                        "name": "tool_call",
+                        "arguments": json.dumps(
+                            {
+                                "name": "kanban_create",
+                                "arguments": {
+                                    "title": "research",
+                                    "assignee": "research",
+                                },
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+    ]
+    released, released_report = edit_tool_context(
+        after_create,
+        phase="failures",
+    )
+    assert "tool read result consumed" in released[1]["content"]
+    assert released_report[0]["action"] == "read_receipt"
+
+
+def test_tool_editor_bounds_unknown_effect_failure_as_blocker():
+    message = _tool(
+        "failed",
+        "remote mutation status unknown\n" + ("z" * 20_000),
+        status="error",
+    )
+    message["_tool_receipt"]["effect"] = "unknown"
+    edited, report = edit_tool_context(
+        [
+            _assistant("failed", "mcp__mixed__write"),
+            message,
+            {"role": "assistant", "content": "Need operator decision."},
+        ],
+        phase="failures",
+    )
+    assert len(edited[1]["content"]) < 900
+    assert "unresolved tool blocker" in edited[1]["content"]
+    assert "remote mutation status unknown" in edited[1]["content"]
+    assert report[0]["action"] == "blocker_receipt"
 
 
 def test_tool_editor_failures_receiptizes_success_and_drops_superseded_failure():

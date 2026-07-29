@@ -69,6 +69,118 @@ def transient_call_ids(messages: Iterable[Dict[str, Any]]) -> Set[str]:
     return ids
 
 
+def _receipt_consumed(msg: Dict[str, Any]) -> bool:
+    raw = msg.get("_tool_receipt")
+    return isinstance(raw, dict) and raw.get("consumed_turn") is not None
+
+
+def _protected_assistant_payload(msg: Dict[str, Any]) -> bool:
+    protected = (
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "thinking",
+        "anthropic_content_blocks",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "provider_data",
+        "api_content",
+    )
+    return any(msg.get(key) not in (None, "", [], {}) for key in protected)
+
+
+def edit_consumed_transients(
+    messages: Iterable[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Remove capability-disclosure payloads after one provider consumption.
+
+    Discovery calls must survive exactly long enough for the model to use their
+    result. ``mark_tool_results_consumed`` stamps the result only after the
+    provider accepted the request containing it; the next request can therefore
+    remove the pair safely. Provider-signed assistant envelopes keep a minimum
+    result placeholder instead of having their call removed underneath them.
+    """
+    source = [copy.deepcopy(msg) for msg in messages]
+    transient_ids = transient_call_ids(source)
+    consumed_ids = {
+        str(msg.get("tool_call_id") or "")
+        for msg in source
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("tool_call_id") or "") in transient_ids
+            and _receipt_consumed(msg)
+        )
+    }
+    if not consumed_ids:
+        return source, []
+
+    protected_ids: Set[str] = set()
+    for msg in source:
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if (
+            isinstance(calls, list)
+            and msg.get("role") == "assistant"
+            and _protected_assistant_payload(msg)
+        ):
+            protected_ids.update(
+                call_id
+                for call in calls
+                for call_id, _name, _arguments in [_call_parts(call)]
+                if call_id in consumed_ids
+            )
+
+    report: List[Dict[str, str]] = []
+    edited: List[Dict[str, Any]] = []
+    for msg in source:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool":
+            call_id = str(msg.get("tool_call_id") or "")
+            if call_id in consumed_ids:
+                if call_id in protected_ids:
+                    msg["content"] = (
+                        "[capability disclosure consumed; payload removed]"
+                    )
+                    report.append(
+                        {"tool_call_id": call_id, "action": "placeholder"}
+                    )
+                    edited.append(msg)
+                else:
+                    report.append(
+                        {"tool_call_id": call_id, "action": "remove_result"}
+                    )
+                continue
+
+        calls = msg.get("tool_calls")
+        if msg.get("role") == "assistant" and isinstance(calls, list):
+            kept = []
+            removed = []
+            for call in calls:
+                call_id, _name, _arguments = _call_parts(call)
+                if call_id in consumed_ids and call_id not in protected_ids:
+                    removed.append(call_id)
+                else:
+                    kept.append(call)
+            if removed:
+                if kept:
+                    msg["tool_calls"] = kept
+                elif msg.get("content") not in (None, ""):
+                    msg.pop("tool_calls", None)
+                else:
+                    report.extend(
+                        {"tool_call_id": call_id, "action": "remove_call"}
+                        for call_id in removed
+                    )
+                    continue
+                report.extend(
+                    {"tool_call_id": call_id, "action": "remove_call"}
+                    for call_id in removed
+                )
+        edited.append(msg)
+    return edited, report
+
+
 def _resolved_durable_call(call: Any) -> Any:
     """Represent a real generic ``tool_call`` as the resolved tool in history."""
     call_id, name, raw_arguments = _call_parts(call)

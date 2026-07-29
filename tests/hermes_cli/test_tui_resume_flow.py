@@ -1585,6 +1585,9 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
             captured["prompt"] = prompt
             return {"final_response": "ok", "failed": False, "partial": False}
 
+        def close(self):
+            captured["closed"] = True
+
     class FakeSessionDB:
         def __new__(cls):
             return sentinel_db
@@ -1633,6 +1636,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["closed"] is True
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

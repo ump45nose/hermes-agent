@@ -11,6 +11,8 @@ from typing import Any
 
 from agent.tool_result_classification import tool_may_have_side_effect
 
+CONSUMED_ARTIFACT_MIN_CHARS = 16_000
+
 
 @dataclass
 class ToolResultReceipt:
@@ -22,6 +24,7 @@ class ToolResultReceipt:
     steer_present: bool = False
     supersedes: str | None = None
     request_ledger: dict[str, str] | None = None
+    retain_until: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,6 +72,7 @@ def build_receipt(
     effect: str | None = None,
     artifact_ref: str | None = None,
     supersedes: str | None = None,
+    retain_until: str | None = None,
 ) -> ToolResultReceipt:
     text = _text(content)
     status = result_status
@@ -84,6 +88,7 @@ def build_receipt(
         artifact_ref=artifact_ref,
         steer_present=_has_steer(content),
         supersedes=supersedes,
+        retain_until=retain_until,
     )
 
 
@@ -161,6 +166,26 @@ def _current_unconsumed_ids(messages: list[dict[str, Any]]) -> set[str]:
     return set()
 
 
+def _retention_satisfied(
+    messages: list[dict[str, Any]],
+    *,
+    after_index: int,
+    required_tool: str | None,
+) -> bool:
+    if not required_tool:
+        return True
+    for message in messages[after_index + 1:]:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            name, arguments = _call_name_and_arguments(call)
+            if name == "tool_call":
+                name = str(arguments.get("name") or "")
+            if name == required_tool:
+                return True
+    return False
+
+
 def _safe_to_clear(
     receipt: ToolResultReceipt,
     *,
@@ -235,6 +260,71 @@ def _read_receipt_text(
             ]
         )
     return "\n".join(parts)
+
+
+def _blocker_receipt_text(
+    receipt: ToolResultReceipt,
+    *,
+    content: Any,
+) -> str:
+    text = _text(content)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "tool error",
+    )
+    if len(first_line) > 240:
+        first_line = first_line[:237] + "..."
+    return (
+        "[unresolved tool blocker after consumption; "
+        f"status={receipt.result_status}; effect={receipt.effect}; "
+        f"chars={len(text)}; sha256={digest}; "
+        f"artifact={receipt.artifact_ref or 'none'}; "
+        f"summary={first_line}]"
+    )
+
+
+def _action_receipt_text(
+    receipt: ToolResultReceipt,
+    *,
+    content: Any,
+) -> str:
+    """Bound a consumed action/unknown result without erasing retry risk."""
+    text = _text(content)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "no textual result",
+    )
+    if len(first_line) > 480:
+        first_line = first_line[:477] + "..."
+    return (
+        "[tool action receipt after consumption: "
+        f"status={receipt.result_status}; effect={receipt.effect}; "
+        f"chars={len(text)}; sha256={digest}; "
+        f"artifact={receipt.artifact_ref or 'none'}; "
+        f"summary={first_line}]"
+    )
+
+
+_PROJECTED_CONTENT_PREFIXES = {
+    "[tool read result consumed;": "read_receipt",
+    "[unresolved tool blocker after consumption;": "blocker_receipt",
+    "[tool action receipt after consumption:": "action_receipt",
+    "[tool result body removed after consumption;": "placeholder",
+}
+
+
+def _projected_content_form(message: dict[str, Any]) -> str | None:
+    """Recognize canonical and legacy projections so editing is idempotent."""
+    form = message.get("_tool_context_form")
+    if form in set(_PROJECTED_CONTENT_PREFIXES.values()):
+        return str(form)
+    text = _text(message.get("content")).lstrip()
+    for prefix, projected_form in _PROJECTED_CONTENT_PREFIXES.items():
+        if text.startswith(prefix):
+            return projected_form
+    return None
 
 
 def _embedded_json_object(text: str) -> dict[str, Any] | None:
@@ -430,6 +520,18 @@ def edit_tool_context(
             continue
         call_id = str(message.get("tool_call_id") or "")
         receipt = receipt_from_message(message)
+        projected_form = _projected_content_form(message)
+        if projected_form is not None:
+            # The canonical history may already contain a compact projection
+            # from a prior request. Never hash/summarize that projection again.
+            message["_tool_context_form"] = projected_form
+            continue
+        if not _retention_satisfied(
+            edited,
+            after_index=index,
+            required_tool=receipt.retain_until,
+        ):
+            continue
         owner = owners.get(call_id)
         if owner and owner[2] and not receipt.request_ledger:
             receipt.request_ledger = owner[2]
@@ -456,6 +558,7 @@ def edit_tool_context(
                 receipt,
                 content=message.get("content"),
             )
+            message["_tool_context_form"] = "read_receipt"
             report.append(
                 {
                     "tool_call_id": call_id,
@@ -473,16 +576,37 @@ def edit_tool_context(
             phase=phase,
         ):
             if (
+                phase in {"failures", "active"}
+                and receipt.consumed_turn is not None
+                and receipt.result_status == "error"
+                and not receipt.steer_present
+            ):
+                message["content"] = _blocker_receipt_text(
+                    receipt,
+                    content=message.get("content"),
+                )
+                message["_tool_context_form"] = "blocker_receipt"
+                report.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "action": "blocker_receipt",
+                        "status": receipt.result_status,
+                        "artifact_ref": receipt.artifact_ref,
+                    }
+                )
+                continue
+            if (
                 phase == "active"
                 and receipt.consumed_turn is not None
                 and not receipt.steer_present
                 and receipt.effect in {"landed", "unknown"}
             ):
-                message["content"] = (
-                    "[tool action receipt after consumption: "
-                    f"status={receipt.result_status}; effect={receipt.effect}; "
-                    f"artifact={receipt.artifact_ref or 'none'}]"
+                message["content"] = _action_receipt_text(
+                    receipt,
+                    content=message.get("content"),
                 )
+                message["_tool_context_form"] = "action_receipt"
                 report.append(
                     {
                         "tool_call_id": call_id,
@@ -504,6 +628,7 @@ def edit_tool_context(
                 "[tool result body removed after consumption; "
                 f"status={receipt.result_status}; effect={receipt.effect}]"
             )
+            message["_tool_context_form"] = "placeholder"
         report.append(
             {
                 "tool_call_id": call_id,
@@ -523,6 +648,46 @@ def strip_internal_tool_metadata(messages: list[dict[str, Any]]) -> None:
     for message in messages:
         message.pop("_tool_receipt", None)
         message.pop("effect_disposition", None)
+        message.pop("_tool_context_form", None)
+
+
+def project_tool_context_for_provider(
+    messages: list[dict[str, Any]],
+    *,
+    progressive_disclosure: bool,
+    editor_mode: str,
+    strip_internal: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, str]]]]:
+    """Apply the canonical pre-provider tool-history projection.
+
+    Every provider-bound path, including forced final summaries, must use this
+    entry point.  Otherwise a side path can resurrect consumed discovery
+    payloads, skip receipts, or leak Hermes-only receipt metadata onto the
+    wire.
+    """
+    projected = [copy.deepcopy(message) for message in messages]
+    capability_report: list[dict[str, str]] = []
+    tool_report: list[dict[str, str]] = []
+    if progressive_disclosure:
+        from agent.capability_history import edit_consumed_transients
+
+        projected, capability_report = edit_consumed_transients(projected)
+    if editor_mode != "off":
+        projected, tool_report = edit_tool_context(
+            projected,
+            report_only=editor_mode == "report_only",
+            phase=(
+                editor_mode
+                if editor_mode in {"readonly", "failures", "active"}
+                else "active"
+            ),
+        )
+    if strip_internal:
+        strip_internal_tool_metadata(projected)
+    return projected, {
+        "capability": capability_report,
+        "tool_context": tool_report,
+    }
 
 
 def mark_tool_results_consumed(
@@ -563,8 +728,8 @@ def mark_tool_results_consumed(
             persist_artifacts
             and not receipt.artifact_ref
             and receipt.result_status == "success"
-            and receipt.effect == "none"
             and not receipt.steer_present
+            and len(_text(message.get("content"))) > CONSUMED_ARTIFACT_MIN_CHARS
         ):
             try:
                 from tools.tool_result_storage import persist_consumed_tool_result

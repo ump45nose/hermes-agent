@@ -239,6 +239,8 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # controller dispatch stop-guard: roster selected but no create attempted
+    "_controller_dispatch_synthetic",
     "_capability_transient",
 )
 

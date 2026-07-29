@@ -1838,8 +1838,20 @@ def init_agent(
     if not isinstance(_editor_cfg, dict):
         _editor_cfg = {}
     agent._tool_context_editor_mode = str(
-        _editor_cfg.get("mode", "report_only")
+        _editor_cfg.get("mode", "failures")
     ).lower()
+    if agent._tool_context_editor_mode not in {
+        "off",
+        "report_only",
+        "readonly",
+        "failures",
+        "active",
+    }:
+        logger.warning(
+            "Unknown tool_context_editor.mode=%r; using failures",
+            agent._tool_context_editor_mode,
+        )
+        agent._tool_context_editor_mode = "failures"
     if not agent._context_files_enabled:
         agent.skip_context_files = True
         agent.load_soul_identity = True
@@ -1850,6 +1862,7 @@ def init_agent(
         from hermes_cli.prompt_compiler import (
             infer_model_family,
             load_compiled_prompt,
+            validate_runtime_prompt_protocols,
         )
 
         _compiled = load_compiled_prompt(get_hermes_home())
@@ -1867,6 +1880,21 @@ def init_agent(
                     _created_family,
                     _runtime_family,
                 )
+            _protocol_check = validate_runtime_prompt_protocols(
+                agent._prompt_lock,
+                platform=str(agent.platform or "cli"),
+                runtime_role=str(agent.runtime_role or "interactive"),
+                reachable_toolsets=agent.reachable_toolsets,
+            )
+            agent._prompt_protocol_validation = _protocol_check
+            if not _protocol_check["ok"]:
+                raise RuntimeError(
+                    "compiled prompt protocol requirements unavailable: "
+                    + ", ".join(_protocol_check["missing"])
+                    + f" (surface={_protocol_check['platform']})"
+                )
+    except RuntimeError:
+        raise
     except Exception as exc:
         _ra().logger.warning("could not load compiled profile prompt: %s", exc)
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
@@ -2677,6 +2705,11 @@ def init_agent(
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
         working_dir=os.getenv("TERMINAL_CWD") or None,
+        enabled=(
+            agent._context_files_enabled
+            and agent._coding_context
+            and not agent.skip_context_files
+        ),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

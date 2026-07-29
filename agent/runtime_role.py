@@ -29,7 +29,11 @@ KANBAN_WORKER_OVERLAY = (
 CRON_OVERLAY = "这是定时进程：只执行当前计划任务，保持幂等，并明确记录本次实际结果。"
 
 RESEARCH_LEAF_PROMPT = (
-    "你是独立研究 leaf。使用可用研究工具深入检索并保存完整 Evidence bundle。"
+    "你是独立研究 leaf。使用可用研究工具深入检索。运行时会自动把完整消息与证据"
+    "保存为 owner-only Evidence bundle；不要自行创建、写入或选择 evidence 文件路径，"
+    "也不要把缺少文件写入工具列为 blocker。"
+    "先广度覆盖任务中每个明确对象并各取至少一条一手来源，再把剩余预算用于冲突、"
+    "交叉验证和薄弱点；仍有未覆盖对象时不得反复深挖单一对象。"
     "同一 canonical 参数不得重复检索；收到 duplicate receipt 后立即改用新来源或总结。"
     "必须在预算耗尽前预留最终 handoff；max_iterations 只能标记 partial/unresolved。"
     "最终只返回一个合法 JSON 对象（不要 Markdown 围栏），字段为 claims、source_ids、"

@@ -461,33 +461,18 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
+    result: dict = {}
+    response = ""
+    try:
         result = agent.run_conversation(prompt)
-        return (result.get("final_response") or "", result)
+        # Extract both values before close(): hard teardown clears agent-owned
+        # conversation state and finalizes the SQLite session, but oneshot
+        # still needs the completed result for stdout and --usage-file.
+        response = result.get("final_response") or ""
     finally:
-        # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
-        # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
-        # close the agent explicitly because the hard-exit path skips finalizers.
-        if agent is not None:
-            try:
-                session_messages = getattr(agent, "_session_messages", None)
-                if isinstance(session_messages, list):
-                    agent.shutdown_memory_provider(session_messages)
-                else:
-                    agent.shutdown_memory_provider()
-            except Exception:
-                logging.debug("oneshot memory/context cleanup failed", exc_info=True)
-            try:
-                agent.close()
-            except Exception:
-                logging.debug("oneshot agent cleanup failed", exc_info=True)
-        # agent.close() calls session_db.end_session() but leaves the connection
-        # open; close it here to checkpoint the WAL before os._exit skips
-        # finalizers.
-        if session_db is not None:
-            try:
-                session_db.close()
-            except Exception:
-                logging.debug("oneshot session store cleanup failed", exc_info=True)
+        agent.close()
+
+    return response, result
 
 
 def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:

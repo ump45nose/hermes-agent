@@ -14286,6 +14286,7 @@ def cmd_profile(args):
         from hermes_constants import get_canonical_hermes_root, get_profile_home
         from hermes_cli.profiles import normalize_profile_name
         from hermes_cli.prompt_compiler import (
+            extra_modules_from_lock,
             load_compiled_prompt,
             render_prompt_diff,
             verify_compiled_prompt,
@@ -14314,14 +14315,22 @@ def cmd_profile(args):
                     sys.exit(2)
                 loaded = load_compiled_prompt(profile_dir)
                 old_lock = loaded[1] if loaded else {}
+                requested_modules = tuple(
+                    getattr(args, "prompt_module", None) or ()
+                )
+                selected_preset = (
+                    getattr(args, "prompt_preset", None)
+                    or old_lock.get("preset")
+                    or "default"
+                )
+                if not requested_modules:
+                    requested_modules = extra_modules_from_lock(
+                        old_lock, preset=selected_preset
+                    )
                 write_compiled_prompt(
                     profile_dir,
-                    preset=(
-                        getattr(args, "prompt_preset", None)
-                        or old_lock.get("preset")
-                        or "default"
-                    ),
-                    extra_modules=getattr(args, "prompt_module", None) or (),
+                    preset=selected_preset,
+                    extra_modules=requested_modules,
                     model_family=(
                         getattr(args, "prompt_model_family", None)
                         or (old_lock.get("model_adapter") or {}).get("family")

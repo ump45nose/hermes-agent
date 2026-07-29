@@ -950,6 +950,94 @@ class TestMaxIterationsSummaryReplay:
         assert messages[0]["content"] == "q1"
         assert messages[0]["api_content"] == "q1\n\nPLUGIN-CTX"
 
+    def test_summary_request_uses_canonical_tool_context_projection(self):
+        from run_agent import AIAgent
+        from agent.chat_completion_helpers import handle_max_iterations
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._cached_system_prompt = "SYS"
+        agent._progressive_disclosure = True
+        agent._tool_context_editor_mode = "failures"
+        captured = {}
+
+        class _Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return "RAW-RESPONSE"
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=_Completions())
+        )
+        transport = types.SimpleNamespace(
+            normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
+        )
+        calls = [
+            {
+                "id": "describe-1",
+                "type": "function",
+                "function": {
+                    "name": "tool_describe",
+                    "arguments": '{"name":"terminal"}',
+                },
+            },
+            {
+                "id": "terminal-1",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command":"pwd"}',
+                },
+            },
+        ]
+        messages = [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "", "tool_calls": calls},
+            {
+                "role": "tool",
+                "tool_call_id": "describe-1",
+                "tool_name": "tool_describe",
+                "content": "FULL SCHEMA",
+                "effect_disposition": "none",
+                "_tool_receipt": {
+                    "tool_name": "tool_describe",
+                    "result_status": "success",
+                    "effect": "none",
+                    "consumed_turn": 2,
+                },
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "terminal-1",
+                "tool_name": "terminal",
+                "content": "X" * 4_000,
+                "effect_disposition": "unknown",
+                "_tool_receipt": {
+                    "tool_name": "terminal",
+                    "result_status": "success",
+                    "effect": "unknown",
+                    "consumed_turn": 2,
+                },
+            },
+        ]
+        with patch.object(
+            agent, "_ensure_primary_openai_client", return_value=client
+        ), patch.object(agent, "_get_transport", return_value=transport):
+            assert handle_max_iterations(agent, messages, 5) == "SUMMARY"
+
+        wire = json.dumps(captured["messages"])
+        assert "FULL SCHEMA" not in wire
+        assert '"tool_describe"' not in wire
+        assert "X" * 1_000 in wire
+        assert "tool action receipt" not in wire
+        assert "_tool_receipt" not in wire
+        assert "effect_disposition" not in wire
+
 
 class TestSessionRowExistsBeforePreflightCompaction:
     """Moving the crash persist after prefetch/pre_llm_call (one write with

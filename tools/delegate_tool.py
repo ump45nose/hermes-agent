@@ -63,6 +63,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         # worker owns the handoff; children return results through delegation.
         "kanban_show",
         "kanban_list",
+        "kanban_roster",
         "kanban_complete",
         "kanban_block",
         "kanban_heartbeat",
@@ -1319,6 +1320,7 @@ def _build_child_agent(
                 "browser",
                 "context7",
                 "smart-search",
+                "github",
                 "tool_artifact",
             ]
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
@@ -1618,6 +1620,8 @@ def _build_child_agent(
             _research_root,
             getattr(parent_agent, "session_id", "session"),
         )
+        _parent_artifact_dir.mkdir(parents=True, exist_ok=True)
+        _parent_artifact_dir.chmod(0o700)
         child._research_artifact_dir = contained_session_path(
             _parent_artifact_dir,
             subagent_id,

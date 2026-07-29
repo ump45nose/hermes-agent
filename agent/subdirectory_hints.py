@@ -67,7 +67,13 @@ class SubdirectoryHintTracker:
             tool_result += hints  # append to the tool result string
     """
 
-    def __init__(self, working_dir: Optional[str] = None):
+    def __init__(
+        self,
+        working_dir: Optional[str] = None,
+        *,
+        enabled: bool = True,
+    ):
+        self.enabled = bool(enabled)
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
         self._loaded_dirs: Set[Path] = set()
         # Pre-mark the working dir as loaded (startup context handles it)
@@ -82,6 +88,12 @@ class SubdirectoryHintTracker:
 
         Returns formatted hint text to append to the tool result, or None.
         """
+        # Project context is a coding feature. A Profile that disables either
+        # context files or coding context must not regain AGENTS.md/CLAUDE.md
+        # through this post-tool-result side channel.
+        if not self.enabled:
+            return None
+
         dirs = self._extract_directories(tool_name, tool_args)
         if not dirs:
             return None

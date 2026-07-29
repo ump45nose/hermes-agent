@@ -44,6 +44,24 @@ interface ModelChoice {
   label: string;
 }
 
+interface PromptCatalog {
+  schema_version: number;
+  presets: Array<{
+    id: string;
+    modules: string[];
+    allowed_runtime_overlays: string[];
+  }>;
+  modules: Array<{
+    id: string;
+    version: number;
+    description: string;
+    protocols: string[];
+    required_capabilities: string[];
+    allowed_runtime_overlays: string[];
+  }>;
+  model_families: Array<"generic" | "openai" | "anthropic" | "google">;
+}
+
 /**
  * Dashboard-native, full-featured profile builder.
  *
@@ -68,7 +86,8 @@ export default function ProfileBuilderPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [promptPreset, setPromptPreset] = useState("default");
-  const [promptModules, setPromptModules] = useState("");
+  const [promptModules, setPromptModules] = useState<Set<string>>(new Set());
+  const [promptCatalog, setPromptCatalog] = useState<PromptCatalog | null>(null);
   const [promptModelFamily, setPromptModelFamily] = useState<
     "generic" | "openai" | "anthropic" | "google"
   >("generic");
@@ -143,6 +162,17 @@ export default function ProfileBuilderPage() {
   }, [skills]);
 
   useEffect(() => {
+    if (step === "prompt" && promptCatalog === null) {
+      api
+        .getProfilePromptCatalog()
+        .then(setPromptCatalog)
+        .catch(() => setPromptCatalog({
+          schema_version: 0,
+          presets: [],
+          modules: [],
+          model_families: ["generic", "openai", "anthropic", "google"],
+        }));
+    }
     if (step === "model") loadModels();
     if (step === "skills") loadSkills();
   }, [step, loadModels, loadSkills]);
@@ -262,10 +292,7 @@ export default function ProfileBuilderPage() {
         provider: pickedModel?.provider,
         model: pickedModel?.model,
         prompt_preset: promptPreset,
-        prompt_modules: promptModules
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
+        prompt_modules: Array.from(promptModules),
         prompt_model_family: promptModelFamily,
         mcp_servers: mcpServers.length ? mcpServers : undefined,
         keep_skills: keepAll ? undefined : Array.from(keptSkills),
@@ -367,10 +394,10 @@ export default function ProfileBuilderPage() {
                   value={promptPreset}
                   onChange={(event) => setPromptPreset(event.target.value)}
                 >
-                  {["default", "lingjun", "companion", "ops", "research", "xp"].map(
+                  {(promptCatalog?.presets ?? []).map(
                     (preset) => (
-                      <option key={preset} value={preset}>
-                        {preset}
+                      <option key={preset.id} value={preset.id}>
+                        {preset.id}
                       </option>
                     ),
                   )}
@@ -381,17 +408,49 @@ export default function ProfileBuilderPage() {
                 </p>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="pb-prompt-modules">
-                  Additional modules (comma separated)
-                </Label>
-                <Input
-                  id="pb-prompt-modules"
-                  placeholder="citation-rigor"
-                  value={promptModules}
-                  onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-                    setPromptModules(event.target.value)
-                  }
-                />
+                <Label>Additional registered modules</Label>
+                <div className="max-h-64 space-y-1 overflow-y-auto border border-border p-2">
+                  {(promptCatalog?.modules ?? [])
+                    .filter(
+                      (module) =>
+                        !(promptCatalog?.presets
+                          .find((preset) => preset.id === promptPreset)
+                          ?.modules.includes(module.id)),
+                    )
+                    .map((module) => (
+                      <label
+                        key={module.id}
+                        className="flex items-start gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
+                      >
+                        <Checkbox
+                          checked={promptModules.has(module.id)}
+                          onCheckedChange={() =>
+                            setPromptModules((current) => {
+                              const next = new Set(current);
+                              if (next.has(module.id)) next.delete(module.id);
+                              else next.add(module.id);
+                              return next;
+                            })
+                          }
+                        />
+                        <span>
+                          <span className="font-medium">
+                            {module.id} v{module.version}
+                          </span>
+                          {module.description && (
+                            <span className="block text-xs text-muted-foreground">
+                              {module.description}
+                            </span>
+                          )}
+                          {module.required_capabilities.length > 0 && (
+                            <span className="block text-xs text-muted-foreground">
+                              Requires: {module.required_capabilities.join(", ")}
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                </div>
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="pb-prompt-family">Model-family adapter</Label>
@@ -832,7 +891,9 @@ export default function ProfileBuilderPage() {
               <ReviewRow
                 label="Prompt"
                 value={`${promptPreset} · ${promptModelFamily}${
-                  promptModules.trim() ? ` · ${promptModules}` : ""
+                  promptModules.size
+                    ? ` · ${Array.from(promptModules).join(", ")}`
+                    : ""
                 }`}
               />
               <ReviewRow

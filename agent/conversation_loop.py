@@ -1585,31 +1585,63 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Clear already-consumed, provably useless tool bodies before provider
-        # adaptation. Internal receipts never leave the process.
-        _editor_mode = getattr(agent, "_tool_context_editor_mode", "report_only")
+        # Clear capability-disclosure payloads after exactly one successful
+        # provider consumption, then compact ordinary consumed tool results.
+        # Apply the same projection to the canonical live list: editing only
+        # ``api_messages`` lets a cached Gateway resurrect the raw payload on
+        # the next turn.
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
         try:
             from agent.tool_context_editor import (
-                edit_tool_context,
-                strip_internal_tool_metadata,
+                project_tool_context_for_provider,
             )
-            if _editor_mode != "off":
-                api_messages, _tool_edit_report = edit_tool_context(
+
+            _progressive = getattr(agent, "_progressive_disclosure", False)
+            api_messages, _api_projection_report = (
+                project_tool_context_for_provider(
                     api_messages,
-                    report_only=_editor_mode == "report_only",
-                    phase=(
-                        _editor_mode
-                        if _editor_mode in {"readonly", "failures", "active"}
-                        else "active"
-                    ),
+                    progressive_disclosure=_progressive,
+                    editor_mode=_editor_mode,
                 )
-                if _tool_edit_report:
-                    request_logger.info(
-                        "Tool Context Editor mode=%s actions=%s",
-                        _editor_mode,
-                        _tool_edit_report,
-                    )
-            strip_internal_tool_metadata(api_messages)
+            )
+            _canonical_messages, _canonical_projection_report = (
+                project_tool_context_for_provider(
+                    messages,
+                    progressive_disclosure=_progressive,
+                    editor_mode=_editor_mode,
+                    strip_internal=False,
+                )
+            )
+            _capability_edit_report = _api_projection_report["capability"]
+            _tool_edit_report = _api_projection_report["tool_context"]
+            if (
+                _canonical_projection_report["capability"]
+                or (
+                    _canonical_projection_report["tool_context"]
+                    and _editor_mode != "report_only"
+                )
+            ):
+                agent._tool_context_canonical_dirty = True
+            if _tool_edit_report:
+                request_logger.info(
+                    "Tool Context Editor mode=%s actions=%s",
+                    _editor_mode,
+                    _tool_edit_report,
+                )
+            if _canonical_messages is not messages and (
+                _canonical_messages != messages
+            ):
+                messages[:] = _canonical_messages
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
+                agent._session_messages = messages
+            if _capability_edit_report:
+                request_logger.info(
+                    "Capability transient editor actions=%s",
+                    _capability_edit_report,
+                )
         except Exception as exc:
             request_logger.warning("Tool Context Editor skipped: %s", exc)
 
@@ -2301,9 +2333,7 @@ def run_conversation(
                     session_id=agent.session_id or "",
                     artifact_dir=str(getattr(agent, "_tool_artifact_dir", "") or ""),
                     persist_artifacts=(
-                        getattr(agent, "runtime_role", "") == "research_leaf"
-                        and _editor_mode
-                        in {"readonly", "failures", "active"}
+                        _editor_mode in {"readonly", "failures", "active"}
                     ),
                 )
                 
@@ -6082,7 +6112,37 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                from agent.controller_protocol import (
+                    CONTROLLER_DISPATCH_ACK,
+                    controller_create_call_ids,
+                    controller_dispatch_outcome,
+                    new_controller_batch_id,
+                )
+
+                _controller_call_ids = controller_create_call_ids(
+                    agent, assistant_message
+                )
+                _controller_batch_token = None
+                if _controller_call_ids:
+                    from gateway.session_context import set_controller_batch_id
+
+                    _controller_batch_token = set_controller_batch_id(
+                        new_controller_batch_id(agent)
+                    )
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    if _controller_batch_token is not None:
+                        from gateway.session_context import (
+                            reset_controller_batch_id,
+                        )
+
+                        reset_controller_batch_id(_controller_batch_token)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -6114,6 +6174,28 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                _controller_outcome = controller_dispatch_outcome(
+                    _controller_call_ids, messages
+                )
+                if _controller_outcome.parked:
+                    # Dispatch success is a Harness state transition, not
+                    # another language-model judgment. End this user turn with
+                    # a deterministic acknowledgement; the watcher later
+                    # injects authoritative terminal receipts into this exact
+                    # canonical session.
+                    _turn_exit_reason = "controller_parked"
+                    final_response = CONTROLLER_DISPATCH_ACK
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": final_response,
+                        }
+                    )
+                    agent._controller_parked = True
+                    agent._controller_batch_id = _controller_outcome.batch_id
+                    agent._session_messages = messages
                     break
 
                 # Reset per-turn retry counters after successful tool
@@ -6720,6 +6802,54 @@ def run_conversation(
                     )
                 ):
                     messages.pop()
+
+                # A Controller chooses the dispatch branch semantically by
+                # calling kanban_roster. From that point, the Harness owns the
+                # state transition: a plain-text progress report cannot replace
+                # kanban_create -> autosubscribe -> park. This does not classify
+                # the user's query or force simple direct tasks through Kanban.
+                try:
+                    from agent.controller_protocol import (
+                        build_controller_dispatch_nudge,
+                    )
+
+                    _controller_dispatch_nudge = build_controller_dispatch_nudge(
+                        agent,
+                        messages=messages[current_turn_user_idx:],
+                        attempts=getattr(
+                            agent, "_controller_dispatch_nudges", 0
+                        ),
+                    )
+                except Exception:
+                    logger.debug(
+                        "controller dispatch stop-loop check failed",
+                        exc_info=True,
+                    )
+                    _controller_dispatch_nudge = None
+
+                if _controller_dispatch_nudge:
+                    agent._controller_dispatch_nudges = (
+                        getattr(agent, "_controller_dispatch_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "controller_dispatch_required"
+                    final_msg["_controller_dispatch_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _controller_dispatch_nudge,
+                            "_controller_dispatch_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    logger.info(
+                        "controller dispatch stop-loop nudge issued "
+                        "(attempt %d)",
+                        agent._controller_dispatch_nudges,
+                    )
+                    _pending_verification_response = final_response
+                    final_response = None
+                    continue
 
                 try:
                     from agent.verification_stop import (
