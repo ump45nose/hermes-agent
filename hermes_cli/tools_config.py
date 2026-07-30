@@ -1955,9 +1955,12 @@ def _get_platform_tool_exposure(config: dict, platform: str) -> PlatformToolExpo
     if not isinstance(raw, dict):
         disclosure = ((config.get("tools") or {}).get("disclosure") or {})
         if isinstance(disclosure, dict) and disclosure.get("mode") == "progressive":
-            if disclosure.get("schema_scope", "turn") != "turn":
+            if disclosure.get("schema_scope", "session") not in {
+                "turn",
+                "session",
+            }:
                 raise ValueError(
-                    "progressive disclosure currently requires schema_scope: turn"
+                    "tools.disclosure.schema_scope must be 'turn' or 'session'"
                 )
             # V2 separates permission from exposure and is allowlist-based.
             # An unlisted platform therefore has no reachable functional
@@ -1982,8 +1985,10 @@ def _get_platform_tool_exposure(config: dict, platform: str) -> PlatformToolExpo
             f"platform_toolsets.{platform} uses V2 structure but "
             "tools.disclosure.mode is not 'progressive'"
         )
-    if disclosure.get("schema_scope", "turn") != "turn":
-        raise ValueError("progressive disclosure currently requires schema_scope: turn")
+    if disclosure.get("schema_scope", "session") not in {"turn", "session"}:
+        raise ValueError(
+            "tools.disclosure.schema_scope must be 'turn' or 'session'"
+        )
 
     def _group(name: str) -> frozenset[str]:
         value = raw.get(name, [])

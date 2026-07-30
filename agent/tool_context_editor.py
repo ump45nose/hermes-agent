@@ -7,11 +7,53 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Collection
 
 from agent.tool_result_classification import tool_may_have_side_effect
 
 CONSUMED_ARTIFACT_MIN_CHARS = 16_000
+ANTHROPIC_DEFAULT_TRIGGER_INPUT_TOKENS = 100_000
+ANTHROPIC_DEFAULT_KEEP_TOOL_USES = 3
+ANTHROPIC_TRIGGER_REFERENCE_CONTEXT_TOKENS = 200_000
+ANTHROPIC_TRIGGER_BEFORE_COMPRESSION_RATIO = 0.75
+ANTHROPIC_CLEARED_TOOL_RESULT = (
+    "[tool result cleared by Anthropic-compatible context editing]"
+)
+
+
+def resolve_anthropic_trigger_input_tokens(
+    configured_trigger: int,
+    *,
+    context_length: int | None,
+    max_output_tokens: int = 0,
+    compression_threshold_tokens: int | None = None,
+    reference_context_tokens: int = ANTHROPIC_TRIGGER_REFERENCE_CONTEXT_TOKENS,
+    before_compression_ratio: float = ANTHROPIC_TRIGGER_BEFORE_COMPRESSION_RATIO,
+) -> int:
+    """Scale the reference trigger to the effective model input window.
+
+    The configured value is interpreted at ``reference_context_tokens``.
+    When conversation compression is enabled, the result is additionally
+    capped below its threshold so tool-result clearing gets a chance to run
+    before whole-conversation summarization.
+    """
+    configured = max(1, int(configured_trigger))
+    context = max(0, int(context_length or 0))
+    output = max(0, int(max_output_tokens or 0))
+    reference = max(1, int(reference_context_tokens or 1))
+    if context:
+        effective_input = max(1, context - output)
+        resolved = max(1, round(configured * effective_input / reference))
+    else:
+        resolved = configured
+    compression_threshold = max(0, int(compression_threshold_tokens or 0))
+    if compression_threshold:
+        ratio = min(0.95, max(0.05, float(before_compression_ratio)))
+        resolved = min(
+            resolved,
+            max(1, int(compression_threshold * ratio)),
+        )
+    return resolved
 
 
 @dataclass
@@ -24,7 +66,6 @@ class ToolResultReceipt:
     steer_present: bool = False
     supersedes: str | None = None
     request_ledger: dict[str, str] | None = None
-    retain_until: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,7 +113,6 @@ def build_receipt(
     effect: str | None = None,
     artifact_ref: str | None = None,
     supersedes: str | None = None,
-    retain_until: str | None = None,
 ) -> ToolResultReceipt:
     text = _text(content)
     status = result_status
@@ -88,7 +128,6 @@ def build_receipt(
         artifact_ref=artifact_ref,
         steer_present=_has_steer(content),
         supersedes=supersedes,
-        retain_until=retain_until,
     )
 
 
@@ -164,26 +203,6 @@ def _current_unconsumed_ids(messages: list[dict[str, Any]]) -> set[str]:
         if role == "assistant" and _text(message.get("content")).strip():
             break
     return set()
-
-
-def _retention_satisfied(
-    messages: list[dict[str, Any]],
-    *,
-    after_index: int,
-    required_tool: str | None,
-) -> bool:
-    if not required_tool:
-        return True
-    for message in messages[after_index + 1:]:
-        if message.get("role") != "assistant":
-            continue
-        for call in message.get("tool_calls") or []:
-            name, arguments = _call_name_and_arguments(call)
-            if name == "tool_call":
-                name = str(arguments.get("name") or "")
-            if name == required_tool:
-                return True
-    return False
 
 
 def _safe_to_clear(
@@ -312,6 +331,7 @@ _PROJECTED_CONTENT_PREFIXES = {
     "[unresolved tool blocker after consumption;": "blocker_receipt",
     "[tool action receipt after consumption:": "action_receipt",
     "[tool result body removed after consumption;": "placeholder",
+    ANTHROPIC_CLEARED_TOOL_RESULT: "anthropic_placeholder",
 }
 
 
@@ -483,18 +503,114 @@ def _assistant_safe_to_remove(message: dict[str, Any], *, call_count: int) -> bo
     return not any(message.get(key) not in (None, "", [], {}) for key in protected)
 
 
+def _anthropic_context_edit_triggered(
+    messages: list[dict[str, Any]],
+    *,
+    trigger_type: str,
+    trigger_value: int,
+    estimated_input_tokens: int | None,
+) -> bool:
+    """Mirror Anthropic's clear_tool_uses trigger semantics."""
+    if trigger_type == "tool_uses":
+        tool_uses = sum(1 for message in messages if message.get("role") == "tool")
+        return tool_uses > trigger_value
+    if estimated_input_tokens is None:
+        return False
+    return estimated_input_tokens > trigger_value
+
+
+def _edit_tool_context_anthropic(
+    messages: list[dict[str, Any]],
+    *,
+    report_only: bool,
+    trigger_type: str,
+    trigger_value: int,
+    keep_tool_uses: int,
+    estimated_input_tokens: int | None,
+    exclude_tools: Collection[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Provider projection equivalent to Anthropic clear_tool_uses_20250919.
+
+    The caller retains the full canonical conversation. Once the configured
+    threshold is crossed, only old tool *results* are replaced; tool call
+    inputs remain intact and the newest ``keep_tool_uses`` result pairs stay
+    available in full.
+    """
+    edited = copy.deepcopy(messages)
+    if not _anthropic_context_edit_triggered(
+        edited,
+        trigger_type=trigger_type,
+        trigger_value=trigger_value,
+        estimated_input_tokens=estimated_input_tokens,
+    ):
+        return (messages if report_only else edited), []
+
+    excluded = {str(name) for name in exclude_tools if str(name)}
+    protected_indices: set[int] = set()
+    remaining = max(0, keep_tool_uses)
+    for index in range(len(edited) - 1, -1, -1):
+        message = edited[index]
+        if message.get("role") != "tool":
+            continue
+        receipt = receipt_from_message(message)
+        if receipt.tool_name in excluded:
+            protected_indices.add(index)
+        if remaining > 0:
+            protected_indices.add(index)
+            remaining -= 1
+
+    report: list[dict[str, Any]] = []
+    for index, message in enumerate(edited):
+        if message.get("role") != "tool" or index in protected_indices:
+            continue
+        if _projected_content_form(message) is not None:
+            continue
+        receipt = receipt_from_message(message)
+        message["content"] = ANTHROPIC_CLEARED_TOOL_RESULT
+        message["_tool_context_form"] = "anthropic_placeholder"
+        report.append(
+            {
+                "tool_call_id": str(message.get("tool_call_id") or ""),
+                "tool_name": receipt.tool_name,
+                "action": "anthropic_clear_tool_result",
+                "status": receipt.result_status,
+                "projected_form": "anthropic_placeholder",
+                "artifact_ref": receipt.artifact_ref,
+            }
+        )
+    if report_only:
+        return messages, report
+    return edited, report
+
+
 def edit_tool_context(
     messages: list[dict[str, Any]],
     *,
     report_only: bool = False,
     phase: str = "active",
+    trigger_type: str = "input_tokens",
+    trigger_value: int = ANTHROPIC_DEFAULT_TRIGGER_INPUT_TOKENS,
+    keep_tool_uses: int = ANTHROPIC_DEFAULT_KEEP_TOOL_USES,
+    estimated_input_tokens: int | None = None,
+    exclude_tools: Collection[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return edited API messages and a structured audit report.
 
-    The newest tool batch is always preserved for one model consumption.
-    Older safe results are removed together with a single-call assistant pair;
-    mixed-call assistant turns keep the call and receive a minimum placeholder.
+    ``phase="anthropic"`` mirrors Anthropic's threshold-triggered tool-result
+    clearing while keeping the canonical client history unchanged. Legacy
+    phased modes retain their prior behavior for rollback compatibility.
     """
+    if phase == "anthropic":
+        return _edit_tool_context_anthropic(
+            messages,
+            report_only=report_only,
+            trigger_type=trigger_type,
+            trigger_value=max(1, int(trigger_value)),
+            keep_tool_uses=max(0, int(keep_tool_uses)),
+            estimated_input_tokens=estimated_input_tokens,
+            exclude_tools=exclude_tools,
+        )
+
     edited = copy.deepcopy(messages)
     current_ids = _current_unconsumed_ids(edited)
     seen_success_by_name: set[str] = set()
@@ -525,12 +641,6 @@ def edit_tool_context(
             # The canonical history may already contain a compact projection
             # from a prior request. Never hash/summarize that projection again.
             message["_tool_context_form"] = projected_form
-            continue
-        if not _retention_satisfied(
-            edited,
-            after_index=index,
-            required_tool=receipt.retain_until,
-        ):
             continue
         owner = owners.get(call_id)
         if owner and owner[2] and not receipt.request_ledger:
@@ -657,6 +767,12 @@ def project_tool_context_for_provider(
     progressive_disclosure: bool,
     editor_mode: str,
     strip_internal: bool = True,
+    trigger_type: str = "input_tokens",
+    trigger_value: int = ANTHROPIC_DEFAULT_TRIGGER_INPUT_TOKENS,
+    keep_tool_uses: int = ANTHROPIC_DEFAULT_KEEP_TOOL_USES,
+    estimated_input_tokens: int | None = None,
+    tool_schema_tokens: int = 0,
+    exclude_tools: Collection[str] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, str]]]]:
     """Apply the canonical pre-provider tool-history projection.
 
@@ -671,16 +787,30 @@ def project_tool_context_for_provider(
     if progressive_disclosure:
         from agent.capability_history import edit_consumed_transients
 
-        projected, capability_report = edit_consumed_transients(projected)
+        projected, capability_report = edit_consumed_transients(
+            projected,
+            keep_recent=keep_tool_uses,
+        )
+    if editor_mode == "anthropic" and estimated_input_tokens is None:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        estimated_input_tokens = (
+            estimate_messages_tokens_rough(projected) + max(0, tool_schema_tokens)
+        )
     if editor_mode != "off":
         projected, tool_report = edit_tool_context(
             projected,
             report_only=editor_mode == "report_only",
             phase=(
                 editor_mode
-                if editor_mode in {"readonly", "failures", "active"}
+                if editor_mode in {"readonly", "failures", "active", "anthropic"}
                 else "active"
             ),
+            trigger_type=trigger_type,
+            trigger_value=trigger_value,
+            keep_tool_uses=keep_tool_uses,
+            estimated_input_tokens=estimated_input_tokens,
+            exclude_tools=exclude_tools,
         )
     if strip_internal:
         strip_internal_tool_metadata(projected)

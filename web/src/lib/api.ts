@@ -657,7 +657,7 @@ export const api = {
       path: string;
       model_set?: boolean;
       mcp_written?: number;
-      skills_disabled?: number;
+      skills_enabled?: number;
       hub_installs?: Array<{ identifier: string; pid: number | null }>;
     }>("/api/profiles", {
       method: "POST",

@@ -5,6 +5,12 @@ it teaches the invariants and the reasoning behind them so a change fits the app
 even as files move. Read it with the repository `AGENTS.md` (root rules still
 apply) and [`DESIGN.md`](./DESIGN.md) for the visual and interaction contract.
 
+The repository's highest-priority local validation policy also applies here:
+do not add, restore, or run Vitest, Playwright, snapshot, unit, integration, or
+E2E suites by default. Use only the smallest relevant typecheck, build check, or
+single-path business smoke probe unless the user explicitly requests broader
+testing.
+
 When a rule here and the code disagree, trust the code and fix whichever is
 wrong — but never break an invariant to make a change easier.
 
@@ -138,9 +144,10 @@ Two auth-flavored corollaries worth naming because they are easy to get wrong:
 
 Desktop and its runtime update on separate clocks, so a change can meet an older
 backend. Keep those users working: preserve the current feature, keep the
-fallback narrow and tied to an identified older runtime, and cover it with a
-test. A fallback that quietly degrades the feature it's meant to protect is worse
-than the crash it replaced.
+fallback narrow and tied to an identified older runtime, and verify it with the
+smallest direct smoke probe that exercises the compatibility path. A fallback
+that quietly degrades the feature it's meant to protect is worse than the crash
+it replaced.
 
 ## Keep the waist narrow, grow at the edges
 
@@ -178,14 +185,12 @@ after writing style; and don't mount expensive content mid-gesture. Prove speed
 against realistic content — a fast empty demo proves nothing about a long
 transcript. If motion is masking latency, remove the motion, don't tune it.
 
-## Testing as a habit of proof
+## Minimal validation
 
-Test the behavior that would actually break a user, not a snapshot of today's
-data. Favor invariants over frozen values. Exercise the real path for anything
-at a seam — resolver precedence and its failure rungs, identity and scope
-boundaries, optimistic rollback and stale-response ordering, and both sides of a
-local/remote adapter with its profile routing intact. Match how the suite is
-actually run rather than inventing a command; when in doubt, read the scripts.
+Validate only the behavior directly changed. Prefer a narrow typecheck, build
+check, or one real-path smoke probe over committed test code or a suite run.
+Stop after that evidence passes and report what was checked; broader validation
+requires an explicit user request.
 
 ## The taste test before you hand off
 

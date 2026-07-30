@@ -79,7 +79,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
@@ -95,18 +94,18 @@ logger = logging.getLogger(__name__)
 # Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
 #   - signature = per-dir max mtime of the dir AND its immediate children
 #     (one scandir per dir; catches skill add/remove inside categories,
-#     which does NOT bump the root dir's mtime), plus the disabled-set
+#     which does NOT bump the root dir's mtime), plus the enabled-set
 #     (config-driven — changes with no filesystem mtime bump at all)
 #   - a short TTL bounds staleness from in-place SKILL.md edits, which
 #     bump only the file's mtime, invisible to any directory signature.
-# skip_disabled True/False are cached separately.
+# include_inactive True/False are cached separately.
 _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
-_SKILLS_CACHE_KEY_DISABLED = "with_disabled"
+_SKILLS_CACHE_KEY_ALL = "all"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, enabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -136,7 +135,7 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (tuple(sig), frozenset(enabled), platform)
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -619,32 +618,14 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 
-def _get_disabled_skill_names(platform: str = None) -> Set[str]:
-    """Load disabled skill names from config.
-
-    Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
-    as a public re-export so existing callers don't need updating.
-    """
-    from agent.skill_utils import get_disabled_skill_names
-    return get_disabled_skill_names(platform=platform)
+def _get_enabled_skill_names(platform: str = None) -> Set[str]:
+    """Load the strict skill allowlist from config."""
+    from agent.skill_utils import get_enabled_skill_names
+    return get_enabled_skill_names(platform=platform)
 
 
-def _get_session_platform() -> str:
-    """Resolve the current platform from gateway session context.
-
-    Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
-    ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
-    """
-    try:
-        from gateway.session_context import get_session_env
-        return get_session_env("HERMES_SESSION_PLATFORM") or ""
-    except Exception:
-        return ""
-
-
-def _is_skill_disabled(name: str, platform: str = None) -> bool:
-    """Check if a skill is disabled in config.
+def _is_skill_enabled(name: str, platform: str = None) -> bool:
+    """Check if a skill is explicitly allowed in config.
 
     Resolves the active platform from (in order of precedence):
     1. Explicit ``platform`` argument
@@ -652,59 +633,40 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        skills_cfg = config.get("skills", {})
-        resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
-        global_disabled = skills_cfg.get("disabled", [])
-        cron_only = skills_cfg.get("cron_only", [])
-        if isinstance(cron_only, str):
-            cron_only = [cron_only]
-        if resolved_platform != "cron" and name in cron_only:
-            return True
-        if resolved_platform:
-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
-            if platform_disabled is not None:
-                # A globally-disabled skill stays disabled on every platform;
-                # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
-                return name in platform_disabled or name in global_disabled
-        return name in global_disabled
+        return name in _get_enabled_skill_names(platform=platform)
     except Exception:
         return False
 
 
 def _find_all_skills(
-    *, skip_disabled: bool = False, platform: str = None
+    *, include_inactive: bool = False, platform: str = None
 ) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
-        skip_disabled: If True, return ALL skills regardless of disabled
-            state (used by ``hermes skills`` config UI). Default False
-            filters out disabled skills.
+        include_inactive: If True, return all installed skills regardless of
+            allowlist state (used by ``hermes skills`` config UI). Default
+            False returns only explicitly enabled skills.
 
     Returns:
         List of skill metadata dicts (name, description, category).
 
     Results are cached per-session; the cache is invalidated when the scan
-    signature changes (dir/category mtimes or the disabled-set) and expires
+    signature changes (dir/category mtimes or the enabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    cache_key = _SKILLS_CACHE_KEY_ALL if include_inactive else _SKILLS_CACHE_KEY_FILTERED
 
-    # Load disabled set once (not per-skill). Part of the cache signature:
-    # disabling a skill is a config change with no filesystem mtime bump.
-    if skip_disabled:
-        disabled = set()
+    # Load the allowlist once (not per-skill). It is part of the cache
+    # signature because config changes do not alter skill directory mtimes.
+    if include_inactive:
+        enabled = set()
     elif platform is None:
-        # Keep the no-override call shape stable for plugins/tests that
-        # monkeypatch this compatibility helper.
-        disabled = _get_disabled_skill_names()
+        enabled = _get_enabled_skill_names()
     else:
-        disabled = _get_disabled_skill_names(platform=platform)
+        enabled = _get_enabled_skill_names(platform=platform)
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -715,7 +677,7 @@ def _find_all_skills(
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, enabled)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -754,7 +716,7 @@ def _find_all_skills(
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
-                if name in disabled:
+                if not include_inactive and name not in enabled:
                     continue
 
                 description = frontmatter.get("description", "")
@@ -1411,7 +1373,7 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Check if the skill is disabled by the user
+        # Strict allowlist gate.
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
         if (
             _is_model_invocation_disabled(parsed_frontmatter)
@@ -1427,12 +1389,12 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
-        if _is_skill_disabled(resolved_name, platform=platform):
+        if not _is_skill_enabled(resolved_name, platform=platform):
             return json.dumps(
                 {
                     "success": False,
                     "error": (
-                        f"Skill '{resolved_name}' is disabled. "
+                        f"Skill '{resolved_name}' is not enabled. "
                         "Enable it with `hermes skills` or inspect the files directly on disk."
                     ),
                 },

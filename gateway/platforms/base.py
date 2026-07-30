@@ -3323,10 +3323,11 @@ class BasePlatformAdapter(ABC):
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
 
-        Loads the persisted transcript, drops the most recent assistant entry
-        (which belongs to the current response), and scans the remaining history
-        for MEDIA: tags and image_generate JSON payloads.  Used to prevent the
-        model from re-delivering the same file when it echoes an old MEDIA tag.
+        Loads the persisted transcript, removes the entire current turn, and
+        scans only prior turns for MEDIA tags and image-generation payloads.
+        Tool results are persisted before final delivery, so dropping only the
+        latest assistant row incorrectly classifies a just-created image as
+        already delivered and filters it out of the current response.
         """
         store = getattr(self, "_session_store", None)
         if not store:
@@ -3344,14 +3345,50 @@ class BasePlatformAdapter(ABC):
             return None
         if not transcript:
             return None
-        # Exclude the current turn's assistant message, which has already been
-        # persisted by the time we reach delivery but must not be treated as
-        # "history" for dedup purposes.
+        # Exclude the entire current turn. Walk back across synthetic/recovery
+        # user rows until the preceding user-to-user segment contains a
+        # completed assistant response; the first row after that response is
+        # the real current-turn boundary.
         history = list(transcript)
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                history.remove(msg)
+        current_user_index = next(
+            (
+                index
+                for index in range(len(history) - 1, -1, -1)
+                if history[index].get("role") == "user"
+            ),
+            None,
+        )
+        while current_user_index is not None:
+            previous_user_index = next(
+                (
+                    index
+                    for index in range(current_user_index - 1, -1, -1)
+                    if history[index].get("role") == "user"
+                ),
+                None,
+            )
+            if previous_user_index is None:
                 break
+            between = history[previous_user_index + 1:current_user_index]
+            prior_turn_completed = any(
+                msg.get("role") == "assistant"
+                and bool(str(msg.get("content") or "").strip())
+                and not msg.get("tool_calls")
+                and msg.get("finish_reason") in (None, "stop", "length")
+                for msg in between
+            )
+            if prior_turn_completed:
+                break
+            current_user_index = previous_user_index
+        if current_user_index is not None:
+            history = history[:current_user_index]
+        else:
+            # Legacy transcripts may contain no user row. Preserve the previous
+            # fallback while still excluding the current final assistant.
+            for index in range(len(history) - 1, -1, -1):
+                if history[index].get("role") == "assistant":
+                    history = history[:index]
+                    break
         if not history:
             return None
         # Avoid circular import: gateway.run already imports this module.

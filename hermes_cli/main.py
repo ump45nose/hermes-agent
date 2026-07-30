@@ -14290,7 +14290,7 @@ def cmd_profile(args):
             load_compiled_prompt,
             render_prompt_diff,
             verify_compiled_prompt,
-            write_compiled_prompt,
+            write_stable_prompt,
         )
 
         name = normalize_profile_name(args.profile_name)
@@ -14327,7 +14327,7 @@ def cmd_profile(args):
                     requested_modules = extra_modules_from_lock(
                         old_lock, preset=selected_preset
                     )
-                write_compiled_prompt(
+                write_stable_prompt(
                     profile_dir,
                     preset=selected_preset,
                     extra_modules=requested_modules,
@@ -14338,7 +14338,10 @@ def cmd_profile(args):
                     ),
                     backup=True,
                 )
-                print("Prompt upgraded; previous files were backed up.")
+                print(
+                    "Stable prompt upgraded; system.md was preserved; "
+                    "previous prompt artifacts were backed up."
+                )
 
     elif action == "request-snapshot":
         from hermes_constants import get_canonical_hermes_root, get_profile_home

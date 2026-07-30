@@ -15019,10 +15019,7 @@ class ProfileCreate(BaseModel):
     # create (the user can fix it from the relevant dashboard page afterward).
     # MCP servers to write into the new profile's config.yaml.
     mcp_servers: List["MCPServerCreate"] = []
-    # Built-in / optional skills to KEEP active. When this list is non-empty,
-    # the builder uses "replace" semantics: the bundle is seeded, then every
-    # seeded skill NOT in this list is added to the profile's disabled list.
-    # Empty list = leave the seeded bundle untouched (legacy behaviour).
+    # Exact skill allowlist for the new profile. Empty means no skills.
     keep_skills: List[str] = []
     # Skills-hub identifiers to install into the new profile. Installed async
     # via a subprocess scoped to the profile (`hermes -p <name> skills install`)
@@ -15222,40 +15219,19 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
     return written
 
 
-def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
-    """Disable every installed skill in ``profile_dir`` not in ``keep``.
-
-    Profiles manage skill activation via a *disabled* list — all installed
-    skills are active by default and users opt out. The builder's skill step
-    uses "replace" semantics: the user picks exactly which seeded built-in /
-    optional skills stay active, and everything else gets added to the disabled
-    list. (Hub skills are installed separately via subprocess and are active on
-    install.) Scoped to the profile via the HERMES_HOME override. Returns the
-    number of skills newly disabled.
-    """
+def _set_skill_allowlist(profile_dir: Path, keep: List[str]) -> int:
+    """Replace ``profile_dir``'s strict skill allowlist with ``keep``."""
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+    from hermes_cli.skills_config import save_enabled_skills
 
     keep_set = {s.strip() for s in keep if s and s.strip()}
-    disabled_count = 0
     token = set_hermes_home_override(str(profile_dir))
     try:
-        installed: List[str] = []
-        skills_root = profile_dir / "skills"
-        if skills_root.is_dir():
-            for md in skills_root.rglob("SKILL.md"):
-                installed.append(md.parent.name)
         cfg = load_config()
-        disabled = get_disabled_skills(cfg)
-        for name in installed:
-            if name not in keep_set and name not in disabled:
-                disabled.add(name)
-                disabled_count += 1
-        if disabled_count:
-            save_disabled_skills(cfg, disabled)
+        save_enabled_skills(cfg, keep_set)
     finally:
         reset_hermes_home_override(token)
-    return disabled_count
+    return len(keep_set)
 
 
 @app.get("/api/profiles")
@@ -15351,15 +15327,12 @@ async def create_profile_endpoint(body: ProfileCreate):
         except Exception:
             _log.exception("Writing MCP servers for new profile %s failed", body.name)
 
-    # Optional "keep" skill selection — replace semantics. When the builder
-    # sends an explicit keep list, disable every seeded skill not in it.
-    # Best-effort. Skipped when keep_skills is empty (legacy: keep the bundle).
-    skills_disabled = 0
-    if body.keep_skills:
-        try:
-            skills_disabled = _disable_unselected_skills(path, body.keep_skills)
-        except Exception:
-            _log.exception("Applying skill selection for new profile %s failed", body.name)
+    # Exact allowlist replacement. Empty is intentionally fail-closed.
+    skills_enabled = 0
+    try:
+        skills_enabled = _set_skill_allowlist(path, body.keep_skills)
+    except Exception:
+        _log.exception("Applying skill allowlist for new profile %s failed", body.name)
 
     # Optional skills-hub installs. Spawned async, scoped to the new profile
     # via `-p <name>` (a fresh subprocess re-binds skills_hub.SKILLS_DIR to the
@@ -15389,7 +15362,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         "path": str(path),
         "model_set": model_set,
         "mcp_written": mcp_written,
-        "skills_disabled": skills_disabled,
+        "skills_enabled": skills_enabled,
         "hub_installs": hub_installs,
     }
 
@@ -15738,7 +15711,7 @@ class SkillToggle(BaseModel):
 @app.get("/api/skills")
 async def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
-    from hermes_cli.skills_config import get_cron_only_skills, get_disabled_skills
+    from hermes_cli.skills_config import get_cron_only_skills, get_enabled_skills
     from tools.skill_usage import (
         _read_bundled_manifest_names,
         _read_hub_installed_names,
@@ -15747,9 +15720,9 @@ async def get_skills(profile: Optional[str] = None):
     )
     with _profile_scope(profile):
         config = load_config()
-        disabled = get_disabled_skills(config)
+        enabled = get_enabled_skills(config)
         cron_only = get_cron_only_skills(config)
-        skills = _find_all_skills(skip_disabled=True)
+        skills = _find_all_skills(include_inactive=True)
         usage = load_usage()
         # Set-based provenance (same classification as skill_usage.provenance,
         # without a per-skill manifest read): hub > bundled > agent, where
@@ -15759,7 +15732,7 @@ async def get_skills(profile: Optional[str] = None):
         hub_names = _read_hub_installed_names()
     for s in skills:
         s["cron_only"] = s["name"] in cron_only
-        s["enabled"] = s["name"] not in disabled and not s["cron_only"]
+        s["enabled"] = s["name"] in enabled and not s["cron_only"]
         s["usage"] = activity_count(usage.get(s["name"], {}))
         s["provenance"] = (
             "hub" if s["name"] in hub_names
@@ -15771,15 +15744,15 @@ async def get_skills(profile: Optional[str] = None):
 
 @app.put("/api/skills/toggle")
 async def toggle_skill(body: SkillToggle, profile: Optional[str] = None):
-    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+    from hermes_cli.skills_config import get_enabled_skills, save_enabled_skills
     with _profile_scope(body.profile or profile):
         config = load_config()
-        disabled = get_disabled_skills(config)
+        enabled = get_enabled_skills(config)
         if body.enabled:
-            disabled.discard(body.name)
+            enabled.add(body.name)
         else:
-            disabled.add(body.name)
-        save_disabled_skills(config, disabled)
+            enabled.discard(body.name)
+        save_enabled_skills(config, enabled)
     return {"ok": True, "name": body.name, "enabled": body.enabled}
 
 

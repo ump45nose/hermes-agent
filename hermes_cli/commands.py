@@ -803,11 +803,10 @@ def _collect_gateway_skill_entries(
       2. Built-in skill commands (fill remaining slots, alphabetical)
 
     Only skills are trimmed when the cap is reached.
-    Hub-installed skills are excluded.  Per-platform disabled skills are
-    excluded.
+    Hub-installed skills and skills outside the strict allowlist are excluded.
 
     Args:
-        platform: Platform identifier for per-platform skill filtering
+        platform: Platform identifier for cron-only skill filtering
             (``"telegram"``, ``"discord"``, etc.).
         max_slots: Maximum number of entries to return (remaining slots after
             built-in/core commands).
@@ -849,10 +848,10 @@ def _collect_gateway_skill_entries(
         all_entries.append((n, d, ""))
 
     # --- Tier 2: Built-in skill commands (trimmed at cap) -----------------
-    _platform_disabled: set[str] = set()
+    _enabled_skills: set[str] = set()
     try:
-        from agent.skill_utils import get_disabled_skill_names
-        _platform_disabled = get_disabled_skill_names(platform=platform)
+        from agent.skill_utils import get_enabled_skill_names
+        _enabled_skills = get_enabled_skill_names(platform=platform)
     except Exception:
         pass
 
@@ -884,7 +883,7 @@ def _collect_gateway_skill_entries(
             if skill_path.startswith(_hub_dir):
                 continue
             skill_name = info.get("name", "")
-            if skill_name in _platform_disabled:
+            if skill_name not in _enabled_skills:
                 continue
             raw_name = cmd_key.lstrip("/")
             name = sanitize_name(raw_name) if sanitize_name else raw_name
@@ -924,8 +923,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
 
     Skills are the only tier that gets trimmed when the cap is hit.
     User-installed hub skills are excluded — accessible via /skills.
-    Skills disabled for the ``"telegram"`` platform (via ``hermes skills
-    config``) are excluded from the menu entirely.
+    Skills outside the strict allowlist are excluded from the menu entirely.
 
     Returns:
         (menu_commands, hidden_count) where hidden_count is the number of
@@ -956,7 +954,7 @@ def discord_skill_commands(
     """Return skill entries for Discord slash command registration.
 
     Same priority and filtering logic as :func:`telegram_menu_commands`
-    (plugins > skills, hub excluded, per-platform disabled excluded), but
+    (plugins > skills, hub excluded, non-allowlisted skills excluded), but
     adapted for Discord's constraints:
 
     - Hyphens are allowed in names (no ``-`` → ``_`` sanitization)
@@ -997,8 +995,8 @@ def discord_skill_commands_by_category(
     the agent's ``/skill-name`` dispatch but silently absent from Discord's
     ``/skill`` autocomplete.
 
-    Filtering mirrors :func:`discord_skill_commands`: hub skills excluded,
-    per-platform disabled excluded, names clamped to 32 chars, descriptions
+    Filtering mirrors :func:`discord_skill_commands`: hub skills and
+    non-allowlisted skills excluded, names clamped to 32 chars, descriptions
     clamped to 100 chars.
 
     The legacy 25-group × 25-subcommand caps (from the old nested
@@ -1020,10 +1018,10 @@ def discord_skill_commands_by_category(
     """
     from pathlib import Path as _P
 
-    _platform_disabled: set[str] = set()
+    _enabled_skills: set[str] = set()
     try:
-        from agent.skill_utils import get_disabled_skill_names
-        _platform_disabled = get_disabled_skill_names(platform="discord")
+        from agent.skill_utils import get_enabled_skill_names
+        _enabled_skills = get_enabled_skill_names(platform="discord")
     except Exception:
         pass
 
@@ -1083,7 +1081,7 @@ def discord_skill_commands_by_category(
                 continue
 
             skill_name = info.get("name", "")
-            if skill_name in _platform_disabled:
+            if skill_name not in _enabled_skills:
                 continue
 
             raw_name = cmd_key.lstrip("/")

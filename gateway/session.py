@@ -3215,6 +3215,25 @@ class SessionStore:
             logger.debug("Could not load messages from DB: %s", e)
             return []
 
+    def load_model_context(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load the persisted live-model projection of a transcript.
+
+        Canonical transcript readers deliberately keep using
+        :meth:`load_transcript`; only a new agent turn should hydrate model
+        context sidecars for tool results already cleared by context editing.
+        """
+        if not self._db:
+            return []
+        try:
+            return self._db.get_messages_as_conversation(
+                session_id,
+                repair_alternation=True,
+                model_context=True,
+            )
+        except Exception as e:
+            logger.debug("Could not load model context from DB: %s", e)
+            return []
+
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.
 

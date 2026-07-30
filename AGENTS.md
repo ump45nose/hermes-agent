@@ -4,6 +4,18 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Local Validation Policy (Highest Priority)
+
+This checkout intentionally does not maintain committed automated test suites
+or test-runner scripts. Do not add, restore, or run unit, integration, E2E,
+snapshot, pytest, Vitest, or Playwright suites by default.
+
+Validation must stay proportional and minimal: use only the narrowest static
+check, compile/import check, or single-path business smoke probe needed for the
+current change. Do not make "add tests" a default implementation step. Broader
+testing requires an explicit user request. This local policy overrides every
+older testing recommendation elsewhere in this inherited upstream guide.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
@@ -217,9 +229,8 @@ the competing PRs into plugins against that interface.
 source .venv/bin/activate   # or: source venv/bin/activate
 ```
 
-`scripts/run_tests.sh` probes `.venv` first, then `venv`, then
-`$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
-main checkout).
+Use the checkout's existing `.venv` or `venv` only when a minimal import,
+compile, or business smoke probe needs the project environment.
 
 ## Project Structure
 
@@ -473,7 +484,6 @@ npm run build     # full build (hermes-ink + tsc)
 npm run typecheck # typecheck only (tsc --noEmit)
 npm run lint      # eslint
 npm run fmt       # prettier
-npm test          # vitest
 ```
 
 ### TUI in the Dashboard (`hermes dashboard` → `/chat`)
@@ -502,7 +512,7 @@ A **separate** chat surface from both the classic CLI and the dashboard's embedd
   - `isDesktopSlashExtensionCommand(name)` — true when the command is NOT a known Hermes built-in (i.e. a skill or user quick command). Both suggestion and catalog-filter paths allow extensions through so skill commands surface in the palette. (Added when fixing "skill commands missing from the desktop slash palette" — the curated allow-list was silently dropping every skill/quick command from completions even though they executed fine when typed.)
 - **Dispatch** lives in `app/session/hooks/use-prompt-actions/slash.ts` (`runSlash`): built-ins that the desktop owns (`/skin`, `/help`, `/new`, …) are handled locally or via `commands.catalog`; everything else goes to `slash.exec`, falling back to `command.dispatch` (which the gateway resolves into skill / alias / exec directives). A skill command resolves to `{type: "skill", message}` and is submitted as a normal prompt.
 
-**Rule:** the desktop slash palette's curation is about hiding noise (terminal-only / messaging-only built-ins), NOT about hiding user-activated extensions. Skill commands and `quick_commands` are extensions the backend surfaces — they belong in completions. If you tighten `desktop-slash-commands.ts`, keep `isDesktopSlashExtensionCommand` flowing into both the suggestion and catalog-filter paths. Tests: from `apps/desktop`, run `npx vitest run src/lib/desktop-slash-commands.test.ts` (workspace dependencies are installed at the repo root).
+**Rule:** the desktop slash palette's curation is about hiding noise (terminal-only / messaging-only built-ins), NOT about hiding user-activated extensions. Skill commands and `quick_commands` are extensions the backend surfaces — they belong in completions. If you tighten `desktop-slash-commands.ts`, keep `isDesktopSlashExtensionCommand` flowing into both the suggestion and catalog-filter paths.
 
 ---
 
@@ -945,9 +955,9 @@ violate them.
    helper script. Reference it from SKILL.md by path relative to the
    skill directory.
 
-7. **Tests live at `tests/skills/test_<skill>_skill.py`** and use only
-   stdlib + pytest + `unittest.mock`. No live network calls. Run via
-   `scripts/run_tests.sh tests/skills/test_<skill>_skill.py -q`.
+7. **Do not add committed test suites by default.** Validate a skill with the
+   smallest relevant metadata or single-path smoke probe; broader automated
+   coverage requires an explicit user request.
 
 8. **`.env.example` additions are isolated to a clearly delimited
    block.** Don't touch the surrounding file — contributor-supplied
@@ -1279,7 +1289,11 @@ def profile_env(tmp_path, monkeypatch):
 
 ---
 
-## Testing
+## Legacy Testing Guidance (Inactive)
+
+The remainder of this section is inherited upstream guidance retained only as
+historical context. It is inactive in this checkout and must not be followed;
+the highest-priority local validation policy above governs all work.
 
 ### Python
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces

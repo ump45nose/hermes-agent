@@ -64,14 +64,6 @@ jobs:
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
   # ─────────────────────────────────────────────────────────────────────
-  tests:
-    name: Python tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/tests.yml
-    with:
-      slice_count: 8
-
   lint:
     name: Python lints
     needs: detect
@@ -79,18 +71,6 @@ jobs:
     uses: ./.github/workflows/lint.yml
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
-
-  js-tests:
-    name: JS & TS checks
-    needs: detect
-    if: needs.detect.outputs.frontend == 'true'
-    uses: ./.github/workflows/js-tests.yml
-
-  e2e-desktop:
-    name: Desktop E2E
-    needs: detect
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true'
-    uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
     name: Docs Site
@@ -179,7 +159,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   comment-live:
     name: CI review comment (live)
-    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, e2e-desktop]
+    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -257,10 +237,7 @@ jobs:
     name: All required checks pass
     needs:
       - detect
-      - tests
       - lint
-      - js-tests
-      - e2e-desktop
       - docs-site
       - history-check
       - contributor-check

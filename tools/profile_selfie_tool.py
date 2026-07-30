@@ -19,12 +19,11 @@ _IDENTITY_HINTS = ("selfie", "mirror", "portrait", "face")
 PROFILE_SELFIE_SCHEMA = {
     "name": "profile_selfie",
     "description": (
-        "Generate and prepare delivery of an identity-consistent image of the "
-        "active profile in one call. Use whenever the user asks to see the "
-        "profile, including their selfie, appearance, outfit, pose, face, or "
-        "body. Do not wait for a second request and do not call image_generate "
-        "separately. On success, copy the returned `delivery` value verbatim "
-        "into the response so the image is sent."
+        "为当前 Profile 一次生成并准备交付身份一致的照片。用户要求看当前 "
+        "Profile 时使用，包括自拍、长相、穿搭、姿势、脸、身体、全身、腿、脚，"
+        "或要求“发你的照片”。不要等待用户再次催促，也不要另行调用 "
+        "image_generate。成功后必须把返回的 `delivery` 值原样复制进回复，"
+        "确保图片真正发送。"
     ),
     "parameters": {
         "type": "object",
@@ -32,8 +31,7 @@ PROFILE_SELFIE_SCHEMA = {
             "request": {
                 "type": "string",
                 "description": (
-                    "The requested view or scene, preserving useful wording "
-                    "and context from the user's message."
+                    "用户要求的画面或场景；保留原消息中有用的措辞和上下文。"
                 ),
             },
             "aspect_ratio": {
@@ -41,7 +39,7 @@ PROFILE_SELFIE_SCHEMA = {
                 "enum": ["portrait", "square", "landscape"],
                 "default": "portrait",
                 "description": (
-                    "Use portrait unless the requested composition needs otherwise."
+                    "默认使用竖图；只有用户要求的构图确有需要时才改用其他比例。"
                 ),
             },
         },

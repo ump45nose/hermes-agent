@@ -1405,6 +1405,10 @@ def init_agent(
     agent._progressive_disclosure = False
     agent.direct_toolsets = frozenset()
     agent.deferred_toolsets = frozenset()
+    agent.direct_tools = []
+    agent.deferred_tools = []
+    agent._hydrated_tool_names = []
+    agent.always_loaded_tool_names = frozenset()
     try:
         from hermes_cli.config import load_config as _load_config
         from hermes_cli.tools_config import _get_platform_tool_exposure
@@ -1417,6 +1421,24 @@ def init_agent(
         )
         if _exposure.progressive:
             agent._progressive_disclosure = True
+            _disclosure_cfg = (
+                (_progressive_cfg.get("tools") or {}).get("disclosure") or {}
+            )
+            _always_loaded = (
+                _disclosure_cfg.get("always_loaded", [])
+                if isinstance(_disclosure_cfg, dict)
+                else []
+            )
+            if not isinstance(_always_loaded, list) or any(
+                not isinstance(name, str) or not name.strip()
+                for name in _always_loaded
+            ):
+                raise ValueError(
+                    "tools.disclosure.always_loaded must be a list of tool names"
+                )
+            agent.always_loaded_tool_names = frozenset(
+                name.strip() for name in _always_loaded
+            )
             _platform_map = _progressive_cfg.get("platform_toolsets") or {}
             _explicit_child_ceiling = (
                 _platform_key == "subagent"
@@ -1461,24 +1483,70 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.reachable_tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=True,
-        skip_tool_search_assembly=True,
-        progressive_disclosure=agent._progressive_disclosure,
-    )
+    if agent._progressive_disclosure:
+        from tools.tool_search import BRIDGE_TOOL_NAMES, assemble_progressive_exposure
+
+        _direct_defs = _ra().get_tool_definitions(
+            enabled_toolsets=sorted(agent.direct_toolsets),
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        _deferred_defs = _ra().get_tool_definitions(
+            enabled_toolsets=sorted(agent.deferred_toolsets),
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        if agent.always_loaded_tool_names:
+            _promoted_defs = [
+                tool_def
+                for tool_def in _deferred_defs
+                if (tool_def.get("function") or {}).get("name")
+                in agent.always_loaded_tool_names
+            ]
+            _promoted_names = {
+                (tool_def.get("function") or {}).get("name")
+                for tool_def in _promoted_defs
+            }
+            _direct_defs = [*_direct_defs, *_promoted_defs]
+            _deferred_defs = [
+                tool_def
+                for tool_def in _deferred_defs
+                if (tool_def.get("function") or {}).get("name")
+                not in _promoted_names
+            ]
+        (
+            agent.tools,
+            agent.reachable_tools,
+            agent.deferred_tools,
+        ) = assemble_progressive_exposure(_direct_defs, _deferred_defs)
+        _direct_names = {
+            (tool.get("function") or {}).get("name")
+            for tool in agent.tools
+            if (tool.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+        }
+        agent.direct_tools = [
+            tool
+            for tool in agent.reachable_tools
+            if (tool.get("function") or {}).get("name") in _direct_names
+        ]
+    else:
+        agent.reachable_tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     agent.reachable_tool_names = {
         tool["function"]["name"] for tool in agent.reachable_tools
     }
     agent.reachable_toolsets = frozenset(enabled_toolsets or [])
-
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-        progressive_disclosure=agent._progressive_disclosure,
-    )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1839,7 +1907,7 @@ def init_agent(
     if not isinstance(_editor_cfg, dict):
         _editor_cfg = {}
     agent._tool_context_editor_mode = str(
-        _editor_cfg.get("mode", "failures")
+        _editor_cfg.get("mode", "anthropic")
     ).lower()
     if agent._tool_context_editor_mode not in {
         "off",
@@ -1847,28 +1915,117 @@ def init_agent(
         "readonly",
         "failures",
         "active",
+        "anthropic",
     }:
         logger.warning(
-            "Unknown tool_context_editor.mode=%r; using failures",
+            "Unknown tool_context_editor.mode=%r; using anthropic",
             agent._tool_context_editor_mode,
         )
-        agent._tool_context_editor_mode = "failures"
+        agent._tool_context_editor_mode = "anthropic"
+
+    _editor_trigger = _editor_cfg.get("trigger") or {}
+    if not isinstance(_editor_trigger, dict):
+        _editor_trigger = {}
+    agent._tool_context_editor_trigger_type = str(
+        _editor_trigger.get("type") or "input_tokens"
+    ).lower()
+    if agent._tool_context_editor_trigger_type not in {
+        "input_tokens",
+        "tool_uses",
+    }:
+        logger.warning(
+            "Unknown tool_context_editor.trigger.type=%r; using input_tokens",
+            agent._tool_context_editor_trigger_type,
+        )
+        agent._tool_context_editor_trigger_type = "input_tokens"
+    try:
+        agent._tool_context_editor_trigger_value = max(
+            1,
+            int(_editor_trigger.get("value") or 100_000),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid tool_context_editor.trigger.value=%r; using 100000",
+            _editor_trigger.get("value"),
+        )
+        agent._tool_context_editor_trigger_value = 100_000
+    try:
+        agent._tool_context_editor_trigger_reference_context_tokens = max(
+            1,
+            int(_editor_trigger.get("reference_context_tokens") or 200_000),
+        )
+    except (TypeError, ValueError):
+        agent._tool_context_editor_trigger_reference_context_tokens = 200_000
+    try:
+        agent._tool_context_editor_trigger_before_compression_ratio = min(
+            0.95,
+            max(
+                0.05,
+                float(_editor_trigger.get("before_compression_ratio") or 0.75),
+            ),
+        )
+    except (TypeError, ValueError):
+        agent._tool_context_editor_trigger_before_compression_ratio = 0.75
+
+    _editor_keep = _editor_cfg.get("keep") or {}
+    if not isinstance(_editor_keep, dict):
+        _editor_keep = {}
+    _editor_keep_type = str(_editor_keep.get("type") or "tool_uses").lower()
+    if _editor_keep_type != "tool_uses":
+        logger.warning(
+            "Unknown tool_context_editor.keep.type=%r; using tool_uses",
+            _editor_keep_type,
+        )
+    try:
+        _keep_value = _editor_keep.get("value")
+        agent._tool_context_editor_keep_tool_uses = max(
+            0,
+            int(3 if _keep_value is None else _keep_value),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid tool_context_editor.keep.value=%r; using 3",
+            _editor_keep.get("value"),
+        )
+        agent._tool_context_editor_keep_tool_uses = 3
+    _editor_exclude_tools = _editor_cfg.get("exclude_tools") or []
+    if not isinstance(_editor_exclude_tools, list):
+        logger.warning(
+            "tool_context_editor.exclude_tools must be a list; using none"
+        )
+        _editor_exclude_tools = []
+    agent._tool_context_editor_exclude_tools = tuple(
+        str(name) for name in _editor_exclude_tools if str(name)
+    )
+    if bool(_editor_cfg.get("clear_tool_inputs", False)):
+        logger.warning(
+            "tool_context_editor.clear_tool_inputs=true is unsupported; "
+            "Hermes keeps tool call inputs like Anthropic's default"
+        )
     if not agent._context_files_enabled:
         agent.skip_context_files = True
         agent.load_soul_identity = True
 
+    agent._stable_prompt = ""
     agent._compiled_prompt = ""
     agent._prompt_lock = {}
     try:
         from hermes_cli.prompt_compiler import (
             infer_model_family,
-            load_compiled_prompt,
+            load_runtime_prompt,
             validate_runtime_prompt_protocols,
         )
 
-        _compiled = load_compiled_prompt(get_hermes_home())
+        # stable.md is the locked runtime policy prefix; system.md remains the
+        # authored Profile prompt. The lock must not make manual system edits
+        # unloadable or trigger regeneration from compiler presets.
+        _compiled = load_runtime_prompt(get_hermes_home())
         if _compiled is not None:
-            agent._compiled_prompt, agent._prompt_lock = _compiled
+            (
+                agent._stable_prompt,
+                agent._compiled_prompt,
+                agent._prompt_lock,
+            ) = _compiled
             _created_family = (
                 (agent._prompt_lock.get("model_adapter") or {}).get("family")
                 or "generic"
@@ -2653,9 +2810,13 @@ def init_agent(
             or "context_engine" in agent.enabled_toolsets
         )
     ):
+        _context_is_direct = (
+            agent._progressive_disclosure
+            and "context_engine" in agent.direct_toolsets
+        )
         _context_tool_target = (
-            agent.reachable_tools
-            if agent._progressive_disclosure
+            agent.direct_tools if _context_is_direct
+            else agent.deferred_tools if agent._progressive_disclosure
             else agent.tools
         )
         _context_name_target = (
@@ -2686,6 +2847,11 @@ def init_agent(
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}
             _context_tool_target.append(_wrapped)
+            if agent._progressive_disclosure:
+                agent.reachable_tools.append(_wrapped)
+                if _context_is_direct:
+                    agent.tools.append(_wrapped)
+                    agent.valid_tool_names.add(_tname)
             _context_name_target.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)

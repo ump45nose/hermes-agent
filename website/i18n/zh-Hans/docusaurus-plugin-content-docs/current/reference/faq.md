@@ -711,21 +711,20 @@ display:
 
 ### 在 Telegram 上管理技能（slash 命令限制）
 
-**场景：** Telegram 有 100 个 slash 命令的限制，您的技能数量已超过此限制。您想禁用 Telegram 上不需要的技能，但 `hermes skills config` 设置似乎没有生效。
+**场景：** Telegram 有 100 个 slash 命令的限制，您的技能数量已超过此限制。
 
-**解决方案：** 使用 `hermes skills config` 按平台禁用技能。这会写入 `config.yaml`：
+**解决方案：** 只把该 Profile 必需的技能写入严格 allowlist：
 
 ```yaml
 skills:
-  disabled: []                    # 全局禁用的技能
-  platform_disabled:
-    telegram: [skill-a, skill-b]  # 仅在 telegram 上禁用
+  enabled: [skill-a, skill-b]
 ```
 
-更改后，**重启网关**（`hermes gateway restart` 或终止并重新启动）。Telegram bot 命令菜单在启动时重建。
+同一 Profile 的所有交互平台共享这份 allowlist。更改后，**重启网关**，
+让 Telegram bot 命令菜单重新构建。
 
 :::tip
-描述过长的技能在 Telegram 菜单中会被截断为 40 个字符，以符合 payload 大小限制。如果技能未出现，可能是总 payload 大小问题而非 100 个命令数量限制 — 禁用未使用的技能对两者都有帮助。
+描述过长的技能在 Telegram 菜单中会被截断为 40 个字符，以符合 payload 大小限制。如果技能未出现，可能是总 payload 大小问题而非 100 个命令数量限制 — 保持 allowlist 精简对两者都有帮助。
 :::
 
 ### 共享线程会话（多用户，一个对话）

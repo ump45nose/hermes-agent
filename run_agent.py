@@ -1997,12 +1997,6 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
-            from agent.capability_history import (
-                project_message as _project_capability_message,
-                transient_call_ids as _transient_capability_call_ids,
-            )
-            _capability_transient_ids = _transient_capability_call_ids(messages)
-
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
                     continue
@@ -2026,13 +2020,7 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
-                _durable_msg = _project_capability_message(
-                    msg,
-                    transient_ids=_capability_transient_ids,
-                )
-                if _durable_msg is None:
-                    msg[_DB_PERSISTED_MARKER] = True
-                    continue
+                _durable_msg = msg
                 role = _durable_msg.get("role", "unknown")
                 content = _durable_msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
@@ -2848,9 +2836,8 @@ class AIAgent:
             return
 
         try:
-            from agent.capability_history import durable_projection
             cleaned = []
-            for msg in durable_projection(messages):
+            for msg in messages:
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):

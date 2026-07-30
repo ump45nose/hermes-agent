@@ -1314,26 +1314,10 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     if is_research_leaf:
-        configured_allowlist = delegation_cfg.get("research_leaf_toolsets")
-        if not isinstance(configured_allowlist, list):
-            configured_allowlist = [
-                "web",
-                "browser",
-                "context7",
-                "smart-search",
-                "github",
-                "tool_artifact",
-            ]
-        expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [
-            name
-            for name in configured_allowlist
-            if name in expanded_parent or name in parent_toolsets
-        ]
-        # A research leaf receives one runtime-scoped local capability in
-        # addition to inherited retrieval tools. Its handler can only read
-        # owner-only tool-result artifacts under this child's session id; it
-        # cannot read arbitrary files or artifacts owned by another process.
+        # Research children follow the same parent/Profile allowlist
+        # intersection as every other delegated child. The only runtime-added
+        # capability is an owner-scoped reader for this child's own spilled
+        # tool results; it cannot read arbitrary files or sibling artifacts.
         if "tool_artifact" not in child_toolsets:
             child_toolsets.append("tool_artifact")
 
@@ -1358,21 +1342,6 @@ def _build_child_agent(
             inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
         )
     )
-    if is_research_leaf:
-        child_disabled_toolsets = list(
-            dict.fromkeys(
-                child_disabled_toolsets
-                + [
-                    "terminal",
-                    "code_execution",
-                    "delegation",
-                    "kanban",
-                    "memory",
-                    "shared-state",
-                ]
-            )
-        )
-
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the

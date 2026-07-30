@@ -1,5 +1,11 @@
 # PRD：Hermes Prompt 与上下文治理 v1
 
+> 2026-07-29 架构修订：本文件中“Research parent 禁止直接检索”“正常任务固定
+> 三 leaf”以及基于 Profile/工具名的 Harness 硬拦截已废止。工具可调用性以
+> Profile allowlist、真实 ACL、approval 与 secret scope 为准。Research parent
+> 可直接取材，只有存在独立证据面且并行有明确收益时才按需委派；Research 向
+> Lingjun 返回整合后的 evidence dossier，由 Lingjun 保留最终分析与判断。
+
 状态：Draft，待评审
 范围：当前 Hermes 多 Profile 部署，以及以后通过 Profile Builder 新建的 Profile
 更新时间：2026-07-27
@@ -15,7 +21,8 @@
 3. 修复 Profile 根路径推导和 Prompt 块拼接；所有块使用明确边界，不再以空格
    粘连多个长提示词。
 4. 增加 Provider 无关的 Tool Context Editor，在每次 LLM 请求前治理历史工具
-   结果。失败、重复和无用结果在完成必要的一次消费后，从后续回放中移除。
+   结果。采用 Anthropic Context Editing 语义：达到输入阈值才清最旧结果，
+   保留最近工具窗口，且不回写破坏 canonical 客户端历史。
 5. Prompt 模块只在创建 Profile 时组装，产物写入 Profile 并固化。运行时不做
    “场景二分类”或语义 Prompt 路由。
 6. 沿用现有 Episode 提炼链，但将 Episode 和情景知识从 Mem0 迁移到本地、
@@ -307,33 +314,31 @@ research_leaf
 #### 6.7.1 位置
 
 在每次 LLM API 调用前、Provider wire-format 转换前运行。它与整体上下文压缩
-分离，不等待 token threshold 才执行。
+分离。默认配置值 `100,000` 是 `200,000`-token 有效输入窗口上的参考值；
+运行时按 `context_length - max_output_tokens` 等比缩放，并封顶为整体
+conversation compression 阈值的 75%，确保 Tool result 编辑先于整段压缩发生。
 
 #### 6.7.2 保留策略
 
-| Tool result 类型 | 首次返回后的后续回放 |
+| Tool result 类型 | Provider 投影 |
 |---|---|
-| 当前待模型消费的结果 | 保留原结果，至少让模型消费一次 |
-| 空结果、无变化、无匹配 | 消费后删除 call/result 对，或替换为最短合法占位 |
-| 完全重复结果 | 只保留最新一份，旧 call/result 对删除 |
-| 瞬时失败且后续重试成功 | 成功后删除失败 call/result 对 |
-| 已被新结果取代的观测 | 删除旧对，仅保留最新观测 |
-| 尚未解决的阻塞失败 | 保留短 blocker receipt：工具、错误类别、最后时间、下一步 |
-| 产生副作用的成功调用 | 保留短 action receipt：对象、动作、可验证结果、artifact id |
-| 大型只读结果 | 保留结构化摘要和本地 artifact 引用 |
-| 图片/base64/二进制结果 | 保留文字描述和 artifact 引用，不回放 payload |
+| 尚未超过触发阈值 | 所有 Tool result 原样保留 |
+| 最近 3 个 tool use/result 对 | 达到阈值后仍原样保留 |
+| 更早的 Tool result | 按时间顺序替换为统一的已清理占位文本 |
+| `exclude_tools` 命中的工具 | 不清理 |
 
-“直接丢弃”必须保持 Provider 消息协议合法：
-
-- Chat Completions 中删除 tool result 时，同时删除与之对应且已经完成使命的
-  assistant tool call；
-- Responses/Anthropic 路径由各 adapter 保持 call/result 配对；
-- 当前正在等待模型处理的结果不得提前删除。
+默认 `clear_tool_inputs=false`：保留 assistant Tool call 输入，只替换对应 Tool
+result 内容，从而维持 Chat Completions、Responses 和 Anthropic 三类 Provider
+的合法配对。
 
 #### 6.7.3 原始审计与压缩
 
-- 原始 Tool result 进入 owner-only 的 session audit/artifact store，不等于继续
-  放在 LLM 上下文。
+- Canonical 会话内存和 `state.db.messages.content` 保留完整原始 Tool result；
+  Context Editor 同时把短占位写入 nullable model-context projection sidecar。
+  Gateway 新 turn 只在 live replay 使用 sidecar，浏览、导出、FTS 和审计仍读
+  canonical 原文；同一 turn 则直接使用本次 Provider 投影。
+- 大结果可额外进入 owner-only 的 session audit/artifact store，供审计或按需
+  重读；该机制与 Provider 投影的统一占位文本分离。
 - 摘要必须是确定性结构化摘要；只有大型复杂观测才允许调用低成本模型生成
   补充摘要。
 - 编辑器输出计数：kept、dropped、deduplicated、superseded、receipts、
@@ -585,10 +590,12 @@ flowchart TD
 
 ### Phase 3：Tool Context Editor
 
-- 先以 report-only 模式记录“若启用将删除/压缩什么”；
-- 覆盖各 Provider 的 call/result 配对测试；
-- 对只读结果启用去重和 superseded 清理；
-- 再启用失败淘汰、action receipt 和 artifact 引用。
+- 使用 Anthropic-compatible Provider projection；
+- 默认参考 `trigger=100,000 input_tokens @ 200,000 context`、
+  `before_compression_ratio=0.75`、`keep=3 tool_uses`；
+- 覆盖阈值前不清理、阈值后保留最近窗口、canonical 不回写和三类 Provider
+  call/result 配对测试；
+- 使用统一占位文本，并保留 artifact 引用和逐条审计报告作为内部元数据。
 
 ### Phase 4：本地 Episode/Scenario
 
@@ -628,10 +635,14 @@ flowchart TD
 ### 9.2 Tool Context
 
 - 每个 tool call/result 在三类 Provider API 上保持合法配对。
-- “失败后重试成功”的失败对不进入第三次及后续请求。
-- 空结果、重复结果和 superseded 结果在一次必要消费后移除。
-- 副作用成功仍有可审计 receipt，原始结果可从 artifact/audit store 读取。
-- report-only 和 active 模式的删除决策可逐条解释。
+- 估算输入不超过当前模型解析出的有效 trigger 时，已消费结果仍原样进入下一次
+  Provider 请求。
+- 超过有效 trigger 时保留最近 3 个 tool use/result 对，只清更旧结果；有效
+  trigger 必须按模型窗口等比缩放且早于 conversation compression 阈值。
+- 默认保留 Tool call 输入；被清理的结果统一替换为短占位文本。
+- Provider/model-context projection 不得覆盖 `state.db.messages.content` 中的
+  canonical 原始结果。
+- 每次阈值触发和清理决策可逐条解释。
 
 ### 9.3 本地知识
 

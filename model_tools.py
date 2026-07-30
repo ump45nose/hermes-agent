@@ -1170,26 +1170,18 @@ def handle_function_call(
             # the deferred catalog identical to the deferrable subset of the
             # session's own tool list, and avoids polluting the process-global
             # _last_resolved_tool_names with out-of-scope tools.
-            current_defs = get_tool_definitions(
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-                quiet_mode=True, skip_tool_search_assembly=True,
-                progressive_disclosure=progressive_disclosure,
-            ) or []
-            if progressive_disclosure and reachable_tool_defs:
-                # Memory-provider/context-engine schemas are injected after
-                # registry assembly. Merge them without letting the static
-                # snapshot hide freshly connected MCP tools.
-                by_name = {
-                    (td.get("function") or {}).get("name"): td
-                    for td in current_defs
-                    if (td.get("function") or {}).get("name")
-                }
-                for td in reachable_tool_defs:
-                    name = (td.get("function") or {}).get("name")
-                    if name and name not in by_name:
-                        current_defs.append(td)
-                        by_name[name] = td
+            if progressive_disclosure and reachable_tool_defs is not None:
+                # In progressive mode the caller supplies the authoritative
+                # deferred catalog. Direct tools are already visible to the
+                # model and must not be rediscovered through the bridge.
+                current_defs = list(reachable_tool_defs)
+            else:
+                current_defs = get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True, skip_tool_search_assembly=True,
+                    progressive_disclosure=progressive_disclosure,
+                ) or []
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:

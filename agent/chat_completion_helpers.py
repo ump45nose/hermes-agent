@@ -1075,6 +1075,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    if getattr(agent, "_progressive_disclosure", False) is True:
+        # Provider-neutral equivalent of tool_reference expansion: compact
+        # references remain in conversation history, while the current real
+        # schemas are re-resolved from this agent's scoped deferred snapshot.
+        from tools.tool_search import hydrate_agent_tools_from_messages
+
+        hydrate_agent_tools_from_messages(agent, api_messages)
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -2069,7 +2076,33 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     agent, "_progressive_disclosure", False
                 ),
                 editor_mode=getattr(
-                    agent, "_tool_context_editor_mode", "failures"
+                    agent, "_tool_context_editor_mode", "anthropic"
+                ),
+                trigger_type=getattr(
+                    agent,
+                    "_tool_context_editor_trigger_type",
+                    "input_tokens",
+                ),
+                trigger_value=getattr(
+                    agent,
+                    "_tool_context_editor_trigger_value",
+                    100_000,
+                ),
+                keep_tool_uses=getattr(
+                    agent,
+                    "_tool_context_editor_keep_tool_uses",
+                    3,
+                ),
+                exclude_tools=getattr(
+                    agent,
+                    "_tool_context_editor_exclude_tools",
+                    (),
+                ),
+                estimated_input_tokens=estimate_request_context_tokens(
+                    {
+                        "messages": messages,
+                        "tools": getattr(agent, "tools", None) or [],
+                    }
                 ),
             )
         )

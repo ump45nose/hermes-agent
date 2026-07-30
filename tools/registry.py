@@ -91,13 +91,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "effect_disposition", "retain_result_until",
+        "effect_disposition",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 effect_disposition=None, retain_result_until=None):
+                 effect_disposition=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -113,7 +113,6 @@ class ToolEntry:
         # ``unknown`` is an authoritative action/risk declaration. ``None``
         # falls back to legacy classification for unannotated tools.
         self.effect_disposition = effect_disposition
-        self.retain_result_until = retain_result_until
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -403,7 +402,6 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         effect_disposition: str | None = None,
-        retain_result_until: str | None = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -418,10 +416,6 @@ class ToolRegistry:
             raise ValueError(
                 "effect_disposition must be None, 'none', or 'unknown'"
             )
-        if retain_result_until is not None and not str(
-            retain_result_until
-        ).strip():
-            raise ValueError("retain_result_until must be a non-empty tool name")
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -473,7 +467,6 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 effect_disposition=effect_disposition,
-                retain_result_until=retain_result_until,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

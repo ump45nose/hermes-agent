@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,7 +14,37 @@ from typing import Any, Iterable
 import yaml
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+STABLE_MODULES: dict[str, dict[str, Any]] = {
+    "memory-boundary": {
+        "version": 1,
+        "description": "Keep durable profile memory separate from shared runtime state.",
+        "text": (
+            "长期信息按层保存：当前 Profile 私有且长期稳定的用户事实、偏好和可复用经验"
+            "写入 Memory；跨 Profile 的当前环境与运行事实写入 shared-state。"
+            "任务过程、临时状态和短期结果不写长期记忆。"
+        ),
+    },
+    "active-profile-boundary": {
+        "version": 1,
+        "description": "Minimal defense-in-depth boundary for profile-private data.",
+        "text": (
+            "仅操作当前 Hermes Profile；未经用户明确指定，不读取或修改其他 Profile "
+            "的私有数据、配置与资产。"
+        ),
+    },
+}
+
+STABLE_PRESETS: dict[str, tuple[str, ...]] = {
+    preset: ("memory-boundary", "active-profile-boundary")
+    for preset in ("default", "lingjun", "companion", "ops", "research", "xp")
+}
+
+RESERVED_STABLE_MODULES: tuple[dict[str, Any], ...] = (
+    {"id": "session-search", "version": 0, "status": "reserved"},
+    {"id": "skill-governance", "version": 0, "status": "reserved"},
+)
 
 MODULES: dict[str, dict[str, Any]] = {
     "core-minimal": {
@@ -25,22 +56,24 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "controller": {
-        "version": 5,
+        "version": 6,
         "description": "Own the user goal, route cross-profile work, and judge results.",
         "text": (
             "职责\n"
             "你是当前用户会话的 Controller。你持有用户目标，负责判断处理方式、"
             "拆解和派单、验收各项结果、失败补救，并向用户统一交付；"
-            "你不代替专业 Profile 执行其领域工作。\n"
+            "最终分析、判断和取舍由你负责。\n"
             "\n"
             "自己处理\n"
-            "只在任务简单、所需信息已在当前上下文中，并且不需要专业取证、"
-            "外部调查或跨 Profile 执行时直接处理，例如解释问题、澄清需求、"
-            "整理已有材料或汇总已经取得的结果。\n"
+            "当前 Profile 已暴露的工具可直接用于读取、检索、分析和完成职责内工作。"
+            "工具是否可调用由 Profile allowlist、工具 ACL 和 approval 决定；"
+            "不要因为存在 Kanban 就把普通查询、简单检索或本可直接完成的工作派出去。\n"
             "\n"
             "走 Kanban\n"
-            "需要专业领域判断或执行、外部或多来源取证、跨 Profile 协作时，"
-            "先调用 kanban_roster，再调用 kanban_create。执行者明确时指定 assignee；"
+            "只有工作确实需要另一个 Profile 的隔离身份、专属能力、独立长任务或"
+            "跨 Profile 协作时才使用 Kanban。需要派单时可先调用 kanban_roster 了解"
+            "当前执行者，再调用 kanban_create；查询 roster 本身不承诺必须派单。"
+            "执行者明确时指定 assignee；"
             "目标仍模糊、跨多个领域或无法可靠选择执行者时使用 triage=true。"
             "任务卡必须带上原始目标、完成标准、用户指定的来源或路径和交付要求。"
             "派单成功后停止当前执行，由 Harness Park 当前会话；收到终态 receipt 后，"
@@ -48,10 +81,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "证据足够，才统一回答用户。\n"
             "\n"
             "边界\n"
-            "工具可见不等于 Controller 有权代做专业工作。"
-            "你决定路线、拆解、执行者、验收和补救；Harness 负责能力校验、创建与订阅、"
-            "Park 与唤醒、Worker 状态和真实 receipt。"
-            "不得绕过 Kanban 自行调用专业来源或执行专业操作，不得轮询、模拟或猜测任务状态。"
+            "你决定路线、拆解、执行者、验收和补救；Harness 只负责创建与订阅、"
+            "Park 与唤醒、Worker 租约和真实 receipt，不负责按工具名或任务语义替你选路。"
+            "不得轮询、模拟或猜测已派任务的状态。"
             "存在未终态的相关任务时，不得提前给出最终答案。\n"
             "\n"
             "复杂链路范例\n"
@@ -68,14 +100,21 @@ MODULES: dict[str, dict[str, Any]] = {
         "allowed_runtime_overlays": ["platform", "cron"],
     },
     "direct-action-minimal": {
-        "version": 1,
-        "text": "职责内且风险可控的简单动作直接完成；不要把执行意图当成已交付结果。",
+        "version": 2,
+        "text": (
+            "职责内且风险可控的简单动作直接完成；不要把执行意图当成已交付结果。"
+            "用户要求“保存参考图片”时，先识别当前对话中明确指向的图片，再调用当前"
+            " Profile 已开放的保存能力并核对真实结果；不要另行生成无关图片、猜测"
+            "保存对象，或在未保存时声称完成。"
+        ),
     },
     "social-companion": {
-        "version": 1,
+        "version": 2,
         "text": (
+            "始终扮演 SOUL.md 中定义的人物，保持身份、关系和表达一致。"
             "以自然、有主动性的陪伴方式交流，保持人物表达一致。"
-            "技术性后台通知应安静，不用系统运维口吻打断对话。"
+            "技术性后台通知应安静，不用系统运维口吻打断对话；"
+            "不用动作旁白代替自然交流，也不必为了推进对话每轮追问。"
         ),
     },
     "media-delivery": {
@@ -101,24 +140,21 @@ MODULES: dict[str, dict[str, Any]] = {
         ),
     },
     "research-parent": {
-        "version": 6,
-        "description": "Fan out to up to three deep research leaves and synthesize evidence.",
+        "version": 7,
+        "description": "Retrieve and integrate evidence, with optional adaptive delegation.",
         "text": (
-            "你是研究父 Agent：正常研究任务先拆成三个互补且独立的 leaf，"
-            "立即用 delegate_task 同步并行分发；父进程不直接搜索、抓取或读取"
-            " GitHub 等来源。等待三个 leaf 全部终态后，再综合证据、冲突、失败和未解决项。"
-            "分发时不得要求 leaf 自行写文件或指定 Evidence 路径；运行时会自动保存"
-            "完整 Evidence bundle。只要求 leaf 返回 claims、source_ids、contradictions、"
-            "unexpected_findings、unresolved 五字段 JSON。"
-            "正常综合只使用 leaf 返回的结构化 handoff；Evidence bundle 仅在"
-            "某个具体结论、冲突或来源缺失时按需钻取，不整包重复读取。"
+            "你负责检索、去重、交叉核验和证据整合。可以直接使用当前 Profile allowlist "
+            "暴露的搜索、抓取、GitHub 和本地读取工具。简单或边界清晰的任务直接完成；"
+            "只有任务能拆成彼此独立的证据面且并行确实提高覆盖率时，才按需使用"
+            " delegate_task 创建少量 leaf，禁止机械地固定创建三个子代理。"
+            "给 leaf 的任务只包含必要目标、范围和证据标准；leaf 返回来源、事实、冲突、"
+            "缺口和 provenance，运行时可保存完整 Evidence bundle。"
+            "你负责把多路材料去重并整合成可追溯的 research dossier。由 Lingjun 或"
+            "其他 Controller 委派时，交付整合证据、争议和未知项，不替 Controller 做"
+            "最终价值判断；直接面向用户时可基于证据回答。"
+            "正常整合优先使用有界 handoff；仅在具体结论、冲突或来源缺失时按需钻取"
+            " Evidence bundle，不整包重复读取。"
         ),
-        "protocols": ["research-parent@1"],
-        "required_capabilities": [
-            "research.delegate",
-            "research.handoff",
-            "github.read",
-        ],
         "allowed_runtime_overlays": [
             "platform",
             "kanban-worker",
@@ -198,7 +234,6 @@ MODEL_ADAPTERS: dict[str, dict[str, Any]] = {
 
 PROTOCOL_SURFACES: dict[str, tuple[str, ...]] = {
     "kanban-controller@1": ("cli", "telegram", "weixin", "api_server"),
-    "research-parent@1": ("cli", "telegram", "weixin", "api_server", "cron"),
 }
 
 CAPABILITY_TOOLSETS: dict[str, str | None] = {
@@ -278,6 +313,20 @@ def _module_record(module_id: str) -> dict[str, Any]:
     }
 
 
+def _stable_module_record(module_id: str) -> dict[str, Any]:
+    try:
+        spec = STABLE_MODULES[module_id]
+    except KeyError as exc:
+        raise ValueError(f"unknown stable prompt module: {module_id}") from exc
+    text = str(spec["text"]).strip()
+    return {
+        "id": module_id,
+        "version": int(spec["version"]),
+        "sha256": _sha256_text(text),
+        "text": text,
+    }
+
+
 def prompt_module_catalog() -> dict[str, Any]:
     """Return the authoritative registry consumed by CLI and Web Builder."""
     return {
@@ -305,6 +354,17 @@ def prompt_module_catalog() -> dict[str, Any]:
             }
             for module_id, spec in MODULES.items()
         ],
+        "stable_modules": [
+            {
+                "id": module_id,
+                "version": int(spec["version"]),
+                "description": str(spec.get("description") or ""),
+            }
+            for module_id, spec in STABLE_MODULES.items()
+        ],
+        "reserved_stable_modules": [
+            dict(record) for record in RESERVED_STABLE_MODULES
+        ],
         "model_families": list(MODEL_ADAPTERS),
     }
 
@@ -319,7 +379,11 @@ def extra_modules_from_lock(
     base = set(PRESETS.get(preset_id, ()))
     return tuple(
         str(record.get("id"))
-        for record in lock.get("modules") or []
+        for record in (
+            lock.get("profile_modules")
+            or lock.get("modules")
+            or []
+        )
         if isinstance(record, dict)
         and record.get("id")
         and str(record["id"]) not in base
@@ -381,7 +445,7 @@ def compile_profile_prompt(
     lock = {
         "schema_version": SCHEMA_VERSION,
         "preset": preset_id,
-        "modules": [
+        "profile_modules": [
             {
                 key: record[key]
                 for key in (
@@ -412,6 +476,52 @@ def compile_profile_prompt(
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return compiled, lock
+
+
+def compile_stable_prompt(
+    preset: str,
+    *,
+    system_text: str,
+    base_lock: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Compile the locked Stable layer without rewriting authored system.md."""
+    preset_id = str(preset or "default").lower()
+    if preset_id not in STABLE_PRESETS:
+        preset_id = "default"
+    records = [
+        _stable_module_record(module_id)
+        for module_id in STABLE_PRESETS[preset_id]
+    ]
+    stable_text = (
+        "\n\n".join(record["text"] for record in records if record["text"]).strip()
+        + "\n"
+    )
+    lock = dict(base_lock)
+    lock["schema_version"] = SCHEMA_VERSION
+    lock["preset"] = str(base_lock.get("preset") or preset_id)
+    lock.pop("compiled_sha256", None)
+    if "modules" in lock and "profile_modules" not in lock:
+        lock["profile_modules"] = lock.pop("modules")
+    lock["stable"] = {
+        "path": "stable.md",
+        "modules": [
+            {
+                key: record[key]
+                for key in ("id", "version", "sha256")
+            }
+            for record in records
+        ],
+        "compiled_sha256": _sha256_text(stable_text),
+    }
+    lock["reserved_stable_modules"] = [
+        dict(record) for record in RESERVED_STABLE_MODULES
+    ]
+    lock["authored_system"] = {
+        "path": "system.md",
+        "observed_sha256": _sha256_text(system_text),
+    }
+    lock["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return stable_text, lock
 
 
 def _exposure_toolsets(raw: Any) -> set[str]:
@@ -514,25 +624,6 @@ def _planned_capability_config(
             deferred = subagent.setdefault("deferred", [])
             if "github" not in deferred:
                 deferred.append("github")
-            delegation = planned.setdefault("delegation", {})
-            if not isinstance(delegation, dict):
-                raise ValueError("delegation must be a mapping")
-            leaf_toolsets = delegation.setdefault(
-                "research_leaf_toolsets",
-                [
-                    "web",
-                    "browser",
-                    "context7",
-                    "smart-search",
-                    "tool_artifact",
-                ],
-            )
-            if not isinstance(leaf_toolsets, list):
-                raise ValueError(
-                    "delegation.research_leaf_toolsets must be a list"
-                )
-            if "github" not in leaf_toolsets:
-                leaf_toolsets.append("github")
     return planned, changes
 
 
@@ -550,11 +641,13 @@ def provision_prompt_capabilities(
         raise ValueError(f"config root must be a mapping: {path}")
     planned, changes = _planned_capability_config(config, lock)
     if write and planned != config:
+        existed = path.exists()
         path.write_text(
             yaml.safe_dump(planned, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
-        os.chmod(path, 0o600)
+        if not existed:
+            os.chmod(path, 0o600)
     return {"config": planned, "changes": changes}
 
 
@@ -688,6 +781,26 @@ def prompt_paths(profile_home: str | Path) -> tuple[Path, Path]:
     return directory / "system.md", directory / "prompt.lock.yaml"
 
 
+def stable_prompt_path(profile_home: str | Path) -> Path:
+    return Path(profile_home) / "prompt" / "stable.md"
+
+
+def _backup_prompt_artifacts(
+    prompt_dir: Path,
+    sources: Iterable[Path],
+) -> Path | None:
+    existing = [source for source in sources if source.exists()]
+    if not existing:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = prompt_dir / "backups" / stamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    backup_dir.chmod(prompt_dir.stat().st_mode & 0o777)
+    for source in existing:
+        shutil.copy2(source, backup_dir / source.name)
+    return backup_dir
+
+
 def write_compiled_prompt(
     profile_home: str | Path,
     *,
@@ -697,33 +810,100 @@ def write_compiled_prompt(
     backup: bool = False,
 ) -> dict[str, Any]:
     system_path, lock_path = prompt_paths(profile_home)
-    compiled, lock = compile_profile_prompt(
+    stable_path = stable_prompt_path(profile_home)
+    compiled, base_lock = compile_profile_prompt(
         preset, extra_modules=extra_modules, model_family=model_family
     )
-    provision_prompt_capabilities(profile_home, lock, write=False)
-    system_path.parent.mkdir(parents=True, exist_ok=True)
-    system_path.parent.chmod(0o700)
-    if backup and (system_path.exists() or lock_path.exists()):
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_dir = system_path.parent / "backups" / stamp
-        backup_dir.mkdir(parents=True, exist_ok=False)
-        backup_dir.chmod(0o700)
-        for source in (system_path, lock_path):
-            if source.exists():
-                shutil.copy2(source, backup_dir / source.name)
-    system_path.write_text(compiled, encoding="utf-8")
-    lock_path.write_text(
-        yaml.safe_dump(lock, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
+    stable, lock = compile_stable_prompt(
+        preset,
+        system_text=compiled,
+        base_lock=base_lock,
     )
-    os.chmod(system_path, 0o600)
-    os.chmod(lock_path, 0o600)
+    provision_prompt_capabilities(profile_home, lock, write=False)
+    prompt_dir_existed = system_path.parent.exists()
+    system_path.parent.mkdir(parents=True, exist_ok=True)
+    if not prompt_dir_existed:
+        system_path.parent.chmod(0o700)
+    if backup:
+        _backup_prompt_artifacts(
+            system_path.parent,
+            (system_path, stable_path, lock_path),
+        )
+    _atomic_write_text(system_path, compiled)
+    _atomic_write_text(stable_path, stable)
+    # Publish the lock last. A crash between the artifact replacements leaves a
+    # detectable hash mismatch instead of silently accepting mixed versions.
+    _atomic_write_text(
+        lock_path,
+        yaml.safe_dump(lock, sort_keys=False, allow_unicode=True),
+    )
     provision_prompt_capabilities(profile_home, lock, write=True)
     return lock
 
 
+def write_stable_prompt(
+    profile_home: str | Path,
+    *,
+    preset: str,
+    extra_modules: Iterable[str] = (),
+    model_family: str = "generic",
+    backup: bool = False,
+) -> dict[str, Any]:
+    """Compile Stable and lock metadata while preserving authored system.md."""
+    system_path, lock_path = prompt_paths(profile_home)
+    stable_path = stable_prompt_path(profile_home)
+    if not system_path.is_file():
+        raise FileNotFoundError(f"authored prompt missing: {system_path}")
+    system_text = system_path.read_text(encoding="utf-8")
+    _unused_template, base_lock = compile_profile_prompt(
+        preset,
+        extra_modules=extra_modules,
+        model_family=model_family,
+    )
+    stable, lock = compile_stable_prompt(
+        preset,
+        system_text=system_text,
+        base_lock=base_lock,
+    )
+    provision_prompt_capabilities(profile_home, lock, write=False)
+    system_path.parent.mkdir(parents=True, exist_ok=True)
+    if backup:
+        _backup_prompt_artifacts(
+            system_path.parent,
+            (system_path, stable_path, lock_path),
+        )
+    _atomic_write_text(stable_path, stable)
+    _atomic_write_text(
+        lock_path,
+        yaml.safe_dump(lock, sort_keys=False, allow_unicode=True),
+    )
+    provision_prompt_capabilities(profile_home, lock, write=True)
+    return lock
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace one prompt artifact atomically within its destination dir."""
+    target_mode = (
+        path.stat().st_mode & 0o777
+        if path.exists()
+        else 0o600 | (path.parent.stat().st_mode & 0o060)
+    )
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, target_mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def ensure_profile_governance_config(profile_home: str | Path) -> None:
-    """Persist deployment defaults that keep runtime prompts deterministic."""
+    """Fill creation-time defaults without overriding Profile policy."""
     path = Path(profile_home) / "config.yaml"
     if path.exists():
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -734,14 +914,51 @@ def ensure_profile_governance_config(profile_home: str | Path) -> None:
     agent = payload.setdefault("agent", {})
     if not isinstance(agent, dict):
         raise ValueError(f"agent config must be a mapping: {path}")
-    agent["context_files"] = False
-    agent["coding_context"] = False
-    agent["environment_probe"] = False
+    changed = not path.exists()
+    for key, value in {
+        "context_files": False,
+        "coding_context": False,
+        "environment_probe": False,
+    }.items():
+        if key not in agent:
+            agent[key] = value
+            changed = True
+    editor = payload.setdefault("tool_context_editor", {})
+    if not isinstance(editor, dict):
+        raise ValueError(f"tool_context_editor config must be a mapping: {path}")
+    if "mode" not in editor:
+        editor["mode"] = "anthropic"
+        changed = True
+    trigger = editor.setdefault("trigger", {})
+    if not isinstance(trigger, dict):
+        raise ValueError(f"tool_context_editor.trigger must be a mapping: {path}")
+    if "type" not in trigger:
+        trigger["type"] = "input_tokens"
+        changed = True
+    if "value" not in trigger:
+        trigger["value"] = 100_000
+        changed = True
+    keep = editor.setdefault("keep", {})
+    if not isinstance(keep, dict):
+        raise ValueError(f"tool_context_editor.keep must be a mapping: {path}")
+    if "type" not in keep:
+        keep["type"] = "tool_uses"
+        changed = True
+    if "value" not in keep:
+        keep["value"] = 3
+        changed = True
+    if "clear_tool_inputs" not in editor:
+        editor["clear_tool_inputs"] = False
+        changed = True
+    if not changed:
+        return
+    existed = path.exists()
     path.write_text(
         yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
-    os.chmod(path, 0o600)
+    if not existed:
+        os.chmod(path, 0o600)
 
 
 def load_compiled_prompt(profile_home: str | Path) -> tuple[str, dict[str, Any]] | None:
@@ -755,18 +972,62 @@ def load_compiled_prompt(profile_home: str | Path) -> tuple[str, dict[str, Any]]
     return text, lock
 
 
+def load_runtime_prompt(
+    profile_home: str | Path,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """Load locked Stable plus authored system prompt without hash coupling.
+
+    ``prompt/system.md`` remains the authored runtime source of truth.  Missing
+    ``stable.md`` is accepted for legacy Profiles and produces an empty Stable
+    layer; Gateway startup never creates or upgrades prompt artifacts.
+    """
+    system_path, lock_path = prompt_paths(profile_home)
+    stable_path = stable_prompt_path(profile_home)
+    if not system_path.is_file():
+        return None
+    system_text = system_path.read_text(encoding="utf-8")
+    stable_text = (
+        stable_path.read_text(encoding="utf-8")
+        if stable_path.is_file()
+        else ""
+    )
+    lock: dict[str, Any] = {}
+    if lock_path.is_file():
+        loaded = yaml.safe_load(lock_path.read_text(encoding="utf-8")) or {}
+        if isinstance(loaded, dict):
+            lock = loaded
+    return stable_text, system_text, lock
+
+
 def verify_compiled_prompt(profile_home: str | Path) -> dict[str, Any]:
-    loaded = load_compiled_prompt(profile_home)
-    if loaded is None:
-        return {"ok": False, "reason": "compiled prompt or lock missing"}
-    text, lock = loaded
-    actual = _sha256_text(text)
-    expected = str(lock.get("compiled_sha256") or "")
+    system_path, lock_path = prompt_paths(profile_home)
+    stable_path = stable_prompt_path(profile_home)
+    missing = [
+        str(path.relative_to(Path(profile_home)))
+        for path in (stable_path, system_path, lock_path)
+        if not path.is_file()
+    ]
+    if missing:
+        return {
+            "ok": False,
+            "reason": "prompt artifacts missing",
+            "missing": missing,
+        }
+
+    stable_text = stable_path.read_text(encoding="utf-8")
+    system_text = system_path.read_text(encoding="utf-8")
+    lock = yaml.safe_load(lock_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(lock, dict):
+        return {"ok": False, "reason": "invalid prompt lock"}
+
+    stable_meta = lock.get("stable") or {}
+    expected = str(stable_meta.get("compiled_sha256") or "")
+    actual = _sha256_text(stable_text)
     module_checks = []
-    for record in lock.get("modules") or []:
+    for record in stable_meta.get("modules") or []:
         module_id = str(record.get("id") or "")
         try:
-            current = _module_record(module_id)
+            current = _stable_module_record(module_id)
         except ValueError:
             module_checks.append({"id": module_id, "ok": False, "reason": "unknown"})
             continue
@@ -781,22 +1042,117 @@ def verify_compiled_prompt(profile_home: str | Path) -> dict[str, Any]:
                 "registry_version": current["version"],
             }
         )
+    reserved_locked = lock.get("reserved_stable_modules") or []
+    reserved_ok = reserved_locked == list(RESERVED_STABLE_MODULES)
+    stable_path_ok = stable_meta.get("path") == "stable.md"
     protocol_check = verify_protocol_capabilities(profile_home, lock)
     hash_ok = bool(expected) and actual == expected
     schema_ok = int(lock.get("schema_version") or 0) == SCHEMA_VERSION
-    modules_ok = all(item["ok"] for item in module_checks)
+    expected_module_ids = tuple(
+        STABLE_PRESETS.get(str(lock.get("preset") or "default"), ())
+    )
+    locked_module_ids = tuple(
+        str(record.get("id") or "") for record in stable_meta.get("modules") or []
+    )
+    modules_ok = (
+        locked_module_ids == expected_module_ids
+        and all(item["ok"] for item in module_checks)
+    )
+
+    permission_checks = []
+    for path in (stable_path, system_path, lock_path):
+        mode = path.stat().st_mode & 0o777
+        permission_checks.append(
+            {
+                "path": str(path.relative_to(Path(profile_home))),
+                "mode": f"{mode:04o}",
+                "ok": (
+                    (mode & 0o600) == 0o600
+                    and not bool(mode & 0o007)
+                    and not bool(mode & 0o111)
+                ),
+            }
+        )
+    prompt_dir = stable_path.parent
+    prompt_dir_mode = prompt_dir.stat().st_mode & 0o777
+    permission_checks.append(
+        {
+            "path": str(prompt_dir.relative_to(Path(profile_home))),
+            "mode": f"{prompt_dir_mode:04o}",
+            "ok": (
+                (prompt_dir_mode & 0o700) == 0o700
+                and not bool(prompt_dir_mode & 0o007)
+            ),
+        }
+    )
+    permissions_ok = all(item["ok"] for item in permission_checks)
+
+    observed_system = str(
+        (lock.get("authored_system") or {}).get("observed_sha256") or ""
+    )
+    system_metadata_ok = (
+        (lock.get("authored_system") or {}).get("path") == "system.md"
+        and len(observed_system) == 64
+    )
+    current_system = _sha256_text(system_text)
+    preset = str(lock.get("preset") or "default")
+    _expected_profile, expected_protocol_lock = compile_profile_prompt(
+        preset,
+        extra_modules=extra_modules_from_lock(lock, preset=preset),
+        model_family=str(
+            (lock.get("model_adapter") or {}).get("family") or "generic"
+        ),
+    )
+    protocol_metadata_fields = (
+        "protocols",
+        "required_capabilities",
+        "protocol_requirements",
+        "protocol_surfaces",
+        "runtime_overlays",
+    )
+    protocol_metadata_ok = all(
+        lock.get(field) == expected_protocol_lock.get(field)
+        for field in protocol_metadata_fields
+    )
     return {
-        "ok": hash_ok and schema_ok and modules_ok and protocol_check["ok"],
+        "ok": (
+            hash_ok
+            and schema_ok
+            and modules_ok
+            and reserved_ok
+            and stable_path_ok
+            and system_metadata_ok
+            and protocol_metadata_ok
+            and protocol_check["ok"]
+            and permissions_ok
+        ),
         "schema_version": lock.get("schema_version"),
         "schema_ok": schema_ok,
         "hash_ok": hash_ok,
         "expected": expected,
         "actual": actual,
-        "preset": lock.get("preset"),
+        "preset": preset,
         "model_family": (lock.get("model_adapter") or {}).get("family"),
-        "modules": module_checks,
+        "stable_modules": module_checks,
+        "reserved_stable_modules": {
+            "ok": reserved_ok,
+            "locked": reserved_locked,
+        },
+        "system": {
+            "metadata_ok": system_metadata_ok,
+            "observed_sha256": observed_system,
+            "current_sha256": current_system,
+            "changed_since_observation": (
+                bool(observed_system) and observed_system != current_system
+            ),
+        },
+        "protocol_metadata_ok": protocol_metadata_ok,
         "protocols": protocol_check,
         "runtime_overlays": lock.get("runtime_overlays") or [],
+        "permissions": {
+            "ok": permissions_ok,
+            "artifacts": permission_checks,
+        },
     }
 
 
@@ -808,8 +1164,17 @@ def render_prompt_diff(
     model_family: str | None = None,
 ) -> str:
     loaded = load_compiled_prompt(profile_home)
-    old_text = loaded[0] if loaded else ""
+    system_path, _lock_path = prompt_paths(profile_home)
+    system_text = (
+        system_path.read_text(encoding="utf-8")
+        if system_path.is_file()
+        else ""
+    )
     old_lock = loaded[1] if loaded else {}
+    stable_path = stable_prompt_path(profile_home)
+    old_stable_text = (
+        stable_path.read_text(encoding="utf-8") if stable_path.is_file() else ""
+    )
     target_preset = preset or old_lock.get("preset") or "default"
     target_family = (
         model_family
@@ -821,17 +1186,22 @@ def render_prompt_diff(
         selected_extras = extra_modules_from_lock(
             old_lock, preset=str(target_preset)
         )
-    new_text, new_lock = compile_profile_prompt(
+    _profile_text, base_lock = compile_profile_prompt(
         target_preset,
         extra_modules=selected_extras,
         model_family=target_family,
     )
+    new_stable_text, new_lock = compile_stable_prompt(
+        str(target_preset),
+        system_text=system_text,
+        base_lock=base_lock,
+    )
     prompt_diff = "".join(
         difflib.unified_diff(
-            old_text.splitlines(keepends=True),
-            new_text.splitlines(keepends=True),
-            fromfile="prompt/system.md",
-            tofile="prompt/system.md.new",
+            old_stable_text.splitlines(keepends=True),
+            new_stable_text.splitlines(keepends=True),
+            fromfile="prompt/stable.md",
+            tofile="prompt/stable.md.new",
         )
     )
     config_path = Path(profile_home) / "config.yaml"

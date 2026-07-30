@@ -2933,7 +2933,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ``/skills list``, but as a deterministic JSON payload.
 
         Returns the same skill metadata (name, description, category) the
-        skills hub uses internally. Disabled skills are excluded so the
+        skills hub uses internally. Skills outside the allowlist are excluded so the
         listing matches what the agent actually loads.
         """
         auth_err = self._check_auth(request)
@@ -2942,7 +2942,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             from tools.skills_tool import _find_all_skills, _sort_skills
-            skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            skills = _sort_skills(_find_all_skills(include_inactive=False))
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(

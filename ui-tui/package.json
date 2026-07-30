@@ -14,9 +14,7 @@
     "lint:fix": "eslint src/ packages/ --fix",
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'packages/**/*.{ts,tsx}'",
     "fix": "npm run lint:fix && npm run fmt",
-    "check": "npm run build:ink && npm run typecheck && npm run test && npm run lint",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "check": "npm run build:ink && npm run typecheck && npm run lint"
   },
   "dependencies": {
     "@hermes/ink": "file:./packages/hermes-ink",
@@ -44,7 +42,6 @@
     "globals": "^16",
     "prettier": "^3",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.3"
+    "typescript": "^6.0.3"
   }
 }

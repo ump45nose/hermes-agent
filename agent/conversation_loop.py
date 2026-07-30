@@ -116,6 +116,21 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _is_local_outer_loop_error(exc: BaseException) -> bool:
+    """Classify deterministic in-process failures without retry storms."""
+    if isinstance(exc, (ImportError, ModuleNotFoundError)):
+        return True
+    tb_module_names: set[str] = set()
+    traceback = exc.__traceback__
+    while traceback is not None:
+        filename = os.path.basename(traceback.tb_frame.f_code.co_filename)
+        tb_module_names.add(os.path.splitext(filename)[0])
+        traceback = traceback.tb_next
+    hit_local = bool(tb_module_names & _LOCAL_PROCESSING_MODULES)
+    hit_api = bool(tb_module_names & _API_CALL_MODULES)
+    return hit_local and not hit_api
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
@@ -1585,12 +1600,88 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Clear capability-disclosure payloads after exactly one successful
-        # provider consumption, then compact ordinary consumed tool results.
-        # Apply the same projection to the canonical live list: editing only
-        # ``api_messages`` lets a cached Gateway resurrect the raw payload on
-        # the next turn.
-        _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
+        # Capability-disclosure payloads remain one-consumption transients.
+        # Tool results use a separate policy. In ``anthropic`` mode they are
+        # cleared only from the provider projection after the configured
+        # context threshold is crossed; canonical client history remains full.
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "anthropic")
+        _editor_tool_schema_tokens = (
+            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        )
+        _editor_estimated_input_tokens = (
+            estimate_messages_tokens_rough(api_messages)
+            + _editor_tool_schema_tokens
+        )
+        agent._tool_context_editor_last_estimated_input_tokens = (
+            _editor_estimated_input_tokens
+        )
+        _configured_editor_trigger = getattr(
+            agent,
+            "_tool_context_editor_trigger_value",
+            100_000,
+        )
+        _effective_editor_trigger = _configured_editor_trigger
+        if (
+            _editor_mode == "anthropic"
+            and getattr(
+                agent,
+                "_tool_context_editor_trigger_type",
+                "input_tokens",
+            )
+            == "input_tokens"
+        ):
+            from agent.tool_context_editor import (
+                resolve_anthropic_trigger_input_tokens,
+            )
+
+            _editor_compressor = getattr(agent, "context_compressor", None)
+            _effective_editor_trigger = resolve_anthropic_trigger_input_tokens(
+                _configured_editor_trigger,
+                context_length=getattr(
+                    _editor_compressor,
+                    "context_length",
+                    None,
+                ),
+                max_output_tokens=getattr(agent, "max_tokens", 0),
+                compression_threshold_tokens=(
+                    getattr(_editor_compressor, "threshold_tokens", None)
+                    if getattr(agent, "compression_enabled", False)
+                    else None
+                ),
+                reference_context_tokens=getattr(
+                    agent,
+                    "_tool_context_editor_trigger_reference_context_tokens",
+                    200_000,
+                ),
+                before_compression_ratio=getattr(
+                    agent,
+                    "_tool_context_editor_trigger_before_compression_ratio",
+                    0.75,
+                ),
+            )
+        agent._tool_context_editor_effective_trigger_value = (
+            _effective_editor_trigger
+        )
+        _editor_policy = {
+            "trigger_type": getattr(
+                agent,
+                "_tool_context_editor_trigger_type",
+                "input_tokens",
+            ),
+            "trigger_value": _effective_editor_trigger,
+            "keep_tool_uses": getattr(
+                agent,
+                "_tool_context_editor_keep_tool_uses",
+                3,
+            ),
+            "estimated_input_tokens": _editor_estimated_input_tokens,
+            "tool_schema_tokens": _editor_tool_schema_tokens,
+            "exclude_tools": getattr(
+                agent,
+                "_tool_context_editor_exclude_tools",
+                (),
+            ),
+        }
         try:
             from agent.tool_context_editor import (
                 project_tool_context_for_provider,
@@ -1602,46 +1693,59 @@ def run_conversation(
                     api_messages,
                     progressive_disclosure=_progressive,
                     editor_mode=_editor_mode,
-                )
-            )
-            _canonical_messages, _canonical_projection_report = (
-                project_tool_context_for_provider(
-                    messages,
-                    progressive_disclosure=_progressive,
-                    editor_mode=_editor_mode,
-                    strip_internal=False,
+                    **_editor_policy,
                 )
             )
             _capability_edit_report = _api_projection_report["capability"]
             _tool_edit_report = _api_projection_report["tool_context"]
-            if (
-                _canonical_projection_report["capability"]
-                or (
-                    _canonical_projection_report["tool_context"]
-                    and _editor_mode != "report_only"
-                )
-            ):
-                agent._tool_context_canonical_dirty = True
             if _tool_edit_report:
                 request_logger.info(
-                    "Tool Context Editor mode=%s actions=%s",
+                    "Tool Context Editor mode=%s trigger=%s/%s "
+                    "(effective/configured) actions=%s",
                     _editor_mode,
+                    _effective_editor_trigger,
+                    _configured_editor_trigger,
                     _tool_edit_report,
                 )
-            if _canonical_messages is not messages and (
-                _canonical_messages != messages
-            ):
-                messages[:] = _canonical_messages
-                current_turn_user_idx = reanchor_current_turn_user_idx(
-                    messages, user_message
-                )
-                agent._persist_user_message_idx = current_turn_user_idx
-                agent._session_messages = messages
             if _capability_edit_report:
                 request_logger.info(
                     "Capability transient editor actions=%s",
                     _capability_edit_report,
                 )
+            _projection_db = getattr(agent, "_session_db", None)
+            _projection_session_id = getattr(agent, "session_id", None)
+            if _projection_db is not None and _projection_session_id:
+                _anthropic_projection_ids = [
+                    item.get("tool_call_id")
+                    for item in _tool_edit_report
+                    if item.get("action") == "anthropic_clear_tool_result"
+                ]
+                if _anthropic_projection_ids:
+                    from agent.tool_context_editor import (
+                        ANTHROPIC_CLEARED_TOOL_RESULT,
+                    )
+
+                    _projection_db.update_tool_context_projection(
+                        _projection_session_id,
+                        _anthropic_projection_ids,
+                        content=ANTHROPIC_CLEARED_TOOL_RESULT,
+                        projection_form="anthropic_placeholder",
+                    )
+                _capability_projection_ids = [
+                    item.get("tool_call_id")
+                    for item in _capability_edit_report
+                    if item.get("action")
+                    in {"placeholder", "remove_result", "remove_call"}
+                ]
+                if _capability_projection_ids:
+                    _projection_db.update_tool_context_projection(
+                        _projection_session_id,
+                        _capability_projection_ids,
+                        content=(
+                            "[capability disclosure consumed; payload removed]"
+                        ),
+                        projection_form="capability_placeholder",
+                    )
         except Exception as exc:
             request_logger.warning("Tool Context Editor skipped: %s", exc)
 
@@ -2372,7 +2476,8 @@ def run_conversation(
                     session_id=agent.session_id or "",
                     artifact_dir=str(getattr(agent, "_tool_artifact_dir", "") or ""),
                     persist_artifacts=(
-                        _editor_mode in {"readonly", "failures", "active"}
+                        _editor_mode
+                        in {"readonly", "failures", "active", "anthropic"}
                     ),
                 )
                 
@@ -6842,54 +6947,6 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                # A Controller chooses the dispatch branch semantically by
-                # calling kanban_roster. From that point, the Harness owns the
-                # state transition: a plain-text progress report cannot replace
-                # kanban_create -> autosubscribe -> park. This does not classify
-                # the user's query or force simple direct tasks through Kanban.
-                try:
-                    from agent.controller_protocol import (
-                        build_controller_dispatch_nudge,
-                    )
-
-                    _controller_dispatch_nudge = build_controller_dispatch_nudge(
-                        agent,
-                        messages=messages[current_turn_user_idx:],
-                        attempts=getattr(
-                            agent, "_controller_dispatch_nudges", 0
-                        ),
-                    )
-                except Exception:
-                    logger.debug(
-                        "controller dispatch stop-loop check failed",
-                        exc_info=True,
-                    )
-                    _controller_dispatch_nudge = None
-
-                if _controller_dispatch_nudge:
-                    agent._controller_dispatch_nudges = (
-                        getattr(agent, "_controller_dispatch_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "controller_dispatch_required"
-                    final_msg["_controller_dispatch_synthetic"] = True
-                    messages.append(final_msg)
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": _controller_dispatch_nudge,
-                            "_controller_dispatch_synthetic": True,
-                        }
-                    )
-                    agent._session_messages = messages
-                    logger.info(
-                        "controller dispatch stop-loop nudge issued "
-                        "(attempt %d)",
-                        agent._controller_dispatch_nudges,
-                    )
-                    _pending_verification_response = final_response
-                    final_response = None
-                    continue
-
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
@@ -7080,17 +7137,7 @@ def run_conversation(
             # local post-processing helpers and never entered the interruptible
             # API-call helpers, it is almost certainly a local processing bug.
             # (#66267)
-            tb_module_names: set[str] = set()
-            _tb = e.__traceback__
-            while _tb is not None:
-                _fname = os.path.splitext(os.path.basename(_tb.tb_frame.f_code.co_filename))[0]
-                tb_module_names.add(_fname)
-                _tb = _tb.tb_next
-
-            _hit_local = bool(tb_module_names & _LOCAL_PROCESSING_MODULES)
-            _hit_api = bool(tb_module_names & _API_CALL_MODULES)
-
-            _is_local_processing_error = _hit_local and not _hit_api
+            _is_local_processing_error = _is_local_outer_loop_error(e)
 
             if _is_local_processing_error:
                 error_msg = (

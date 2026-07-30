@@ -387,7 +387,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           '';
           fixtureC = pkgs.writeText "fixture-c.yaml" ''
             skills:
-              disabled:
+              enabled:
                 - skill-a
                 - skill-b
             session_reset:
@@ -402,7 +402,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           fixtureD = pkgs.writeText "fixture-d.yaml" ''
             model: "user-model"
             skills:
-              disabled:
+              enabled:
                 - skill-x
             streaming:
               enabled: true
@@ -478,8 +478,8 @@ json.dump(load_config(), sys.stdout, default=str)
           install -m 0644 ${fixtureC} "$C_HOME/config.yaml"
           C_CONFIG=$(merge_and_load "$C_HOME")
 
-          echo "$C_CONFIG" | jq -e '.skills.disabled == ["skill-a", "skill-b"]' > /dev/null \
-            || fail "C: skills.disabled not preserved"
+          echo "$C_CONFIG" | jq -e '.skills.enabled == ["skill-a", "skill-b"]' > /dev/null \
+            || fail "C: skills.enabled not preserved"
           echo "$C_CONFIG" | jq -e '.session_reset.mode == "idle"' > /dev/null \
             || fail "C: session_reset.mode not preserved"
           echo "$C_CONFIG" | jq -e '.session_reset.idle_minutes == 30' > /dev/null \
@@ -500,7 +500,7 @@ json.dump(load_config(), sys.stdout, default=str)
 
           echo "$D_CONFIG" | jq -e '.model == "test/nix-model"' > /dev/null \
             || fail "D: Nix model did not override user model"
-          echo "$D_CONFIG" | jq -e '.skills.disabled == ["skill-x"]' > /dev/null \
+          echo "$D_CONFIG" | jq -e '.skills.enabled == ["skill-x"]' > /dev/null \
             || fail "D: user skills not preserved"
           echo "$D_CONFIG" | jq -e '.streaming.enabled == true' > /dev/null \
             || fail "D: user streaming not preserved"

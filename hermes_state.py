@@ -41,7 +41,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -283,7 +283,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1313,6 +1313,8 @@ CREATE TABLE IF NOT EXISTS messages (
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
+    context_content TEXT,
+    context_projection_form TEXT,
     display_kind TEXT,
     display_metadata TEXT
 );
@@ -7197,6 +7199,41 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def update_tool_context_projection(
+        self,
+        session_id: str,
+        tool_call_ids: Iterable[str],
+        *,
+        content: str,
+        projection_form: str,
+    ) -> int:
+        """Persist a model-only projection for canonical tool result rows.
+
+        ``messages.content`` remains the audit/export/search source of truth.
+        Live model replay may select ``context_content`` instead, preventing a
+        new gateway turn from hydrating tool bodies that the provider
+        projection has already cleared.
+        """
+        call_ids = tuple(
+            dict.fromkeys(str(call_id) for call_id in tool_call_ids if call_id)
+        )
+        if not call_ids:
+            return 0
+        encoded_content = self._encode_content(content)
+
+        def _do(conn):
+            placeholders = ",".join("?" for _ in call_ids)
+            cursor = conn.execute(
+                "UPDATE messages "
+                "SET context_content=?, context_projection_form=? "
+                "WHERE session_id=? AND role='tool' AND active=1 "
+                f"AND tool_call_id IN ({placeholders})",
+                (encoded_content, projection_form, session_id, *call_ids),
+            )
+            return int(cursor.rowcount or 0)
+
+        return self._execute_write(_do)
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -7806,6 +7843,7 @@ class SessionDB:
         include_ancestors: bool = False,
         include_inactive: bool = False,
         repair_alternation: bool = False,
+        model_context: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -7830,10 +7868,15 @@ class SessionDB:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
+        content_column = (
+            "COALESCE(context_content, content) AS content"
+            if model_context
+            else "content"
+        )
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, tool_receipt, "
+                f"SELECT role, {content_column}, tool_call_id, tool_calls, tool_name, effect_disposition, tool_receipt, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
                 "api_content, display_kind, display_metadata "

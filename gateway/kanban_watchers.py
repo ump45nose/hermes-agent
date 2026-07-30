@@ -1037,7 +1037,14 @@ class GatewayKanbanWatchersMixin:
         from hermes_constants import get_canonical_hermes_root, get_profile_home
         from hermes_state import SessionDB
 
-        profile = str(sub.get("source_profile") or "default")
+        # Legacy subscriptions may not have source_profile, but they do carry
+        # the gateway Profile that created the subscription. Routing those to
+        # default/state.db makes append_message fail its session FK forever.
+        profile = str(
+            sub.get("source_profile")
+            or sub.get("notifier_profile")
+            or "default"
+        )
         session_id = str(sub.get("session_id") or "")
         if not session_id:
             raise RuntimeError("controller subscription missing session_id")

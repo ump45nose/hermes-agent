@@ -7124,6 +7124,30 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
 
+    direct_names: set[str] = set()
+    if progressive:
+        direct_defs = get_tool_definitions(
+            enabled_toolsets=sorted(getattr(agent, "direct_toolsets", ()) or ()),
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        direct_names.update(
+            (tool.get("function") or {}).get("name")
+            for tool in direct_defs
+            if (tool.get("function") or {}).get("name")
+        )
+        # Preserve direct post-build families such as memory/context-engine
+        # schemas, which are not reproduced by registry assembly.
+        direct_names.update(
+            (tool.get("function") or {}).get("name")
+            for tool in (getattr(agent, "direct_tools", None) or [])
+            if (tool.get("function") or {}).get("name")
+        )
+        direct_names.update(
+            getattr(agent, "always_loaded_tool_names", None) or ()
+        )
+
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
@@ -7152,12 +7176,32 @@ def refresh_agent_mcp_tools(
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         if progressive:
-            from tools.tool_search import BRIDGE_TOOL_NAMES, bridge_tool_schemas
+            from tools.tool_search import assemble_progressive_exposure
 
-            agent.reachable_tools = new_defs
+            direct_defs = [
+                tool for tool in new_defs
+                if (tool.get("function") or {}).get("name") in direct_names
+            ]
+            deferred_defs = [
+                tool for tool in new_defs
+                if (tool.get("function") or {}).get("name") not in direct_names
+            ]
+            (
+                agent.tools,
+                agent.reachable_tools,
+                agent.deferred_tools,
+            ) = assemble_progressive_exposure(direct_defs, deferred_defs)
+            agent.direct_tools = direct_defs
+            from tools.tool_search import rebuild_hydrated_tool_surface
+
+            rebuild_hydrated_tool_surface(
+                agent,
+                getattr(agent, "_hydrated_tool_names", None) or [],
+            )
             agent.reachable_tool_names = new_names
-            agent.tools = bridge_tool_schemas()
-            agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+            agent.valid_tool_names = {
+                tool["function"]["name"] for tool in agent.tools
+            }
         else:
             agent.tools = new_defs
             agent.valid_tool_names = new_names

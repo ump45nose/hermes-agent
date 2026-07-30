@@ -68,7 +68,6 @@ _CLONE_SUBDIR_FILES = [
     "memories/MEMORY.md",
     "memories/USER.md",
     "prompt/system.md",
-    "prompt/prompt.lock.yaml",
 ]
 
 # Runtime files stripped after --clone-all (shouldn't carry over).
@@ -78,6 +77,8 @@ _CLONE_ALL_STRIP: list[str] = [
     "gateway.pid",
     "gateway_state.json",
     "processes.json",
+    "prompt/stable.md",
+    "prompt/prompt.lock.yaml",
 ]
 
 # Infrastructure artifacts excluded from --clone-all when the source is the
@@ -1162,19 +1163,31 @@ def create_profile(
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
 
-    # Clone keeps compiled bytes and lock unchanged. A legacy source without
-    # them gets a one-time compile, never a runtime rebuild.
+    # Fresh Profiles compile both prompt layers. Clones preserve the source's
+    # authored system.md but always regenerate Stable and its target lock.
     from hermes_cli.prompt_compiler import (
         ensure_profile_governance_config,
-        load_compiled_prompt,
+        prompt_paths,
         write_compiled_prompt,
+        write_stable_prompt,
     )
     ensure_profile_governance_config(profile_dir)
-    if load_compiled_prompt(profile_dir) is None:
-        known_presets = {"lingjun", "companion", "ops", "research", "xp"}
+    known_presets = {"lingjun", "companion", "ops", "research", "xp"}
+    selected_preset = prompt_preset or (
+        canon if canon in known_presets else "default"
+    )
+    system_path, _lock_path = prompt_paths(profile_dir)
+    if system_path.is_file():
+        write_stable_prompt(
+            profile_dir,
+            preset=selected_preset,
+            extra_modules=prompt_modules or (),
+            model_family=prompt_model_family,
+        )
+    else:
         write_compiled_prompt(
             profile_dir,
-            preset=prompt_preset or (canon if canon in known_presets else "default"),
+            preset=selected_preset,
             extra_modules=prompt_modules or (),
             model_family=prompt_model_family,
         )

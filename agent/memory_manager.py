@@ -113,11 +113,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
     # Require the concrete runtime flag. Test doubles and partially
     # constructed agents often return a truthy MagicMock for unknown attrs.
     progressive = getattr(agent, "_progressive_disclosure", False) is True
-    tools = getattr(
-        agent,
-        "reachable_tools" if progressive else "tools",
-        None,
-    )
+    tools = getattr(agent, "reachable_tools" if progressive else "tools", None)
     if not memory_manager or tools is None:
         return 0
 
@@ -156,8 +152,21 @@ def inject_memory_provider_tools(agent: Any) -> int:
         tool_name = schema["name"]
         if tool_name in existing_tool_names:
             continue
-        tools.append({"type": "function", "function": schema})
+        wrapped = {"type": "function", "function": schema}
+        tools.append(wrapped)
         valid_tool_names.add(tool_name)
+        if progressive:
+            direct = "memory" in (getattr(agent, "direct_toolsets", None) or ())
+            exposure_tools = getattr(
+                agent,
+                "direct_tools" if direct else "deferred_tools",
+                None,
+            )
+            if exposure_tools is not None:
+                exposure_tools.append(wrapped)
+            if direct:
+                agent.tools.append(wrapped)
+                agent.valid_tool_names.add(tool_name)
         existing_tool_names.add(tool_name)
         added += 1
 

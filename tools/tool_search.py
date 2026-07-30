@@ -1,8 +1,10 @@
 """Progressive tool disclosure ("tool search") for Hermes Agent.
 
-When enabled, MCP and non-core plugin tools are replaced in the model-visible
-tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+The model sees a small eager tool surface plus ``tool_search``. Search results
+carry structured tool references; the agent harness hydrates those references
+into real tool schemas on the next model request. The model then calls the real
+tool directly. ``tool_describe`` and ``tool_call`` remain executable only for
+old conversation compatibility and are no longer advertised to new turns.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
@@ -64,6 +66,13 @@ BRIDGE_TOOL_NAMES = frozenset({
     SKILL_SEARCH_NAME,
 })
 
+MODEL_VISIBLE_BRIDGE_NAMES = frozenset({
+    TOOL_SEARCH_NAME,
+    SKILL_SEARCH_NAME,
+})
+
+DEFAULT_MAX_HYDRATED_TOOLS = 16
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -115,13 +124,13 @@ class ToolSearchConfig:
         """
         if raw is True:
             return cls(enabled="auto", threshold_pct=5.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=5)
         if raw is False:
             return cls(enabled="off", threshold_pct=5.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=5)
         if not isinstance(raw, dict):
             return cls(enabled="auto", threshold_pct=5.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=5)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -136,7 +145,7 @@ class ToolSearchConfig:
         threshold_pct = _safe_float(raw.get("threshold_pct"), 5.0)
         threshold_pct = max(0.0, min(100.0, threshold_pct))
 
-        max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
+        max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 5)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
 
@@ -410,31 +419,80 @@ class CatalogEntry:
     _tokens: List[str] = field(default_factory=list)
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u3400-\u4dbf\u4e00-\u9fff]+")
+_LATIN_QUERY_STOPWORDS = frozenset({
+    "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "tool",
+    "tools", "use", "using", "want", "with",
+})
+
+
+def _cjk_tokens(run: str) -> List[str]:
+    """Return exact, bigram, and character tokens for a CJK run."""
+    if not run:
+        return []
+    tokens = [run]
+    if len(run) > 1:
+        tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
+        tokens.extend(run)
+    return tokens
 
 
 def _tokenize(text: str) -> List[str]:
     if not text:
         return []
-    return [t.lower() for t in _TOKEN_RE.findall(text)]
+    tokens: List[str] = []
+    for raw in _TOKEN_RE.findall(text):
+        lowered = raw.lower()
+        if re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff]+", lowered):
+            tokens.extend(_cjk_tokens(lowered))
+        elif lowered not in _LATIN_QUERY_STOPWORDS:
+            tokens.append(lowered)
+    return tokens
 
 
 def _entry_search_text(td: Dict[str, Any]) -> str:
     """Build the search-text blob for a deferrable tool.
 
     Includes the tool name (with underscores broken into words so BM25 can
-    match against query terms), the description, and the names of the
-    top-level parameters. Schema bodies are deliberately excluded —
-    indexing them adds noise without improving recall in our measurement.
+    match against query terms), the description, and argument names and
+    descriptions. This mirrors the useful part of Anthropic's Tool Search
+    retrieval contract without coupling Hermes to an Anthropic provider.
     """
     fn = td.get("function") or {}
     name = fn.get("name", "")
     desc = fn.get("description", "") or ""
-    params = ((fn.get("parameters") or {}).get("properties") or {})
-    param_names = " ".join(params.keys())
+    argument_terms: List[str] = []
+
+    def _collect_arguments(node: Any) -> None:
+        if isinstance(node, dict):
+            description = node.get("description")
+            if isinstance(description, str) and description:
+                argument_terms.append(description)
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                for argument_name, argument_schema in properties.items():
+                    argument_terms.append(str(argument_name))
+                    _collect_arguments(argument_schema)
+            items = node.get("items")
+            if items is not None:
+                _collect_arguments(items)
+            for union_key in ("allOf", "anyOf", "oneOf"):
+                variants = node.get(union_key)
+                if isinstance(variants, list):
+                    for variant in variants:
+                        _collect_arguments(variant)
+        elif isinstance(node, list):
+            for item in node:
+                _collect_arguments(item)
+
+    _collect_arguments(fn.get("parameters") or {})
+    argument_text = " ".join(argument_terms)
     # Break snake_case and dotted names into words for BM25.
     name_words = name.replace("_", " ").replace(".", " ").replace("-", " ").replace(":", " ")
-    return f"{name_words} {desc} {param_names}"
+    # Exact capability names are the most reliable retrieval signal. Repeat
+    # them to give dedicated tools priority over generic descriptions that
+    # happen to contain more query words.
+    return f"{name_words} {name_words} {name_words} {desc} {argument_text}"
 
 
 def _classify_source(name: str) -> Tuple[str, str]:
@@ -534,10 +592,25 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
             doc_freq[t] = doc_freq.get(t, 0) + 1
     n_docs = len(catalog)
 
+    distinct_query_tokens = set(query_tokens)
+    require_multiple_terms = len(distinct_query_tokens) >= 3
+    normalized_query = " ".join(query_tokens)
     scored: List[Tuple[float, CatalogEntry]] = []
     for entry in catalog:
+        matched_terms = distinct_query_tokens.intersection(entry._tokens)
+        # A multi-term capability query sharing only one generic word
+        # ("send", "search", "image") is not a useful match.
+        if require_multiple_terms and len(matched_terms) < 2:
+            continue
         s = _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl,
                         doc_freq, n_docs)
+        name_phrase = " ".join(
+            _tokenize(
+                entry.name.replace("_", " ").replace(".", " ").replace("-", " ")
+            )
+        )
+        if name_phrase and name_phrase in normalized_query:
+            s += 10.0
         if s > 0:
             scored.append((s, entry))
 
@@ -619,8 +692,8 @@ def build_catalog_listing_with_form(
         return "\n".join(lines)
 
     header = (
-        "Deferred tool catalog (call schemas via "
-        f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):"
+        "Deferred tool catalog (find a tool with "
+        f"`{TOOL_SEARCH_NAME}` to load its real schema):"
     )
 
     def assemble(modes: Dict[str, str]) -> str:
@@ -678,11 +751,11 @@ def bridge_tool_schemas(
     listing: Optional[str] = None,
     listing_form: str = "",
 ) -> List[Dict[str, Any]]:
-    """Build the bridge tool schemas to inject in place of deferred tools.
+    """Build the model-visible discovery schemas.
 
-    The schemas are intentionally short — every byte added here is a byte
-    the user pays on every turn. Descriptions are tuned to be unambiguous
-    about the call sequence the model should follow.
+    New turns only receive ``tool_search`` and ``skill_search``. Legacy
+    ``tool_describe`` and ``tool_call`` dispatch remains below so historical
+    sessions can still be replayed safely.
 
     When ``listing`` is provided (see :func:`build_catalog_listing`), it is
     embedded in the ``tool_search`` description so every deferred capability
@@ -698,9 +771,12 @@ def bridge_tool_schemas(
     # that would invalidate the provider prompt-cache prefix whenever an MCP
     # server or a check_fn changed.
     desc_search = (
-        "Search tools available to this session. Returns short matches without "
-        f"parameters. Use `{TOOL_DESCRIBE_NAME}` for one schema, then "
-        f"`{TOOL_CALL_NAME}` to invoke it."
+        "Search tools available to this session. Matching tool references are "
+        "loaded as real tool schemas for the next model step; then call the "
+        "loaded tool directly by its real name. Search before concluding that "
+        "a deferred capability is unavailable. Searchable domains may include "
+        "files/source code, shell/processes, web/research, messaging, schedules, "
+        "documents, memory, infrastructure state, and media."
     )
     if listing and listing_form == "groups":
         desc_search += (
@@ -713,9 +789,8 @@ def bridge_tool_schemas(
     elif listing:
         desc_search += (
             "\n\nEvery deferred capability is listed below. If a tool name "
-            "appears here, do NOT claim it is unavailable — load it with "
-            f"`{TOOL_DESCRIBE_NAME}` (skip `{TOOL_SEARCH_NAME}` when you "
-            "already see the exact name)."
+            "appears here, do NOT claim it is unavailable — find it with "
+            f"`{TOOL_SEARCH_NAME}` so its real schema is loaded."
         )
         if listing_form == "mixed":
             desc_search += (
@@ -724,17 +799,9 @@ def bridge_tool_schemas(
                 "concluding anything is missing."
             )
         desc_search += "\n\n" + listing
-    desc_describe = (
-        f"Load the full JSON schema for one tool returned by `{TOOL_SEARCH_NAME}`. "
-        f"Required before `{TOOL_CALL_NAME}` if the tool's parameters are unknown."
-    )
-    desc_call = (
-        "Invoke an available tool by name. Arguments must match the schema from "
-        f"`{TOOL_DESCRIBE_NAME}`. Normal policy and approval checks still apply."
-    )
     desc_skill = (
         "Search up to three task-relevant Skills available to this session. "
-        "Returns a short index; load a selected Skill with tool_call(skill_view)."
+        "Returns a short index; load a selected Skill with the real skill_view tool."
     )
 
     return [
@@ -756,44 +823,6 @@ def bridge_tool_schemas(
                         },
                     },
                     "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": TOOL_DESCRIBE_NAME,
-                "description": desc_describe,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Exact tool name (as returned by tool_search).",
-                        },
-                    },
-                    "required": ["name"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": TOOL_CALL_NAME,
-                "description": desc_call,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Exact tool name to invoke.",
-                        },
-                        "arguments": {
-                            "type": "object",
-                            "description": "Arguments for the tool, matching its schema.",
-                        },
-                    },
-                    "required": ["name", "arguments"],
                 },
             },
         },
@@ -837,6 +866,49 @@ class AssemblyResult:
     #   2 = bare bridge — catalog too large for any listing form
     tier: int = 0
     listing_form: str = "none"  # "full" | "names" | "none"
+
+
+def assemble_progressive_exposure(
+    direct_tool_defs: List[Dict[str, Any]],
+    deferred_tool_defs: List[Dict[str, Any]],
+) -> tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    """Build model-visible, reachable, and deferred-only tool snapshots.
+
+    Profile exposure is authoritative: tools from ``direct_tool_defs`` stay
+    model-visible, while only ``deferred_tool_defs`` enter the transient
+    discovery catalog. If overlapping toolsets resolve to the same concrete
+    tool, direct exposure wins.
+    """
+    direct: List[Dict[str, Any]] = []
+    direct_names: set[str] = set()
+    for tool_def in direct_tool_defs:
+        name = (tool_def.get("function") or {}).get("name", "")
+        if not name or name in BRIDGE_TOOL_NAMES or name in direct_names:
+            continue
+        direct.append(tool_def)
+        direct_names.add(name)
+
+    deferred: List[Dict[str, Any]] = []
+    deferred_names: set[str] = set()
+    for tool_def in deferred_tool_defs:
+        name = (tool_def.get("function") or {}).get("name", "")
+        if (
+            not name
+            or name in BRIDGE_TOOL_NAMES
+            or name in direct_names
+            or name in deferred_names
+        ):
+            continue
+        deferred.append(tool_def)
+        deferred_names.add(name)
+
+    reachable = [*direct, *deferred]
+    model_visible = [*direct, *bridge_tool_schemas()]
+    return model_visible, reachable, deferred
 
 
 def assemble_tool_defs(
@@ -942,6 +1014,14 @@ def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
     }
 
 
+def _format_tool_reference(entry: CatalogEntry) -> Dict[str, str]:
+    return {
+        "type": "tool_reference",
+        "name": entry.name,
+        "schema_hash": entry.schema_hash,
+    }
+
+
 def dispatch_tool_search(args: Dict[str, Any],
                          *,
                          current_tool_defs: List[Dict[str, Any]],
@@ -967,7 +1047,163 @@ def dispatch_tool_search(args: Dict[str, Any],
         "query": query,
         "total_available": len(catalog),
         "matches": [_format_search_hit(h) for h in hits],
+        "tool_references": [_format_tool_reference(h) for h in hits],
     }, ensure_ascii=False)
+
+
+def rebuild_hydrated_tool_surface(
+    agent: Any,
+    names: Optional[Iterable[str]] = None,
+    *,
+    max_loaded: int = DEFAULT_MAX_HYDRATED_TOOLS,
+) -> List[str]:
+    """Rebuild the model-visible surface from eager and hydrated real tools.
+
+    Every requested name is re-resolved against the agent's authoritative
+    deferred snapshot, so a stale or out-of-scope reference cannot grant a
+    capability. The most recently referenced names win when the bounded
+    session cache is full.
+    """
+    if getattr(agent, "_progressive_disclosure", False) is not True:
+        return []
+
+    deferred_by_name = {
+        (tool_def.get("function") or {}).get("name", ""): tool_def
+        for tool_def in (getattr(agent, "deferred_tools", None) or [])
+        if (tool_def.get("function") or {}).get("name")
+    }
+    requested = list(
+        names
+        if names is not None
+        else (getattr(agent, "_hydrated_tool_names", None) or [])
+    )
+    ordered: List[str] = []
+    for name in requested:
+        normalized = str(name or "")
+        if not normalized or normalized not in deferred_by_name:
+            continue
+        if normalized in ordered:
+            ordered.remove(normalized)
+        ordered.append(normalized)
+    ordered = ordered[-max(1, int(max_loaded)):]
+
+    direct = list(getattr(agent, "direct_tools", None) or [])
+    hydrated = [deferred_by_name[name] for name in ordered]
+    model_visible = [*direct, *hydrated, *bridge_tool_schemas()]
+    agent._hydrated_tool_names = ordered
+    agent.tools = model_visible
+    agent.valid_tool_names = {
+        (tool_def.get("function") or {}).get("name")
+        for tool_def in model_visible
+        if (tool_def.get("function") or {}).get("name")
+    }
+    return ordered
+
+
+def hydrate_tool_search_result(agent: Any, result: Any) -> Any:
+    """Hydrate structured references from one successful tool_search result."""
+    if getattr(agent, "_progressive_disclosure", False) is not True:
+        return result
+    if isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return result
+    elif isinstance(result, dict):
+        payload = copy.deepcopy(result)
+    else:
+        return result
+    if not isinstance(payload, dict) or payload.get("error"):
+        return result
+
+    deferred_by_name = {
+        (tool_def.get("function") or {}).get("name", ""): tool_def
+        for tool_def in (getattr(agent, "deferred_tools", None) or [])
+        if (tool_def.get("function") or {}).get("name")
+    }
+    accepted: List[str] = []
+    rejected: List[str] = []
+    for reference in payload.get("tool_references") or []:
+        if not isinstance(reference, dict) or reference.get("type") != "tool_reference":
+            continue
+        name = str(reference.get("name") or "")
+        tool_def = deferred_by_name.get(name)
+        expected_hash = str(reference.get("schema_hash") or "")
+        if (
+            tool_def is None
+            or not expected_hash
+            or _schema_hash(tool_def) != expected_hash
+        ):
+            if name:
+                rejected.append(name)
+            continue
+        accepted.append(name)
+
+    loaded = list(getattr(agent, "_hydrated_tool_names", None) or [])
+    for name in accepted:
+        if name in loaded:
+            loaded.remove(name)
+        loaded.append(name)
+    active = rebuild_hydrated_tool_surface(agent, loaded)
+    payload["loaded_tools"] = accepted
+    if accepted:
+        payload["instruction"] = (
+            "The referenced tools are now loaded with their real schemas. "
+            "Call them directly by name; do not use tool_describe or tool_call."
+        )
+    if rejected:
+        payload["rejected_references"] = rejected
+    payload["active_hydrated_tools"] = active
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def hydrate_agent_tools_from_messages(
+    agent: Any,
+    messages: Iterable[Dict[str, Any]],
+) -> List[str]:
+    """Rebuild session hydration from compact references in conversation history."""
+    if getattr(agent, "_progressive_disclosure", False) is not True:
+        return []
+
+    search_ids: set[str] = set()
+    referenced_names: List[str] = []
+    deferred_names = {
+        (tool_def.get("function") or {}).get("name", "")
+        for tool_def in (getattr(agent, "deferred_tools", None) or [])
+    }
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or call.get("call_id") or "")
+                function = call.get("function") or {}
+                name = str(function.get("name") or call.get("name") or "")
+                if name == TOOL_SEARCH_NAME and call_id:
+                    search_ids.add(call_id)
+                elif name in deferred_names:
+                    referenced_names.append(name)
+        if (
+            message.get("role") == "tool"
+            and str(message.get("tool_call_id") or "") in search_ids
+        ):
+            try:
+                payload = json.loads(str(message.get("content") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                for reference in payload.get("tool_references") or []:
+                    if isinstance(reference, dict):
+                        name = str(reference.get("name") or "")
+                        if name:
+                            referenced_names.append(name)
+
+    loaded = list(getattr(agent, "_hydrated_tool_names", None) or [])
+    loaded.extend(referenced_names)
+    return rebuild_hydrated_tool_surface(agent, loaded)
 
 
 def dispatch_tool_describe(args: Dict[str, Any],
@@ -1142,6 +1378,8 @@ __all__ = [
     "TOOL_CALL_NAME",
     "SKILL_SEARCH_NAME",
     "BRIDGE_TOOL_NAMES",
+    "MODEL_VISIBLE_BRIDGE_NAMES",
+    "DEFAULT_MAX_HYDRATED_TOOLS",
     "ToolSearchConfig",
     "CatalogEntry",
     "AssemblyResult",
@@ -1159,6 +1397,9 @@ __all__ = [
     "assemble_tool_defs",
     "is_bridge_tool",
     "dispatch_tool_search",
+    "hydrate_tool_search_result",
+    "hydrate_agent_tools_from_messages",
+    "rebuild_hydrated_tool_surface",
     "dispatch_tool_describe",
     "dispatch_skill_search",
     "resolve_underlying_call",

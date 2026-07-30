@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""One-time, reversible migration for fixed profile prompts and local context."""
+"""One-time, reversible local-context migration.
+
+Profile prompt/system.md files are user-authored runtime inputs and are never
+rewritten by this migration.
+"""
 
 from __future__ import annotations
 
@@ -15,10 +19,7 @@ from typing import Any
 import yaml
 
 from agent.local_context import LocalContextStore
-from hermes_cli.prompt_compiler import (
-    ensure_profile_governance_config,
-    write_compiled_prompt,
-)
+from hermes_cli.prompt_compiler import ensure_profile_governance_config
 
 
 PROFILES = ("default", "lingjun", "companion", "ops", "research", "xp")
@@ -67,7 +68,14 @@ def _set_config(name: str, home: Path) -> None:
     ensure_profile_governance_config(home)
     path = home / "config.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    config.setdefault("tool_context_editor", {})["mode"] = "failures"
+    config.setdefault("tool_context_editor", {}).update(
+        {
+            "mode": "anthropic",
+            "trigger": {"type": "input_tokens", "value": 100_000},
+            "keep": {"type": "tool_uses", "value": 3},
+            "clear_tool_inputs": False,
+        }
+    )
     config.setdefault("observability", {}).setdefault("request_snapshot", "off")
     config.setdefault("episode_store", {}).update(
         {
@@ -96,9 +104,6 @@ def _set_config(name: str, home: Path) -> None:
             "direct": ["tool_artifact"],
             "deferred": ["web", "browser", "context7", "smart-search"],
         }
-        config.setdefault("delegation", {})["research_leaf_toolsets"] = [
-            "web", "browser", "context7", "smart-search", "tool_artifact"
-        ]
     if name == "xp":
         for exposure in platform.values():
             if not isinstance(exposure, dict):
@@ -259,8 +264,8 @@ def main() -> int:
     profile_report: dict[str, Any] = {}
     for name, home in homes.items():
         _set_config(name, home)
-        write_compiled_prompt(home, preset=name, model_family="generic")
         profile_report[name] = {
+            "system_prompt": "preserved",
             "agents_link_removed": _remove_agents_link(home),
             "soul": _clean_soul(name, home),
             "memory": _clean_memory(home) if name != "default" else {"preserved": True},

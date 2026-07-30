@@ -23,7 +23,7 @@ from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
-    get_disabled_skill_names,
+    get_enabled_skill_names,
     is_model_invocation_disabled,
     iter_skill_index_files,
     parse_frontmatter,
@@ -1523,17 +1523,17 @@ def build_skills_system_prompt(
         return ""
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
-    # Include the resolved platform so per-platform disabled-skill lists
-    # produce distinct cache entries (gateway serves multiple platforms).
+    # Include the resolved platform so cron-only visibility gets a distinct
+    # cache entry from interactive sessions.
     _platform_hint = _current_session_platform_hint()
-    disabled = get_disabled_skill_names(_platform_hint or None)
+    enabled = get_enabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
-        tuple(sorted(disabled)),
+        tuple(sorted(enabled)),
         tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1559,7 +1559,7 @@ def build_skills_system_prompt(
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
-            if frontmatter_name in disabled or skill_name in disabled:
+            if frontmatter_name not in enabled and skill_name not in enabled:
                 continue
             if entry.get("model_invocation_disabled"):
                 continue
@@ -1586,7 +1586,10 @@ def build_skills_system_prompt(
             if not is_compatible:
                 continue
             skill_name = entry["skill_name"]
-            if entry["frontmatter_name"] in disabled or skill_name in disabled:
+            if (
+                entry["frontmatter_name"] not in enabled
+                and skill_name not in enabled
+            ):
                 continue
             if entry.get("model_invocation_disabled"):
                 continue
@@ -1643,7 +1646,7 @@ def build_skills_system_prompt(
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
                     continue
-                if frontmatter_name in disabled or skill_name in disabled:
+                if frontmatter_name not in enabled and skill_name not in enabled:
                     continue
                 if entry.get("model_invocation_disabled"):
                     continue

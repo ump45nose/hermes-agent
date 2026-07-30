@@ -120,7 +120,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_list.add_argument(
         "--enabled-only",
         action="store_true",
-        help="Hide disabled skills. Use with -p <profile> to see exactly "
+        help="Show only allowlisted skills. Use with -p <profile> to see exactly "
         "which skills will load for that profile.",
     )
 

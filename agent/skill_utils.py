@@ -335,7 +335,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return False
 
 
-# ── Disabled skills ───────────────────────────────────────────────────────
+# ── Skill allowlist ───────────────────────────────────────────────────────
 
 
 _RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
@@ -381,16 +381,17 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
-def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
-    """Read disabled skill names from config.yaml.
+def get_enabled_skill_names(platform: str | None = None) -> Set[str]:
+    """Read the strict skill allowlist from config.yaml.
 
     Args:
         platform: Explicit platform name (e.g. ``"telegram"``).  When
             *None*, resolves from ``HERMES_PLATFORM`` or
-            ``HERMES_SESSION_PLATFORM`` env vars. Returns the global disabled
-            list plus ``skills.cron_only`` outside cron, unioned with the
-            platform-specific list when a platform is resolved. A globally
-            disabled skill stays disabled on every platform.
+            ``HERMES_SESSION_PLATFORM`` env vars.
+
+    ``skills.enabled`` is the only interactive allowlist.  Cron additionally
+    receives ``skills.cron_only``.  Missing or malformed configuration is
+    intentionally fail-closed and enables no skills.
 
     Reads the config file directly (no CLI config imports) to stay
     lightweight.
@@ -409,18 +410,11 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         or os.getenv("HERMES_PLATFORM")
         or get_session_env("HERMES_SESSION_PLATFORM")
     )
-    global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
+    enabled = _normalize_string_set(skills_cfg.get("enabled"))
     cron_only = _normalize_string_set(skills_cfg.get("cron_only"))
-    disabled = set(global_disabled)
-    if resolved_platform != "cron":
-        disabled.update(cron_only)
-    if resolved_platform:
-        platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
-            resolved_platform
-        )
-        if platform_disabled is not None:
-            disabled.update(_normalize_string_set(platform_disabled))
-    return disabled
+    if resolved_platform == "cron":
+        enabled.update(cron_only)
+    return enabled
 
 
 def _normalize_string_set(values) -> Set[str]:
@@ -716,12 +710,12 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     a deduplicated list of config var dicts.  Each dict also includes a
     ``skill`` key with the skill name for attribution.
 
-    Disabled and platform-incompatible skills are excluded.
+    Skills outside the allowlist and platform-incompatible skills are excluded.
     """
     all_vars: List[Dict[str, Any]] = []
     seen_keys: set = set()
 
-    disabled = get_disabled_skill_names()
+    enabled = get_enabled_skill_names()
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.is_dir():
             continue
@@ -733,7 +727,7 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
                 continue
 
             skill_name = frontmatter.get("name") or skill_file.parent.name
-            if str(skill_name) in disabled:
+            if str(skill_name) not in enabled:
                 continue
             if not skill_matches_platform(frontmatter):
                 continue

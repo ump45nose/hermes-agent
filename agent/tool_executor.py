@@ -34,7 +34,6 @@ from agent.display import (
 )
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_result_classification import (
-    declared_tool_retention,
     file_mutation_result_landed,
     tool_may_have_side_effect,
 )
@@ -119,6 +118,35 @@ def _record_capability_metric(agent, tool_name: str, result: Any) -> None:
         metrics["skill_view"],
         metrics["transient_bytes"],
     )
+
+
+def _hydrate_tool_search_result(agent, tool_name: str, result: Any) -> Any:
+    """Turn discovery results into real model-visible schemas."""
+    if getattr(agent, "_progressive_disclosure", False) is not True:
+        return result
+    try:
+        from tools.tool_search import (
+            hydrate_tool_search_result,
+            rebuild_hydrated_tool_surface,
+        )
+
+        if tool_name == "tool_search":
+            return hydrate_tool_search_result(agent, result)
+        if tool_name != "skill_search":
+            return result
+        payload = json.loads(result) if isinstance(result, str) else dict(result)
+        loaded = list(getattr(agent, "_hydrated_tool_names", None) or [])
+        loaded.append("skill_view")
+        active = rebuild_hydrated_tool_surface(agent, loaded)
+        if "skill_view" in active:
+            payload["loaded_tools"] = ["skill_view"]
+            payload["instruction"] = (
+                "skill_view is now loaded with its real schema; call it directly."
+            )
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        logger.warning("tool reference hydration failed: %s", exc)
+        return result
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -344,7 +372,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         return frozenset()
 
-    enabled = getattr(agent, "enabled_toolsets", None)
+    progressive = bool(getattr(agent, "_progressive_disclosure", False))
+    enabled = (
+        getattr(agent, "deferred_toolsets", None)
+        if progressive
+        else getattr(agent, "enabled_toolsets", None)
+    )
     disabled = getattr(agent, "disabled_toolsets", None)
     cache_key = (
         getattr(_registry, "_generation", 0),
@@ -355,7 +388,6 @@ def _tool_search_scoped_names(agent) -> frozenset:
     if cached is not None and cached[0] == cache_key:
         return cached[1]
     try:
-        progressive = bool(getattr(agent, "_progressive_disclosure", False))
         scoped_defs = model_tools.get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
@@ -369,13 +401,11 @@ def _tool_search_scoped_names(agent) -> frozenset:
                 for td in scoped_defs
                 if (td.get("function") or {}).get("name")
             }
-            for td in getattr(agent, "reachable_tools", []) or []:
+            for td in getattr(agent, "deferred_tools", []) or []:
                 name = (td.get("function") or {}).get("name")
                 if name and name not in known:
                     scoped_defs.append(td)
                     known.add(name)
-            agent.reachable_tools = scoped_defs
-            agent.reachable_tool_names = known
         names = _ts.scoped_deferrable_names(
             scoped_defs,
             progressive=progressive,
@@ -1305,6 +1335,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 effect_disposition = "unknown"
 
             if not blocked:
+                function_result = _hydrate_tool_search_result(
+                    agent,
+                    function_name,
+                    function_result,
+                )
+            if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -1372,15 +1408,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
             result_status=result_status,
             artifact_ref=artifact_ref_from_content(function_result),
-            retain_until=declared_tool_retention(name),
         )
         messages.append(tool_message)
-        try:
-            from agent.controller_protocol import note_controller_tool_result
-
-            note_controller_tool_result(agent, name, result_status)
-        except Exception:
-            pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,
@@ -1582,23 +1611,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
-        else:
-            try:
-                from agent.controller_protocol import runtime_protocol_tool_policy_block
-
-                _runtime_policy_block = runtime_protocol_tool_policy_block(
-                    agent,
-                    function_name,
-                )
-            except Exception:
-                _runtime_policy_block = None
-            if _runtime_policy_block is not None:
-                (
-                    _block_protocol,
-                    _block_required_next_tool,
-                    _block_msg,
-                ) = _runtime_policy_block
-                _block_error_type = "runtime_protocol_block"
         if _block_msg is None:
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
@@ -1701,13 +1713,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             _block_payload = {"error": _block_msg}
-            if _block_error_type == "runtime_protocol_block":
-                _block_payload.update(
-                    {
-                        "protocol": _block_protocol,
-                        "required_next_tool": _block_required_next_tool,
-                    }
-                )
             function_result = json.dumps(_block_payload, ensure_ascii=False)
             tool_duration = 0.0
             _emit_terminal_post_tool_call(
@@ -2012,7 +2017,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     progressive_disclosure=getattr(agent, "_progressive_disclosure", False),
-                    reachable_tool_defs=getattr(agent, "reachable_tools", None),
+                    reachable_tool_defs=(
+                        getattr(agent, "deferred_tools", None)
+                        if getattr(agent, "_progressive_disclosure", False)
+                        else getattr(agent, "reachable_tools", None)
+                    ),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -2061,7 +2070,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     progressive_disclosure=getattr(agent, "_progressive_disclosure", False),
-                    reachable_tool_defs=getattr(agent, "reachable_tools", None),
+                    reachable_tool_defs=(
+                        getattr(agent, "deferred_tools", None)
+                        if getattr(agent, "_progressive_disclosure", False)
+                        else getattr(agent, "reachable_tools", None)
+                    ),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
@@ -2084,6 +2097,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        if not _execution_blocked:
+            function_result = _hydrate_tool_search_result(
+                agent,
+                function_name,
+                function_result,
+            )
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2191,19 +2210,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effect_disposition=_effect,
             result_status="error" if _is_error_result else "success",
             artifact_ref=artifact_ref_from_content(function_result),
-            retain_until=declared_tool_retention(function_name),
         )
         messages.append(tool_message)
-        try:
-            from agent.controller_protocol import note_controller_tool_result
-
-            note_controller_tool_result(
-                agent,
-                function_name,
-                "error" if _is_error_result else "success",
-            )
-        except Exception:
-            pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,

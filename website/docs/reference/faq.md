@@ -697,21 +697,20 @@ display:
 
 ### Managing skills on Telegram (slash command limit)
 
-**Scenario:** Telegram has a 100 slash command limit, and your skills are pushing past it. You want to disable skills you don't need on Telegram, but `hermes skills config` settings don't seem to take effect.
+**Scenario:** Telegram has a 100 slash command limit, and your skills are pushing past it.
 
-**Solution:** Use `hermes skills config` to disable skills per-platform. This writes to `config.yaml`:
+**Solution:** Keep only the skills this profile needs in the strict allowlist:
 
 ```yaml
 skills:
-  disabled: []                    # globally disabled skills
-  platform_disabled:
-    telegram: [skill-a, skill-b]  # disabled only on telegram
+  enabled: [skill-a, skill-b]
 ```
 
-After changing this, **restart the gateway** (`hermes gateway restart` or kill and relaunch). The Telegram bot command menu rebuilds on startup.
+The same allowlist applies to every interactive platform for that profile.
+After changing it, **restart the gateway** so the Telegram menu is rebuilt.
 
 :::tip
-Skills with very long descriptions are truncated to 40 characters in the Telegram menu to stay within payload size limits. If skills aren't appearing, it may be a total payload size issue rather than the 100 command count limit — disabling unused skills helps with both.
+Skills with very long descriptions are truncated to 40 characters in the Telegram menu to stay within payload size limits. If skills aren't appearing, it may be a total payload size issue rather than the 100 command count limit — keeping the allowlist small helps with both.
 :::
 
 ### Shared thread sessions (multiple users, one conversation)

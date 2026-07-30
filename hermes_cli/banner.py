@@ -90,11 +90,11 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 # =========================================================================
 
 def get_available_skills() -> Dict[str, List[str]]:
-    """Return skills grouped by category, filtered by platform and disabled state.
+    """Return skills grouped by category, filtered by platform and allowlist.
 
     Delegates to ``_find_all_skills()`` from ``tools/skills_tool`` which already
     handles platform gating (``platforms:`` frontmatter) and respects the
-    user's ``skills.disabled`` config list.
+    user's strict ``skills.enabled`` allowlist.
     """
     try:
         from tools.skills_tool import _find_all_skills

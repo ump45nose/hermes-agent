@@ -2739,7 +2739,7 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
-    Returns a helpful message if the skill exists but is disabled or only
+    Returns a helpful message if the skill is not allowlisted or only
     available as an optional install. Returns None if no match found.
 
     The slug for each on-disk skill is derived from its frontmatter ``name:``
@@ -2753,11 +2753,11 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     # Normalize: command uses hyphens, skill names may use hyphens or underscores
     normalized = command_name.lower().replace("_", "-")
     try:
-        from tools.skills_tool import _get_disabled_skill_names
+        from tools.skills_tool import _get_enabled_skill_names
         from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-        disabled = _get_disabled_skill_names()
+        enabled = _get_enabled_skill_names()
 
-        # Check disabled skills across all dirs (local + external)
+        # Check non-allowlisted skills across all dirs (local + external).
         for skills_dir in get_all_skills_dirs():
             if not skills_dir.exists():
                 continue
@@ -2767,11 +2767,9 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                 slug, declared_name = _skill_slug_from_frontmatter(skill_md)
                 if not slug or not declared_name:
                     continue
-                # disabled is keyed by the declared frontmatter name (what
-                # skills.disabled / skills.platform_disabled store).
-                if slug == normalized and declared_name in disabled:
+                if slug == normalized and declared_name not in enabled:
                     return (
-                        f"The **{command_name}** skill is installed but disabled.\n"
+                        f"The **{command_name}** skill is installed but not enabled.\n"
                         f"Enable it with: `hermes skills config`"
                     )
 
@@ -12387,11 +12385,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 bundle_key = resolve_bundle_command_key(command)
                 if bundle_key is not None:
                     user_instruction = event.get_command_args().strip()
-                    # Pass the platform explicitly: bundle skill loading
-                    # bypasses get_skill_commands()' scan-time disabled
-                    # filter, and the gateway serves multiple platforms in
-                    # one process, so env-var platform resolution can't be
-                    # trusted here. Mirrors the stacked-skill gate (#58888).
+                    # Pass the platform explicitly: bundle loading bypasses
+                    # get_skill_commands()' scan-time allowlist gate and cron
+                    # has an additional cron-only allowlist.
                     _bundle_plat = source.platform.value if source.platform else None
                     bundle_result = build_bundle_invocation_message(
                         bundle_key, user_instruction, task_id=_quick_key,
@@ -12420,17 +12416,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 skill_cmds = get_skill_commands()
                 cmd_key = resolve_skill_command_key(command)
                 if cmd_key is not None:
-                    # Check per-platform disabled status before executing.
-                    # get_skill_commands() only applies the *global* disabled
-                    # list at scan time; per-platform overrides need checking
-                    # here because the cache is process-global across platforms.
+                    # Re-apply the strict allowlist for the event platform.
                     _skill_name = skill_cmds[cmd_key].get("name", "")
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
-                        from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
-                        if _skill_name in _get_plat_disabled(platform=_plat):
+                        from agent.skill_utils import get_enabled_skill_names
+                        if _skill_name not in get_enabled_skill_names(platform=_plat):
                             return (
-                                f"The **{_skill_name}** skill is disabled for {_plat}.\n"
+                                f"The **{_skill_name}** skill is not enabled.\n"
                                 f"Enable it with: `hermes skills config`"
                             )
                     user_instruction = event.get_command_args().strip()
@@ -12451,22 +12444,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if extra_keys and _plat:
                         # split_stacked_skill_commands() only resolves that
                         # each extra token is a KNOWN skill command — like
-                        # get_skill_commands() itself, it has no per-platform
-                        # view. Re-check every stacked skill (not just the
-                        # leading one above) against the same disabled list,
-                        # or a skill an operator disabled for this platform
-                        # still gets its full content loaded via the stack.
-                        from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
-                        _plat_disabled = _get_plat_disabled(platform=_plat)
-                        _disabled_extra = [
+                        # get_skill_commands() itself has no event-specific
+                        # view. Re-check every stacked skill against the same
+                        # allowlist.
+                        from agent.skill_utils import get_enabled_skill_names
+                        _plat_enabled = get_enabled_skill_names(platform=_plat)
+                        _inactive_extra = [
                             skill_cmds.get(k, {}).get("name", "")
                             for k in extra_keys
-                            if skill_cmds.get(k, {}).get("name", "") in _plat_disabled
+                            if skill_cmds.get(k, {}).get("name", "") not in _plat_enabled
                         ]
-                        if _disabled_extra:
+                        if _inactive_extra:
                             return (
-                                f"The **{', '.join(_disabled_extra)}** skill(s) in this "
-                                f"stacked invocation are disabled for {_plat}.\n"
+                                f"The **{', '.join(_inactive_extra)}** skill(s) in this "
+                                "stacked invocation are not enabled.\n"
                                 f"Enable them with: `hermes skills config`"
                             )
                     if extra_keys and _build_stacked is not None:
@@ -12489,7 +12480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event.text = msg
                             # Fall through to normal message processing with skill content
                 else:
-                    # Not an active skill — check if it's a known-but-disabled or
+                    # Not an active skill — check if it is known but not enabled or
                     # uninstalled skill and give actionable guidance.
                     _unavail_msg = _check_unavailable_skill(command)
                     if _unavail_msg:
@@ -13497,7 +13488,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._turn_lease_tokens[(_quick_key, run_generation)] = _lease_token
 
         # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        history = await self.async_session_store.load_model_context(
+            session_entry.session_id
+        )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts

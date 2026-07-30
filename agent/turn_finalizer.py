@@ -247,13 +247,8 @@ def finalize_turn(
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
-        _trajectory_messages = messages
-        if getattr(agent, "_progressive_disclosure", False):
-            from agent.capability_history import durable_projection
-
-            _trajectory_messages = durable_projection(messages)
         agent._save_trajectory(
-            _trajectory_messages,
+            messages,
             _summarize_user_message_for_log(user_message),
             completed,
         )
@@ -359,22 +354,14 @@ def finalize_turn(
         if callable(_apply_override):
             _apply_override(messages)
 
-        # The final provider call may have consumed a tool result without a
-        # subsequent API round. Canonicalize once more before persistence so
-        # raw discovery/results cannot survive in Gateway memory or reload from
-        # SQLite on the next user turn.
+        # Canonical history remains complete. Tool Context Editor is a
+        # provider-projection concern; only legacy explicit mutation modes
+        # below are allowed to rewrite canonical results.
         _canonical_dirty = bool(
             getattr(agent, "_tool_context_canonical_dirty", False)
         )
-        if getattr(agent, "_progressive_disclosure", False):
-            from agent.capability_history import durable_projection
-
-            _projected = durable_projection(messages)
-            if _projected != messages:
-                _canonical_dirty = True
-            messages = _projected
-        _editor_mode = getattr(agent, "_tool_context_editor_mode", "failures")
-        if _editor_mode != "off":
+        _editor_mode = getattr(agent, "_tool_context_editor_mode", "anthropic")
+        if _editor_mode not in {"off", "anthropic"}:
             from agent.tool_context_editor import edit_tool_context
 
             _edited, _edit_report = edit_tool_context(

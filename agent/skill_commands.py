@@ -167,11 +167,11 @@ def _extract_bundle_user_instruction(message: str) -> Optional[str]:
 
 
 def _resolve_skill_commands_platform() -> Optional[str]:
-    """Return the current platform scope used for disabled-skill filtering.
+    """Return the current platform scope used for allowlist filtering.
 
     Used to detect when the active platform has shifted so
     :func:`get_skill_commands` can drop a stale cache that was populated
-    for a different platform's ``skills.platform_disabled`` view (#14536).
+    for a different cron/interative allowlist view.
 
     Resolves from (in order) ``HERMES_PLATFORM`` env var and
     ``HERMES_SESSION_PLATFORM`` from the gateway session context. Returns
@@ -386,10 +386,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_enabled_skill_names
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
-        disabled = _get_disabled_skill_names()
+        enabled = _get_enabled_skill_names()
         seen_names: set = set()
 
         # Scan local dir first, then external dirs
@@ -415,8 +415,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
                         continue
-                    # Respect user's disabled skills config
-                    if name in disabled:
+                    # Strict allowlist gate.
+                    if name not in enabled:
                         continue
                     description = frontmatter.get('description', '')
                     if not description:
@@ -475,9 +475,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    Rescans when the active platform scope changes so cron receives its
+    ``skills.cron_only`` additions while interactive platforms do not.
     """
     if (
         not _skill_commands
@@ -757,22 +756,19 @@ def build_preloaded_skills_prompt(
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
 
-    Disabled skills are treated the same as missing ones: this loads via a
-    raw identifier straight into ``_load_skill_payload``, bypassing
-    ``get_skill_commands()``'s scan-time disabled filter — mirrors the
-    bundle-invocation gate (#59156). Without this, ``hermes -s <skill>`` or
-    a deployment's ``HERMES_TUI_SKILLS`` env var could force-load a skill an
-    operator disabled via ``skills.disabled``/``skills.platform_disabled``.
+    Skills outside the allowlist are treated the same as missing ones. This
+    closes the raw-identifier path used by ``hermes -s <skill>`` and
+    ``HERMES_TUI_SKILLS``.
     """
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
 
     try:
-        from agent.skill_utils import get_disabled_skill_names
-        disabled_names = get_disabled_skill_names()
+        from agent.skill_utils import get_enabled_skill_names
+        enabled_names = get_enabled_skill_names()
     except Exception:
-        disabled_names = set()
+        enabled_names = set()
 
     seen: set[str] = set()
     for raw_identifier in skill_identifiers:
@@ -788,7 +784,7 @@ def build_preloaded_skills_prompt(
 
         loaded_skill, skill_dir, skill_name = loaded
 
-        if skill_name in disabled_names or identifier in disabled_names:
+        if skill_name not in enabled_names and identifier not in enabled_names:
             missing.append(identifier)
             continue
 

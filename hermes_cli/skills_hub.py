@@ -751,6 +751,14 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
+    # A confirmed profile-local install is an explicit opt-in.
+    from hermes_cli.config import load_config
+    from hermes_cli.skills_config import get_enabled_skills, save_enabled_skills
+
+    config = load_config()
+    enabled = get_enabled_skills(config)
+    enabled.add(bundle.name)
+    save_enabled_skills(config, enabled)
 
     # Blueprint detection: if the installed skill declares a
     # metadata.hermes.blueprint block, it is a runnable automation. Register it as
@@ -949,17 +957,14 @@ def do_list(source_filter: str = "all",
 
     Args:
         source_filter: ``all`` | ``hub`` | ``builtin`` | ``local``.
-        enabled_only: If True, hide disabled skills from the output.
+        enabled_only: If True, hide skills outside the allowlist.
 
-    Enabled/disabled state is resolved against the currently active profile's
-    config — ``hermes -p <profile> skills list`` reads that profile's
-    ``skills.disabled`` list because ``-p`` swaps ``HERMES_HOME`` at process
-    start.  No explicit profile flag needed here.
+    Allowlist state is resolved against the currently active profile's config.
     """
     from tools.skills_hub import HubLockFile, ensure_hub_dirs
     from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
-    from agent.skill_utils import get_disabled_skill_names
+    from agent.skill_utils import get_enabled_skill_names
 
     c = console or _console
     ensure_hub_dirs()
@@ -967,9 +972,9 @@ def do_list(source_filter: str = "all",
     hub_installed = {e["name"]: e for e in lock.list_installed()}
     builtin_names = set(_read_manifest())
 
-    # Pull ALL skills (including disabled ones) so we can annotate status.
-    all_skills = _find_all_skills(skip_disabled=True)
-    disabled_names = get_disabled_skill_names()
+    # Pull all installed skills so we can annotate allowlist status.
+    all_skills = _find_all_skills(include_inactive=True)
+    enabled_names = get_enabled_skill_names()
 
     title = "Installed Skills"
     if enabled_only:
@@ -1009,7 +1014,7 @@ def do_list(source_filter: str = "all",
         if source_filter != "all" and source_filter != source_type:
             continue
 
-        is_enabled = name not in disabled_names
+        is_enabled = name in enabled_names
         if enabled_only and not is_enabled:
             continue
 
@@ -1025,7 +1030,7 @@ def do_list(source_filter: str = "all",
             status_cell = "[bold green]enabled[/]"
         else:
             disabled_count += 1
-            status_cell = "[dim red]disabled[/]"
+            status_cell = "[dim red]not enabled[/]"
 
         trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow", "local": "dim"}.get(trust, "dim")
         trust_label = "official" if source_display == "official" else trust
@@ -1036,7 +1041,7 @@ def do_list(source_filter: str = "all",
     if enabled_only:
         summary += f" — {enabled_count} enabled shown"
     else:
-        summary += f" — {enabled_count} enabled, {disabled_count} disabled"
+        summary += f" — {enabled_count} enabled, {disabled_count} not enabled"
     summary += "[/]\n"
     c.print(summary)
 
@@ -1164,6 +1169,13 @@ def do_uninstall(name: str, console: Optional[Console] = None,
 
     success, msg = uninstall_skill(name)
     if success:
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_enabled_skills, save_enabled_skills
+
+        config = load_config()
+        enabled = get_enabled_skills(config)
+        enabled.discard(name)
+        save_enabled_skills(config, enabled)
         c.print(f"[bold green]{msg}[/]\n")
         if invalidate_cache:
             try:

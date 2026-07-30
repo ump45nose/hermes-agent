@@ -1,8 +1,8 @@
 """Durable projection for progressive capability-disclosure messages.
 
-The live API tool loop keeps search/describe/Skill-load calls so the model can
-use their results within the current user request. Durable history must not:
-those payloads are discovery scaffolding, not conversation state.
+Tool-search references are durable session state because they determine which
+real schemas are hydrated after resume. Legacy describe payloads and Skill
+discovery remain transient scaffolding.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import json
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-_TRANSIENT_BRIDGES = {"tool_search", "tool_describe", "skill_search"}
+_TRANSIENT_BRIDGES = {"tool_describe", "skill_search"}
 _TRANSIENT_UNDERLYING = {"skills_list", "skill_view"}
 
 
@@ -74,6 +74,96 @@ def _receipt_consumed(msg: Dict[str, Any]) -> bool:
     return isinstance(raw, dict) and raw.get("consumed_turn") is not None
 
 
+def _described_tool_name(
+    messages: List[Dict[str, Any]],
+    *,
+    call_id: str,
+) -> str:
+    """Resolve the tool named by a ``tool_describe`` call/result pair."""
+    for msg in messages:
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            candidate_id, name, raw_arguments = _call_parts(call)
+            if candidate_id != call_id or name != "tool_describe":
+                continue
+            described = str(_arguments_object(raw_arguments).get("name") or "")
+            if described:
+                return described
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("tool_call_id") or "") == call_id
+        ):
+            try:
+                payload = json.loads(str(msg.get("content") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                return str(payload.get("name") or "")
+    return ""
+
+
+def _described_contract_pending(
+    messages: List[Dict[str, Any]],
+    *,
+    describe_call_id: str,
+) -> bool:
+    """Keep a schema until the described tool result reaches the provider."""
+    described = _described_tool_name(messages, call_id=describe_call_id)
+    if not described:
+        return False
+
+    describe_call_index = -1
+    describe_index = -1
+    for index, msg in enumerate(messages):
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if isinstance(calls, list) and any(
+            _call_parts(call)[0] == describe_call_id for call in calls
+        ):
+            describe_call_index = index
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("tool_call_id") or "") == describe_call_id
+        ):
+            describe_index = index
+            break
+    if describe_index < 0:
+        return False
+
+    underlying_ids: Set[str] = set()
+    scan_from = describe_call_index if describe_call_index >= 0 else describe_index + 1
+    for msg in messages[scan_from:]:
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            candidate_id, name, raw_arguments = _call_parts(call)
+            if candidate_id == describe_call_id:
+                continue
+            if name == "tool_call":
+                name = str(_arguments_object(raw_arguments).get("name") or "")
+            if candidate_id and name == described:
+                underlying_ids.add(candidate_id)
+
+    # The schema remains current-turn working context until the capability is
+    # invoked. Once invoked, keep it through the provider request that consumes
+    # the real result so behavioral contracts remain visible during synthesis.
+    if not underlying_ids:
+        return True
+    for msg in messages[describe_index + 1:]:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("tool_call_id") or "") in underlying_ids
+        ):
+            return not _receipt_consumed(msg)
+    return True
+
+
 def _protected_assistant_payload(msg: Dict[str, Any]) -> bool:
     protected = (
         "reasoning",
@@ -91,18 +181,22 @@ def _protected_assistant_payload(msg: Dict[str, Any]) -> bool:
 
 def edit_consumed_transients(
     messages: Iterable[Dict[str, Any]],
+    *,
+    keep_recent: int = 3,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
-    """Remove capability-disclosure payloads after one provider consumption.
+    """Bound consumed capability disclosures while keeping recent context.
 
-    Discovery calls must survive exactly long enough for the model to use their
-    result. ``mark_tool_results_consumed`` stamps the result only after the
-    provider accepted the request containing it; the next request can therefore
-    remove the pair safely. Provider-signed assistant envelopes keep a minimum
-    result placeholder instead of having their call removed underneath them.
+    ``mark_tool_results_consumed`` stamps a result only after the provider
+    accepted the request containing it. Keep the latest configured number of
+    consumed discovery results so the model can reuse a just-found schema
+    instead of searching again on the next provider call. Older pairs can then
+    be removed from the provider projection. Provider-signed assistant
+    envelopes keep a minimum result placeholder instead of having their call
+    removed underneath them.
     """
     source = [copy.deepcopy(msg) for msg in messages]
     transient_ids = transient_call_ids(source)
-    consumed_ids = {
+    consumed_order = [
         str(msg.get("tool_call_id") or "")
         for msg in source
         if (
@@ -110,6 +204,20 @@ def edit_consumed_transients(
             and msg.get("role") == "tool"
             and str(msg.get("tool_call_id") or "") in transient_ids
             and _receipt_consumed(msg)
+        )
+    ]
+    retained_ids = set(
+        consumed_order[-max(0, int(keep_recent)):]
+        if keep_recent
+        else ()
+    )
+    consumed_ids = {
+        call_id
+        for call_id in consumed_order
+        if call_id not in retained_ids
+        if not _described_contract_pending(
+            source,
+            describe_call_id=call_id,
         )
     }
     if not consumed_ids:

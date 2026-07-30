@@ -100,7 +100,7 @@ export default function ProfileBuilderPage() {
 
   // ── Step 3: skills ────────────────────────────────────────────────
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
-  // keepAll = true: don't send a keep list (full bundle stays active).
+  // keepAll still sends every selected name as an explicit allowlist.
   const [keepAll, setKeepAll] = useState(true);
   const [keptSkills, setKeptSkills] = useState<Set<string>>(new Set());
   const [skillFilter, setSkillFilter] = useState("");
@@ -295,7 +295,9 @@ export default function ProfileBuilderPage() {
         prompt_modules: Array.from(promptModules),
         prompt_model_family: promptModelFamily,
         mcp_servers: mcpServers.length ? mcpServers : undefined,
-        keep_skills: keepAll ? undefined : Array.from(keptSkills),
+        keep_skills: keepAll
+          ? (skills ?? []).map((skill) => skill.name)
+          : Array.from(keptSkills),
         hub_skills: hubSkills.length
           ? hubSkills.map((s) => s.identifier)
           : undefined,
@@ -538,8 +540,8 @@ export default function ProfileBuilderPage() {
               {!keepAll && (
                 <div className="space-y-2">
                   <p className="text-xs text-muted-foreground">
-                    Choose which built-in / optional skills to keep active.
-                    Unchecked skills are disabled in the new profile.
+                    Choose the exact built-in / optional skill allowlist.
+                    Unchecked skills are not enabled in the new profile.
                   </p>
                   <Input
                     placeholder="Filter skills…"

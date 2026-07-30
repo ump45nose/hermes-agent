@@ -81,7 +81,7 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     )
 
     profile_prompt = profile_subparsers.add_parser(
-        "prompt", help="Verify, diff, or explicitly upgrade a fixed prompt"
+        "prompt", help="Verify, diff, or explicitly upgrade locked Stable prompt policy"
     )
     profile_prompt.add_argument("profile_name", help="Profile to inspect")
     profile_prompt.add_argument(
@@ -97,7 +97,7 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         default=None,
     )
     profile_prompt.add_argument(
-        "-y", "--yes", action="store_true", help="Confirm prompt upgrade"
+        "-y", "--yes", action="store_true", help="Confirm Stable prompt upgrade"
     )
 
     profile_snapshot = profile_subparsers.add_parser(
