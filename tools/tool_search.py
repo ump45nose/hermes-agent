@@ -48,6 +48,8 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from tools.registry import tool_error
+
 logger = logging.getLogger("tools.tool_search")
 
 
@@ -1032,7 +1034,7 @@ def dispatch_tool_search(args: Dict[str, Any],
         config = load_config()
     query = str(args.get("query") or "").strip()
     if not query:
-        return json.dumps({"error": "query is required"}, ensure_ascii=False)
+        return tool_error("query is required")
 
     raw_limit = args.get("limit")
     if raw_limit is None:
@@ -1240,9 +1242,9 @@ def dispatch_tool_describe(args: Dict[str, Any],
                 "parameters": delivered_fn.get("parameters", {}),
                 "schema_hash": _schema_hash(td),
             }, ensure_ascii=False)
-    return json.dumps({
-        "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
-    }, ensure_ascii=False)
+    return tool_error(
+        f"'{name}' is not currently available. Re-run tool_search to refresh."
+    )
 
 
 def scoped_deferrable_names(
