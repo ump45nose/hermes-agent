@@ -392,6 +392,24 @@ def finalize_turn(
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
+    if (
+        getattr(agent, "_pending_episode_injections", ())
+        and getattr(agent, "_turn_received_provider_response", False) is not True
+    ):
+        try:
+            _episode_db = getattr(agent, "_session_db", None)
+            if _episode_db is not None and agent.session_id:
+                _episode_db.mark_episode_injections(
+                    str(agent.session_id),
+                    turn_id=str(turn_id or ""),
+                    status="failed",
+                )
+        except Exception:
+            logger.warning(
+                "Episode injection failed-audit update failed",
+                exc_info=True,
+            )
+
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log

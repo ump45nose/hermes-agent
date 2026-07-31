@@ -1189,6 +1189,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _episode_context = _ctx.episode_context
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1458,6 +1459,7 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        _episode_context,
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
@@ -1682,6 +1684,11 @@ def run_conversation(
                 (),
             ),
         }
+        # Episode extraction is intentionally absent from the provider request
+        # path. The final assistant row atomically enqueues a bounded,
+        # secret-redacted turn in SessionDB; the daily worker leases that
+        # durable input. Compression can therefore proceed without an inline
+        # auxiliary-model call and without hiding the only extractable copy.
         try:
             from agent.tool_context_editor import (
                 project_tool_context_for_provider,
@@ -2754,6 +2761,28 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if _episode_context and getattr(
+                    agent,
+                    "_pending_episode_injections",
+                    (),
+                ):
+                    try:
+                        _episode_db = getattr(agent, "_session_db", None)
+                        if _episode_db is not None and agent.session_id:
+                            _episode_db.mark_episode_injections(
+                                str(agent.session_id),
+                                turn_id=str(turn_id or ""),
+                                status="sent",
+                                request_id=str(
+                                    getattr(response, "id", "") or ""
+                                )
+                                or None,
+                            )
+                    except Exception:
+                        request_logger.warning(
+                            "Episode injection sent-audit failed",
+                            exc_info=True,
+                        )
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":

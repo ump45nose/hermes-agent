@@ -163,6 +163,10 @@ def _build_fixed_profile_prompt_parts(
     )
 
     role = getattr(agent, "runtime_role", "interactive")
+    has_tools = bool(
+        getattr(agent, "reachable_tool_names", ())
+        or getattr(agent, "valid_tool_names", ())
+    )
     manifest: List[Dict[str, Any]] = []
     stable_parts: List[str] = []
     if getattr(agent, "_progressive_disclosure", False):
@@ -227,6 +231,12 @@ def _build_fixed_profile_prompt_parts(
             stable_parts.append(CRON_OVERLAY)
             manifest.append({"kind": "runtime_overlay", "id": "cron"})
 
+    if has_tools:
+        stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+        manifest.append(
+            {"kind": "execution_guidance", "id": "tool-use-enforcement"}
+        )
+
     platform_key = (getattr(agent, "platform", "") or "").lower().strip()
     # Fixed-profile prompts use deliberately short surface facts. The legacy
     # PLATFORM_HINTS blocks mix delivery, cron, UI and coding-era guidance and
@@ -254,10 +264,6 @@ def _build_fixed_profile_prompt_parts(
     busy_input_mode = str(
         os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE") or ""
     ).lower().strip()
-    has_tools = bool(
-        getattr(agent, "reachable_tool_names", ())
-        or getattr(agent, "valid_tool_names", ())
-    )
     if busy_input_mode == "steer" and has_tools:
         stable_parts.append(
             "工具结果末尾由 Hermes Steer marker 包裹的内容是用户本轮插话，"
@@ -291,11 +297,6 @@ def _build_fixed_profile_prompt_parts(
                 manifest.append({"kind": "external_memory"})
         except Exception:
             pass
-
-    scenario = str(getattr(agent, "_scenario_context", "") or "").strip()
-    if scenario and role != "research_leaf":
-        volatile_parts.append(scenario)
-        manifest.append({"kind": "scenario"})
 
     from hermes_time import now as _hermes_now
     timestamp = f"Conversation started: {_hermes_now().strftime('%A, %B %d, %Y')}"

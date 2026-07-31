@@ -114,6 +114,37 @@ def _dynamic_infra_error(target: str, content: Optional[str]) -> Optional[str]:
     return None
 
 
+def validate_memory_content(
+    target: str,
+    content: Optional[str],
+) -> Optional[str]:
+    """Shared deterministic gate for manual and Episode-derived writes."""
+    if not isinstance(content, str) or not content.strip():
+        return None
+    scan_error = _scan_memory_content(content)
+    if scan_error:
+        return scan_error
+    infra_error = _dynamic_infra_error(target, content)
+    if infra_error:
+        return infra_error
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            content,
+            force=True,
+            code_file=False,
+        )
+    except Exception:
+        redacted = content
+    if redacted != content:
+        return (
+            "Credentials or secret-shaped content cannot be written to "
+            "MEMORY.md or USER.md."
+        )
+    return None
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -195,6 +226,7 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._disk_fingerprint: tuple = ()
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -264,6 +296,26 @@ class MemoryStore:
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
         }
+        self._disk_fingerprint = self._current_disk_fingerprint()
+
+    def _current_disk_fingerprint(self) -> tuple:
+        values = []
+        for name in ("MEMORY.md", "USER.md"):
+            path = get_memory_dir() / name
+            try:
+                stat = path.stat()
+                values.append((name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                values.append((name, 0, 0))
+        return tuple(values)
+
+    def reload_if_changed(self) -> bool:
+        """Reload the frozen prompt snapshot after an external daily write."""
+        current = self._current_disk_fingerprint()
+        if current == self._disk_fingerprint:
+            return False
+        self.load_from_disk()
+        return True
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
@@ -420,7 +472,7 @@ class MemoryStore:
             return {"success": False, "error": "Content cannot be empty."}
 
         # Scan for injection/exfiltration before accepting
-        scan_error = _scan_memory_content(content)
+        scan_error = validate_memory_content(target, content)
         if scan_error:
             return {"success": False, "error": scan_error}
 
@@ -482,7 +534,7 @@ class MemoryStore:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
 
         # Scan replacement content for injection/exfiltration
-        scan_error = _scan_memory_content(new_content)
+        scan_error = validate_memory_content(target, new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
 
@@ -607,7 +659,7 @@ class MemoryStore:
             act = (op or {}).get("action")
             new_content = (op or {}).get("content")
             if act in {"add", "replace"} and new_content:
-                scan_error = _scan_memory_content(new_content)
+                scan_error = validate_memory_content(target, new_content)
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
@@ -1086,6 +1138,67 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     )
 
 
+def _audit_non_episode_write(
+    *,
+    target: str,
+    operations: List[Dict[str, Any]],
+    before_entries: List[str],
+    after_entries: List[str],
+    origin: str = "foreground_memory",
+) -> None:
+    """Best-effort audit for manual/foreground Markdown mutations.
+
+    Protection does not depend on this audit: every entry without an
+    episode_distillation hash is manual by default. The audit makes that
+    provenance explicit without allowing an audit outage to fail a completed
+    foreground write.
+    """
+    try:
+        import hashlib
+        from hermes_state import SessionDB
+
+        before_hash = hashlib.sha256(
+            json.dumps(before_entries, ensure_ascii=False).encode()
+        ).hexdigest()
+        after_hash = hashlib.sha256(
+            json.dumps(after_entries, ensure_ascii=False).encode()
+        ).hexdigest()
+        db_path = get_hermes_home() / "state.db"
+        if not db_path.exists():
+            return
+        db = SessionDB(db_path=db_path)
+        try:
+            for operation in operations:
+                action = str((operation or {}).get("action") or "")
+                content = str((operation or {}).get("content") or "").strip()
+                old_text = str((operation or {}).get("old_text") or "").strip()
+                if action in {"add", "replace"} and content:
+                    audited = content
+                else:
+                    matches = [
+                        entry for entry in before_entries
+                        if old_text and old_text in entry
+                    ]
+                    audited = matches[0] if len(matches) == 1 else old_text
+                db.record_memory_audit(
+                    target=target,
+                    action=action,
+                    origin=origin,
+                    before_hash=before_hash,
+                    after_hash=after_hash,
+                    content_hash=(
+                        hashlib.sha256(audited.encode()).hexdigest()
+                        if audited
+                        else ""
+                    ),
+                    episode_ids=(),
+                )
+        finally:
+            db.close()
+    except Exception:
+        logger.warning("Manual memory audit failed after successful write", exc_info=True)
+
+
 def memory_tool(
     action: str = None,
     target: str = "memory",
@@ -1121,13 +1234,21 @@ def memory_tool(
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
         for operation in operations:
-            error = _dynamic_infra_error(target, operation.get("content"))
+            error = validate_memory_content(target, operation.get("content"))
             if error:
                 return tool_error(error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
+        before_entries = list(store._entries_for(target))
         result = store.apply_batch(target, operations)
+        if result.get("success"):
+            _audit_non_episode_write(
+                target=target,
+                operations=operations,
+                before_entries=before_entries,
+                after_entries=list(store._entries_for(target)),
+            )
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1146,7 +1267,7 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
-    dynamic_error = _dynamic_infra_error(target, content)
+    dynamic_error = validate_memory_content(target, content)
     if dynamic_error:
         return tool_error(dynamic_error, success=False)
 
@@ -1156,6 +1277,7 @@ def memory_tool(
     if gate_result is not None:
         return gate_result
 
+    before_entries = list(store._entries_for(target))
     if action == "add":
         result = store.add(target, content)
 
@@ -1168,6 +1290,15 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
+    if result.get("success"):
+        _audit_non_episode_write(
+            target=target,
+            operations=[
+                {"action": action, "content": content, "old_text": old_text}
+            ],
+            before_entries=before_entries,
+            after_entries=list(store._entries_for(target)),
+        )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1186,15 +1317,32 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     target = payload.get("target", "memory")
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    before_entries = list(store._entries_for(target))
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
-        return store.remove(target, old_text)
-    return {"success": False, "error": f"Unknown staged action '{action}'."}
+        operations = payload.get("operations") or []
+        result = store.apply_batch(target, operations)
+    elif action == "add":
+        operations = [{"action": action, "content": content}]
+        result = store.add(target, content)
+    elif action == "replace":
+        operations = [
+            {"action": action, "content": content, "old_text": old_text}
+        ]
+        result = store.replace(target, old_text, content)
+    elif action == "remove":
+        operations = [{"action": action, "old_text": old_text}]
+        result = store.remove(target, old_text)
+    else:
+        return {"success": False, "error": f"Unknown staged action '{action}'."}
+    if result.get("success"):
+        _audit_non_episode_write(
+            target=target,
+            operations=operations,
+            before_entries=before_entries,
+            after_entries=list(store._entries_for(target)),
+            origin="approved_foreground_memory",
+        )
+    return result
 # OpenAI Function-Calling Schema
 # =============================================================================
 
@@ -1283,6 +1431,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-

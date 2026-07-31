@@ -2116,6 +2116,12 @@ class AIAgent:
                     ]
                 elif isinstance(_durable_msg.get("tool_calls"), list):
                     tool_calls_data = _durable_msg["tool_calls"]
+                _episode_nonterminal_reasons = {
+                    "incomplete",
+                    "verification_required",
+                    "verify_hook_continue",
+                    "kanban_terminal_required",
+                }
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -2142,6 +2148,16 @@ class AIAgent:
                     display_metadata=msg.get("display_metadata"),
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
+                    ),
+                    episode_profile=str(
+                        getattr(self, "_episode_memory_profile", "") or ""
+                    ),
+                    enqueue_episode=bool(
+                        role == "assistant"
+                        and getattr(self, "_episode_memory_enabled", True)
+                        and not tool_calls_data
+                        and str(_durable_msg.get("finish_reason") or "")
+                        not in _episode_nonterminal_reasons
                     ),
                 )
                 msg[_DB_PERSISTED_MARKER] = True

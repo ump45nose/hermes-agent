@@ -1967,6 +1967,41 @@ def init_agent(
     except (TypeError, ValueError):
         agent._tool_context_editor_trigger_before_compression_ratio = 0.75
 
+    _episode_cfg = _agent_cfg.get("episode_memory") or {}
+    if not isinstance(_episode_cfg, dict):
+        _episode_cfg = {}
+    agent._episode_memory_enabled = bool(_episode_cfg.get("enabled", True))
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        agent._episode_memory_profile = get_active_profile_name() or "default"
+    except Exception:
+        agent._episode_memory_profile = "default"
+    _episode_read_scopes = _episode_cfg.get("read_scopes")
+    if not isinstance(_episode_read_scopes, list):
+        _episode_read_scopes = [{"profile": "self", "subjects": ["self"]}]
+    _normalized_episode_scopes = []
+    for _scope in _episode_read_scopes:
+        if not isinstance(_scope, dict):
+            continue
+        _scope_profile = str(_scope.get("profile") or "").strip()
+        _scope_subjects = _scope.get("subjects")
+        if not _scope_profile or not isinstance(_scope_subjects, list):
+            continue
+        _normalized_subjects = tuple(
+            str(value).strip()
+            for value in _scope_subjects
+            if str(value).strip() == "self"
+            or re.fullmatch(r"user-[0-9a-f]{24}", str(value).strip())
+        )
+        if _normalized_subjects:
+            _normalized_episode_scopes.append(
+                (_scope_profile, _normalized_subjects)
+            )
+    agent._episode_memory_read_scopes = tuple(
+        _normalized_episode_scopes
+    ) or (("self", ("self",)),)
+
     _editor_keep = _editor_cfg.get("keep") or {}
     if not isinstance(_editor_keep, dict):
         _editor_keep = {}

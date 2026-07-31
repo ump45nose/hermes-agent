@@ -57,9 +57,9 @@ def compose_user_api_content(
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
-    Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    Sources: memory-manager prefetch + ``pre_llm_call`` plugin context +
+    transient Episode recall. They are appended to the *API copy* of the user
+    message only — the stored content stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -325,6 +325,9 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Recalled Episode context is provider-request transient and is preserved
+    # only in the api_content wire sidecar, never canonical content.
+    episode_context: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -578,6 +581,10 @@ def build_turn_context(
     think_scrubber = getattr(agent, "_stream_think_scrubber", None)
     if think_scrubber is not None:
         think_scrubber.reset()
+
+    # Persistent MEMORY/USER changes are deliberately session-boundary
+    # updates. A live conversation keeps its system prompt byte-stable for
+    # provider prefix caching; the next session loads the new files.
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
@@ -1163,17 +1170,17 @@ def build_turn_context(
         except Exception:
             pass
 
-    scenario_context = ""
+    episode_context = ""
     if isinstance(original_user_message, str):
         try:
-            from agent.local_context import scenario_context_for_turn
+            from agent.episode_memory import episode_context_for_turn
 
-            scenario_context = scenario_context_for_turn(
+            episode_context = episode_context_for_turn(
                 agent, original_user_message
             )
         except Exception:
-            scenario_context = ""
-    agent._last_scenario_context = scenario_context
+            episode_context = ""
+    agent._last_episode_context = episode_context
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -1203,7 +1210,7 @@ def build_turn_context(
             _turn_user_msg.get("content", ""),
             ext_prefetch_cache,
             plugin_user_context,
-            scenario_context,
+            episode_context,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
@@ -1251,6 +1258,28 @@ def build_turn_context(
         else:
             with persist_lock:
                 _ensure_and_persist()
+        _db = getattr(agent, "_session_db", None)
+        _pending_injections = getattr(
+            agent,
+            "_pending_episode_injections",
+            (),
+        )
+        if (
+            _db is not None
+            and episode_context
+            and _pending_injections
+            and agent.session_id
+        ):
+            _db.record_episode_injections(
+                str(agent.session_id),
+                _pending_injections,
+                turn_id=str(turn_id or ""),
+                user_message_id=_db.latest_message_id(
+                    str(agent.session_id),
+                    role="user",
+                ),
+                status="prepared",
+            )
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
@@ -1276,5 +1305,6 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        episode_context=episode_context,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

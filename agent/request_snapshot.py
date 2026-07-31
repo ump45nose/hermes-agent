@@ -119,7 +119,7 @@ def capture_request_snapshot(
         "wire_file": raw_path.name,
         "redacted_file": display_path.name,
         "sources": list(getattr(agent, "_prompt_source_manifest", []) or [])
-        + ([{"kind": "scenario"}] if getattr(agent, "_last_scenario_context", "") else [])
+        + ([{"kind": "episode"}] if getattr(agent, "_last_episode_context", "") else [])
         + [
             {"kind": "history"},
             {"kind": "tool_result"},

@@ -215,6 +215,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "learning_review": {
+        "description": "Owner-gated review of Episode-derived learning candidates",
+        "tools": ["learning_review"],
+        "includes": []
+    },
+
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],

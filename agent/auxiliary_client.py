@@ -108,6 +108,7 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -4728,7 +4729,7 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
         return explicit
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
-        return os.getenv(key_env, "").strip() or None
+        return str(_get_secret(key_env, "") or "").strip() or None
     return None
 
 
@@ -5516,7 +5517,7 @@ def resolve_provider_client(
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+                custom_key = str(_get_secret(custom_key_env, "") or "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
@@ -6791,7 +6792,7 @@ def _resolve_task_provider_model(
                 task_config.get("key_env") or task_config.get("api_key_env") or ""
             ).strip()
             if cfg_key_env:
-                cfg_api_key = os.getenv(cfg_key_env, "").strip() or None
+                cfg_api_key = str(_get_secret(cfg_key_env, "") or "").strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
     # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not

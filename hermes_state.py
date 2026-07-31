@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import atexit
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -283,7 +284,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 26
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1319,6 +1320,163 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+CREATE TABLE IF NOT EXISTS episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    first_message_id INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL,
+    source_hash TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    retrieval_text TEXT NOT NULL,
+    keywords_json TEXT NOT NULL DEFAULT '[]',
+    outcome TEXT,
+    payload_json TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    extractor_model TEXT,
+    extractor_version INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    UNIQUE(source_session_id, first_message_id, last_message_id, source_hash)
+);
+
+CREATE TABLE IF NOT EXISTS episode_extractions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    first_message_id INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL,
+    source_hash TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    subject_id TEXT NOT NULL DEFAULT '',
+    input_json TEXT,
+    trigger_source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    lease_until REAL,
+    last_error TEXT,
+    episode_id INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(session_id, first_message_id, last_message_id, source_hash),
+    FOREIGN KEY (episode_id) REFERENCES episodes(id)
+);
+
+CREATE TABLE IF NOT EXISTS episode_injections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL DEFAULT '',
+    user_message_id INTEGER,
+    request_id TEXT,
+    episode_profile TEXT NOT NULL,
+    episode_id INTEGER NOT NULL,
+    body_hash TEXT NOT NULL,
+    score REAL,
+    status TEXT NOT NULL DEFAULT 'sent',
+    injected_at REAL NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_distillations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    episode_ids_json TEXT NOT NULL,
+    extractor_model TEXT,
+    extractor_version INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(profile, source_hash)
+);
+
+CREATE TABLE IF NOT EXISTS memory_entry_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT NOT NULL,
+    action TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    before_hash TEXT,
+    after_hash TEXT,
+    content_hash TEXT,
+    evidence_episode_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS episode_knowledge_dispositions (
+    episode_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    target_ref TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (episode_id, kind),
+    FOREIGN KEY (episode_id) REFERENCES episodes(id)
+);
+
+CREATE TABLE IF NOT EXISTS episode_tool_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    result_status TEXT NOT NULL,
+    effect TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    digest_hash TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(episode_id, message_id, digest_hash),
+    FOREIGN KEY (episode_id) REFERENCES episodes(id)
+);
+
+CREATE TABLE IF NOT EXISTS learning_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    semantic_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    version_hash TEXT NOT NULL,
+    successful_run_count INTEGER NOT NULL DEFAULT 0,
+    repeated_failure_count INTEGER NOT NULL DEFAULT 0,
+    last_notified_version TEXT,
+    application_json TEXT NOT NULL DEFAULT '{}',
+    application_claim_id TEXT,
+    application_reviewer TEXT,
+    application_lease_until REAL,
+    applied_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(kind, semantic_key)
+);
+
+CREATE TABLE IF NOT EXISTS learning_candidate_evidence (
+    candidate_id INTEGER NOT NULL,
+    episode_id INTEGER NOT NULL,
+    source_hash TEXT NOT NULL,
+    outcome TEXT,
+    evidence_count INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (candidate_id, episode_id),
+    FOREIGN KEY (candidate_id) REFERENCES learning_candidates(id),
+    FOREIGN KEY (episode_id) REFERENCES episodes(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodes_subject_profile
+    ON episodes(subject_id, profile, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_episode_extractions_status
+    ON episode_extractions(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_episode_injections_session
+    ON episode_injections(session_id, injected_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_distillations_status
+    ON knowledge_distillations(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_episode_tool_evidence_episode
+    ON episode_tool_evidence(episode_id, tool_name);
+CREATE INDEX IF NOT EXISTS idx_learning_candidates_status
+    ON learning_candidates(status, kind, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_entry_audit_manual_import
+    ON memory_entry_audit(target, content_hash) WHERE origin='manual_import';
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -1409,6 +1567,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_episode_extractions_lease
+    ON episode_extractions(status, lease_until, updated_at);
+CREATE INDEX IF NOT EXISTS idx_episode_injections_turn
+    ON episode_injections(session_id, turn_id, status, updated_at);
 """
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
@@ -7043,6 +7205,8 @@ class SessionDB:
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        episode_profile: Optional[str] = None,
+        enqueue_episode: bool = False,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -7178,9 +7342,38 @@ class SessionDB:
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            if enqueue_episode and role == "assistant" and not tool_calls_json:
+                self._enqueue_episode_turn_in_txn(
+                    conn,
+                    session_id=session_id,
+                    final_message_id=int(msg_id),
+                    profile=str(episode_profile or ""),
+                    trigger_source="turn_finalized",
+                )
             return msg_id
 
         return self._execute_write(_do)
+
+    def latest_message_id(
+        self,
+        session_id: str,
+        *,
+        role: Optional[str] = None,
+    ) -> Optional[int]:
+        with self._lock:
+            if role:
+                row = self._conn.execute(
+                    "SELECT id FROM messages WHERE session_id=? AND role=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, role),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT id FROM messages WHERE session_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+        return int(row["id"]) if row is not None else None
 
     def update_tool_receipt(
         self,
@@ -7231,6 +7424,1279 @@ class SessionDB:
                 (encoded_content, projection_form, session_id, *call_ids),
             )
             return int(cursor.rowcount or 0)
+
+        return self._execute_write(_do)
+
+    def _render_episode_turn(
+        self,
+        rows: Iterable[Any],
+        *,
+        max_chars: int = 96_000,
+    ) -> List[Dict[str, str]]:
+        """Build the durable, secret-redacted Episode extractor input."""
+        try:
+            from agent.redact import redact_sensitive_text
+        except Exception:
+            redact_sensitive_text = None
+
+        rendered: List[Dict[str, str]] = []
+        used = 0
+        for row in rows:
+            role = str(row["role"] or "")
+            if role in {"user", "assistant"}:
+                content = self._decode_content(row["content"])
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                text = content.strip()
+            elif role == "tool":
+                try:
+                    receipt = json.loads(row["tool_receipt"] or "null")
+                except (TypeError, json.JSONDecodeError):
+                    receipt = None
+                if not isinstance(receipt, dict):
+                    continue
+                text = json.dumps(
+                    {
+                        key: receipt.get(key)
+                        for key in (
+                            "tool_name",
+                            "result_status",
+                            "effect",
+                            "artifact_ref",
+                        )
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            else:
+                continue
+            if callable(redact_sensitive_text):
+                text = redact_sensitive_text(
+                    text,
+                    force=True,
+                    code_file=False,
+                )
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            text = text[:remaining]
+            rendered.append({"role": role, "content": text})
+            used += len(text)
+        return rendered
+
+    @staticmethod
+    def _episode_subject_id(source: str, user_id: str) -> str:
+        source_value = str(source or "local")
+        user_value = str(user_id or "local-owner")
+        digest = hashlib.sha256(
+            f"{source_value}\0{user_value}".encode()
+        ).hexdigest()[:24]
+        return f"user-{digest}"
+
+    def _enqueue_episode_turn_in_txn(
+        self,
+        conn,
+        *,
+        session_id: str,
+        final_message_id: int,
+        profile: str,
+        trigger_source: str,
+        max_chars: int = 96_000,
+    ) -> bool:
+        """Persist one complete turn before later compression can hide it."""
+        session = conn.execute(
+            "SELECT source, user_id FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if session is None:
+            return False
+        source = str(session["source"] or "local").lower()
+        if source in {"cron", "subagent", "research_leaf", "test", "pytest"}:
+            return False
+        final_row = conn.execute(
+            "SELECT id, role, content, tool_calls FROM messages "
+            "WHERE session_id=? AND id=?",
+            (session_id, int(final_message_id)),
+        ).fetchone()
+        if (
+            final_row is None
+            or str(final_row["role"] or "") != "assistant"
+            or final_row["tool_calls"]
+            or not str(final_row["content"] or "").strip()
+        ):
+            return False
+        first_row = conn.execute(
+            "SELECT id FROM messages WHERE session_id=? AND id<=? "
+            "AND role='user' AND COALESCE(display_kind, '') != 'hidden' "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id, int(final_message_id)),
+        ).fetchone()
+        if first_row is None:
+            return False
+        first_id = int(first_row["id"])
+        rows = conn.execute(
+            "SELECT id, role, content, tool_calls, tool_receipt "
+            "FROM messages WHERE session_id=? AND id BETWEEN ? AND ? "
+            "AND COALESCE(display_kind, '') != 'hidden' ORDER BY id",
+            (session_id, first_id, int(final_message_id)),
+        ).fetchall()
+        rendered = self._render_episode_turn(rows, max_chars=max_chars)
+        if not rendered:
+            return False
+        canonical = json.dumps(
+            rendered,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        source_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        now = time.time()
+        subject = self._episode_subject_id(
+            str(session["source"] or "local"),
+            str(session["user_id"] or "local-owner"),
+        )
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO episode_extractions "
+            "(session_id, first_message_id, last_message_id, source_hash, "
+            "profile, subject_id, input_json, trigger_source, status, attempts, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+            (
+                session_id,
+                first_id,
+                int(final_message_id),
+                source_hash,
+                profile,
+                subject,
+                canonical,
+                trigger_source,
+                now,
+                now,
+            ),
+        )
+        if cursor.rowcount:
+            return True
+        # Existing legacy failed/running records lacked durable input. Fill it
+        # without changing succeeded/skipped outcomes, retry counters, or the
+        # status-lifecycle timestamp used by failed-item retry cutoffs.
+        conn.execute(
+            "UPDATE episode_extractions SET "
+            "profile=CASE WHEN profile='' THEN ? ELSE profile END, "
+            "subject_id=CASE WHEN subject_id='' THEN ? ELSE subject_id END, "
+            "input_json=COALESCE(input_json, ?) "
+            "WHERE session_id=? AND first_message_id=? AND last_message_id=? "
+            "AND source_hash=? "
+            "AND (profile='' OR subject_id='' OR input_json IS NULL)",
+            (
+                profile,
+                subject,
+                canonical,
+                session_id,
+                first_id,
+                int(final_message_id),
+                source_hash,
+            ),
+        )
+        return False
+
+    def enqueue_episode_backlog(
+        self,
+        *,
+        profile: str,
+        limit: int = 5_000,
+        since_timestamp: Optional[float] = None,
+    ) -> int:
+        """Discover complete turns, including soft-archived originals.
+
+        ``since_timestamp`` is the explicit local-Episode migration watermark.
+        Final assistant messages older than it are left untouched; new turns
+        are still enqueued transactionally by ``add_message``.
+        """
+        def _enqueue(conn):
+            session_sql = (
+                "SELECT id FROM sessions "
+                "WHERE lower(COALESCE(source, '')) NOT IN "
+                "('cron', 'subagent', 'research_leaf', 'test', 'pytest') "
+            )
+            session_args: tuple[Any, ...] = ()
+            if since_timestamp is not None:
+                session_sql += (
+                    "AND EXISTS("
+                    "SELECT 1 FROM messages candidate "
+                    "WHERE candidate.session_id=sessions.id "
+                    "AND candidate.role='assistant' "
+                    "AND candidate.tool_calls IS NULL "
+                    "AND COALESCE(candidate.content, '') != '' "
+                    "AND COALESCE(candidate.display_kind, '') != 'hidden' "
+                    "AND candidate.timestamp >= ?) "
+                )
+                session_args = (float(since_timestamp),)
+            session_sql += "ORDER BY started_at"
+            sessions = conn.execute(session_sql, session_args).fetchall()
+            inserted = 0
+            for session in sessions:
+                if inserted >= max(1, int(limit)):
+                    break
+                final_sql = (
+                    "SELECT id FROM messages WHERE session_id=? "
+                    "AND role='assistant' AND tool_calls IS NULL "
+                    "AND COALESCE(content, '') != '' "
+                    "AND COALESCE(display_kind, '') != 'hidden' "
+                )
+                final_args: tuple[Any, ...] = (str(session["id"]),)
+                if since_timestamp is not None:
+                    final_sql += "AND timestamp >= ? "
+                    final_args += (float(since_timestamp),)
+                final_sql += "ORDER BY id"
+                finals = conn.execute(final_sql, final_args).fetchall()
+                for final in finals:
+                    if inserted >= max(1, int(limit)):
+                        break
+                    if self._enqueue_episode_turn_in_txn(
+                        conn,
+                        session_id=str(session["id"]),
+                        final_message_id=int(final["id"]),
+                        profile=profile,
+                        trigger_source="daily_discovery",
+                    ):
+                        inserted += 1
+            return inserted
+
+        return int(self._execute_write(_enqueue) or 0)
+
+    def claim_episode_candidate(
+        self,
+        session_id: str,
+        *,
+        trigger_source: str,
+        max_chars: int = 96_000,
+        retry_failed: bool = False,
+        retry_failed_before: Optional[float] = None,
+        lease_seconds: int = 300,
+    ) -> Optional[Dict[str, Any]]:
+        """Lease one already-persisted Episode input for extraction."""
+        del max_chars  # Input was bounded and redacted at enqueue time.
+        now = time.time()
+        failed_before = (
+            float(retry_failed_before)
+            if retry_failed_before is not None
+            else now
+        )
+        failed_clause = (
+            "OR (status='failed' AND updated_at < ?) "
+            if retry_failed
+            else ""
+        )
+
+        def _claim(conn):
+            row = conn.execute(
+                "SELECT * FROM episode_extractions WHERE session_id=? "
+                "AND input_json IS NOT NULL AND ("
+                "status='pending' "
+                f"{failed_clause}"
+                "OR "
+                "(status='running' AND COALESCE(lease_until, 0) < ?)) "
+                "ORDER BY first_message_id LIMIT 1",
+                (
+                    session_id,
+                    *((failed_before,) if retry_failed else ()),
+                    now,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            lease_until = now + max(30, int(lease_seconds))
+            cursor = conn.execute(
+                "UPDATE episode_extractions SET status='running', "
+                "attempts=attempts+1, trigger_source=?, last_error=NULL, "
+                "lease_until=?, updated_at=? WHERE id=? AND ("
+                "status='pending' "
+                f"{failed_clause}"
+                "OR "
+                "(status='running' AND COALESCE(lease_until, 0) < ?))",
+                (
+                    trigger_source,
+                    lease_until,
+                    now,
+                    int(row["id"]),
+                    *((failed_before,) if retry_failed else ()),
+                    now,
+                ),
+            )
+            if not cursor.rowcount:
+                return None
+            return conn.execute(
+                "SELECT * FROM episode_extractions WHERE id=?",
+                (int(row["id"]),),
+            ).fetchone()
+
+        row = self._execute_write(_claim)
+        if row is None:
+            return None
+        try:
+            rendered = json.loads(row["input_json"])
+        except (TypeError, json.JSONDecodeError):
+            self.fail_episode_extraction(
+                int(row["id"]),
+                "persisted episode input is invalid JSON",
+            )
+            return None
+        return {
+            "extraction_id": int(row["id"]),
+            "attempts": int(row["attempts"]),
+            "session_id": str(row["session_id"]),
+            "first_message_id": int(row["first_message_id"]),
+            "last_message_id": int(row["last_message_id"]),
+            "source_hash": str(row["source_hash"]),
+            "profile": str(row["profile"] or ""),
+            "subject_id": str(row["subject_id"] or ""),
+            "messages": rendered,
+        }
+
+    def list_episode_candidate_sessions(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Return sessions with pending, failed, or stale leased work."""
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.source, s.user_id, s.started_at, "
+                "EXISTS(SELECT 1 FROM episode_extractions x "
+                "       WHERE x.session_id=s.id AND x.status='failed') AS has_failed "
+                "FROM sessions s "
+                "WHERE EXISTS(SELECT 1 FROM episode_extractions x "
+                "             WHERE x.session_id=s.id AND x.input_json IS NOT NULL "
+                "             AND (x.status IN ('pending', 'failed') "
+                "                  OR (x.status='running' "
+                "                      AND COALESCE(x.lease_until, 0) < ?))) "
+                "ORDER BY has_failed DESC, s.started_at ASC LIMIT ?",
+                (now, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_episode_backlog(self) -> int:
+        """Return the exact number of claimable extraction records."""
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM episode_extractions "
+                "WHERE input_json IS NOT NULL AND ("
+                "status IN ('pending', 'failed') "
+                "OR (status='running' AND COALESCE(lease_until, 0) < ?))",
+                (now,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def fail_episode_extraction(self, extraction_id: int, error: str) -> None:
+        bounded = str(error or "unknown error")[:1000]
+        self._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE episode_extractions SET status='failed', "
+                "lease_until=NULL, last_error=?, updated_at=? "
+                "WHERE id=? AND status='running'",
+                (bounded, time.time(), int(extraction_id)),
+            )
+        )
+
+    def complete_episode_extraction(
+        self,
+        extraction_id: int,
+        *,
+        subject_id: str,
+        profile: str,
+        payload: Optional[Dict[str, Any]],
+        extractor_model: str,
+    ) -> Optional[int]:
+        """Commit one Episode or an explicit skip in the same transaction."""
+        now = time.time()
+
+        def _complete(conn):
+            row = conn.execute(
+                "SELECT * FROM episode_extractions WHERE id=?",
+                (int(extraction_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"episode extraction {extraction_id} not found")
+            if row["status"] in {"succeeded", "skipped"}:
+                return int(row["episode_id"]) if row["episode_id"] else None
+            if payload is None:
+                conn.execute(
+                    "UPDATE episode_extractions SET status='skipped', "
+                    "lease_until=NULL, updated_at=? WHERE id=?",
+                    (now, int(extraction_id)),
+                )
+                return None
+
+            normalized = dict(payload)
+            title = str(normalized.get("title") or "Untitled Episode").strip()[:240]
+            summary = str(normalized.get("summary") or "").strip()
+            retrieval_text = str(
+                normalized.get("retrieval_text") or summary or title
+            ).strip()
+            keywords = normalized.get("keywords")
+            if not isinstance(keywords, list):
+                keywords = []
+            keywords = [
+                str(item).strip()[:120]
+                for item in keywords[:24]
+                if str(item).strip()
+            ]
+            normalized["keywords"] = keywords
+            payload_json = json.dumps(
+                normalized, ensure_ascii=False, sort_keys=True
+            )
+            body_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO episodes "
+                "(subject_id, profile, source_session_id, first_message_id, "
+                "last_message_id, source_hash, title, summary, retrieval_text, "
+                "keywords_json, outcome, payload_json, body_hash, "
+                "extractor_model, extractor_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (
+                    subject_id,
+                    profile,
+                    row["session_id"],
+                    row["first_message_id"],
+                    row["last_message_id"],
+                    row["source_hash"],
+                    title,
+                    summary,
+                    retrieval_text,
+                    json.dumps(keywords, ensure_ascii=False),
+                    str(normalized.get("outcome") or "") or None,
+                    payload_json,
+                    body_hash,
+                    extractor_model,
+                    now,
+                ),
+            )
+            episode_id = int(cursor.lastrowid) if cursor.rowcount else int(
+                conn.execute(
+                    "SELECT id FROM episodes WHERE source_session_id=? "
+                    "AND first_message_id=? AND last_message_id=? AND source_hash=?",
+                    (
+                        row["session_id"],
+                        row["first_message_id"],
+                        row["last_message_id"],
+                        row["source_hash"],
+                    ),
+                ).fetchone()["id"]
+            )
+            conn.execute(
+                "UPDATE episode_extractions SET status='succeeded', "
+                "episode_id=?, lease_until=NULL, updated_at=? WHERE id=?",
+                (episode_id, now, int(extraction_id)),
+            )
+            receipt_rows = conn.execute(
+                "SELECT id, tool_receipt FROM messages "
+                "WHERE session_id=? AND id BETWEEN ? AND ? "
+                "AND role='tool' AND tool_receipt IS NOT NULL",
+                (
+                    row["session_id"],
+                    row["first_message_id"],
+                    row["last_message_id"],
+                ),
+            ).fetchall()
+            for receipt_row in receipt_rows:
+                try:
+                    receipt = json.loads(receipt_row["tool_receipt"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(receipt, dict):
+                    continue
+                tool_name = str(receipt.get("tool_name") or "").strip()
+                if not tool_name or tool_name == "<unknown>":
+                    continue
+                digest_obj = {
+                    "tool_name": tool_name,
+                    "result_status": str(
+                        receipt.get("result_status") or "unknown"
+                    )[:80],
+                    "effect": str(receipt.get("effect") or "unknown")[:80],
+                    "artifact_ref": str(receipt.get("artifact_ref") or "")[:500],
+                }
+                digest = json.dumps(
+                    digest_obj, ensure_ascii=False, sort_keys=True
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO episode_tool_evidence "
+                    "(episode_id, message_id, tool_name, result_status, effect, "
+                    "digest, digest_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        episode_id,
+                        int(receipt_row["id"]),
+                        tool_name,
+                        digest_obj["result_status"],
+                        digest_obj["effect"],
+                        digest,
+                        hashlib.sha256(digest.encode()).hexdigest(),
+                        now,
+                    ),
+                )
+            return episode_id
+
+        episode_id = self._execute_write(_complete)
+        if episode_id:
+            self._ensure_episode_fts()
+        return episode_id
+
+    def import_episode_record(
+        self,
+        *,
+        subject_id: str,
+        profile: str,
+        source_session_id: str,
+        source_hash: str,
+        payload: Dict[str, Any],
+        extractor_model: str = "legacy-context-db",
+    ) -> bool:
+        """Idempotently import an already-extracted Episode."""
+        normalized = dict(payload)
+        title = str(normalized.get("title") or "Imported Episode").strip()[:240]
+        summary = str(normalized.get("summary") or normalized.get("context") or "").strip()
+        retrieval_text = str(
+            normalized.get("retrieval_text") or summary or title
+        ).strip()
+        keywords = normalized.get("keywords")
+        if not isinstance(keywords, list):
+            keywords = []
+        normalized["keywords"] = keywords
+        payload_json = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        body_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO episodes "
+                "(subject_id, profile, source_session_id, first_message_id, "
+                "last_message_id, source_hash, title, summary, retrieval_text, "
+                "keywords_json, outcome, payload_json, body_hash, extractor_model, "
+                "extractor_version, created_at) "
+                "VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (
+                    subject_id,
+                    profile,
+                    source_session_id,
+                    source_hash,
+                    title,
+                    summary,
+                    retrieval_text,
+                    json.dumps(keywords, ensure_ascii=False),
+                    str(normalized.get("outcome") or "") or None,
+                    payload_json,
+                    body_hash,
+                    extractor_model,
+                    now,
+                ),
+            )
+            return bool(cursor.rowcount)
+
+        inserted = bool(self._execute_write(_do))
+        if inserted:
+            self._ensure_episode_fts()
+        return inserted
+
+    def _ensure_episode_fts(self) -> bool:
+        if not self._fts_enabled:
+            return False
+        tokenizer = "cjk_unicode61" if self._fts_cjk_loaded else "trigram"
+        version = f"2:{tokenizer}"
+        sql = f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+            title, retrieval_text, keywords_json,
+            content='episodes', content_rowid='id', tokenize='{tokenizer}'
+        );
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_ai AFTER INSERT ON episodes BEGIN
+          INSERT INTO episodes_fts(rowid, title, retrieval_text, keywords_json)
+          VALUES (new.id, new.title, new.retrieval_text, new.keywords_json);
+        END;
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_ad AFTER DELETE ON episodes BEGIN
+          INSERT INTO episodes_fts(episodes_fts, rowid, title, retrieval_text, keywords_json)
+          VALUES ('delete', old.id, old.title, old.retrieval_text, old.keywords_json);
+        END;
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_au AFTER UPDATE ON episodes BEGIN
+          INSERT INTO episodes_fts(episodes_fts, rowid, title, retrieval_text, keywords_json)
+          VALUES ('delete', old.id, old.title, old.retrieval_text, old.keywords_json);
+          INSERT INTO episodes_fts(rowid, title, retrieval_text, keywords_json)
+          VALUES (new.id, new.title, new.retrieval_text, new.keywords_json);
+        END;
+        """
+        try:
+            with self._lock:
+                current = self._conn.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key='episodes_fts_version'"
+                ).fetchone()
+                if current is None or str(current["value"]) != version:
+                    self._conn.executescript(
+                        "DROP TRIGGER IF EXISTS episodes_fts_ai;"
+                        "DROP TRIGGER IF EXISTS episodes_fts_ad;"
+                        "DROP TRIGGER IF EXISTS episodes_fts_au;"
+                        "DROP TABLE IF EXISTS episodes_fts;"
+                    )
+                columns = {
+                    str(row["name"])
+                    for row in self._conn.execute(
+                        "PRAGMA table_info('episodes_fts')"
+                    ).fetchall()
+                }
+                if columns and "keywords_json" not in columns:
+                    self._conn.executescript(
+                        "DROP TRIGGER IF EXISTS episodes_fts_ai;"
+                        "DROP TRIGGER IF EXISTS episodes_fts_ad;"
+                        "DROP TRIGGER IF EXISTS episodes_fts_au;"
+                        "DROP TABLE IF EXISTS episodes_fts;"
+                    )
+                self._conn.executescript(sql)
+                if current is None or str(current["value"]) != version:
+                    self._conn.execute(
+                        "INSERT INTO episodes_fts(episodes_fts) VALUES('rebuild')"
+                    )
+                    self._conn.execute(
+                        "INSERT INTO state_meta(key, value) "
+                        "VALUES('episodes_fts_version', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (version,),
+                    )
+            return True
+        except sqlite3.Error:
+            if tokenizer != "unicode61":
+                # A private build without the configured CJK/trigram tokenizer
+                # still keeps bounded LIKE retrieval available.
+                logger.debug(
+                    "Episode CJK FTS unavailable; using LIKE fallback",
+                    exc_info=True,
+                )
+            return False
+
+    def search_episodes(
+        self,
+        query: str,
+        *,
+        subject_id: str,
+        profile: str,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        normalized = " ".join(str(query or "").split()).strip()
+        if not normalized:
+            return []
+        self._ensure_episode_fts()
+        rows = []
+        terms = re.findall(r"[\w\u3400-\u9fff]+", normalized, re.UNICODE)
+        fts_query = " OR ".join(f'"{term}"' for term in terms[:12] if term)
+        if fts_query:
+            try:
+                with self._lock:
+                    rows = self._conn.execute(
+                        "SELECT e.*, bm25(episodes_fts) AS rank "
+                        "FROM episodes_fts JOIN episodes e ON e.id=episodes_fts.rowid "
+                        "WHERE episodes_fts MATCH ? AND e.subject_id=? AND e.profile=? "
+                        "ORDER BY rank, e.created_at DESC LIMIT ?",
+                        (fts_query, subject_id, profile, int(limit)),
+                    ).fetchall()
+            except sqlite3.Error:
+                rows = []
+        if not rows:
+            like = f"%{normalized[:500]}%"
+            try:
+                with self._lock:
+                    rows = self._conn.execute(
+                        "SELECT *, 1000.0 AS rank FROM episodes "
+                        "WHERE subject_id=? AND profile=? AND "
+                        "(title LIKE ? OR retrieval_text LIKE ? OR keywords_json LIKE ?) "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (subject_id, profile, like, like, like, int(limit)),
+                    ).fetchall()
+            except sqlite3.Error:
+                rows = []
+        return [dict(row) for row in rows]
+
+    def record_episode_injections(
+        self,
+        session_id: str,
+        injections: Iterable[Dict[str, Any]],
+        *,
+        turn_id: str,
+        user_message_id: Optional[int] = None,
+        status: str = "prepared",
+    ) -> None:
+        items = list(injections)
+        if not items:
+            return
+        normalized_status = str(status or "prepared")
+        if normalized_status not in {"prepared", "sent", "failed"}:
+            raise ValueError("invalid Episode injection status")
+
+        def _do(conn):
+            now = time.time()
+            for item in items:
+                conn.execute(
+                    "INSERT INTO episode_injections "
+                    "(session_id, turn_id, user_message_id, episode_profile, "
+                    "episode_id, body_hash, score, status, injected_at, updated_at) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+                    "WHERE NOT EXISTS (SELECT 1 FROM episode_injections "
+                    "WHERE session_id=? AND turn_id=? AND episode_profile=? "
+                    "AND episode_id=? AND body_hash=?)",
+                    (
+                        session_id,
+                        str(turn_id or ""),
+                        int(user_message_id) if user_message_id else None,
+                        str(item["profile"]),
+                        int(item["id"]),
+                        str(item["body_hash"]),
+                        float(item.get("score") or 0.0),
+                        normalized_status,
+                        now,
+                        now,
+                        session_id,
+                        str(turn_id or ""),
+                        str(item["profile"]),
+                        int(item["id"]),
+                        str(item["body_hash"]),
+                    ),
+                )
+
+        self._execute_write(_do)
+
+    def mark_episode_injections(
+        self,
+        session_id: str,
+        *,
+        turn_id: str,
+        status: str,
+        request_id: Optional[str] = None,
+    ) -> int:
+        normalized_status = str(status or "")
+        if normalized_status not in {"sent", "failed"}:
+            raise ValueError("Episode injection status must be sent or failed")
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE episode_injections SET status=?, request_id=COALESCE(?, request_id), "
+                "updated_at=? WHERE session_id=? AND turn_id=? AND status='prepared'",
+                (
+                    normalized_status,
+                    str(request_id) if request_id else None,
+                    time.time(),
+                    session_id,
+                    str(turn_id or ""),
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+        return int(self._execute_write(_do) or 0)
+
+    def list_episodes_for_distillation(
+        self,
+        *,
+        profile: str,
+        limit: int = 50,
+        candidate_kinds: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return Episodes not yet handled by the requested distillation pass."""
+        kinds = ("skill", "tool") if candidate_kinds else ("memory", "user")
+        placeholders = ",".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT e.* FROM episodes e WHERE e.profile=? AND ("
+                "SELECT COUNT(DISTINCT d.kind) FROM episode_knowledge_dispositions d "
+                "WHERE d.episode_id=e.id AND d.kind IN (" + placeholders + ")) < ? "
+                "ORDER BY e.id LIMIT ?",
+                (profile, *kinds, len(kinds), max(1, int(limit))),
+            ).fetchall()
+            result = [dict(row) for row in rows]
+            for item in result:
+                evidence = self._conn.execute(
+                    "SELECT tool_name, result_status, effect, digest "
+                    "FROM episode_tool_evidence WHERE episode_id=? ORDER BY id",
+                    (int(item["id"]),),
+                ).fetchall()
+                item["tool_evidence"] = [dict(row) for row in evidence]
+        return result
+
+    def claim_knowledge_distillation(
+        self,
+        *,
+        profile: str,
+        episode_ids: Iterable[int],
+        extractor_model: str,
+    ) -> Optional[Dict[str, Any]]:
+        ids = tuple(sorted({int(value) for value in episode_ids}))
+        if not ids:
+            return None
+        canonical = json.dumps(ids, separators=(",", ":"))
+        source_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, status, attempts FROM knowledge_distillations "
+                "WHERE profile=? AND source_hash=?",
+                (profile, source_hash),
+            ).fetchone()
+            if row is not None:
+                if row["status"] == "succeeded":
+                    return None
+                conn.execute(
+                    "UPDATE knowledge_distillations SET status='running', "
+                    "attempts=attempts+1, last_error=NULL, updated_at=? WHERE id=?",
+                    (now, int(row["id"])),
+                )
+                return {"id": int(row["id"]), "source_hash": source_hash}
+            cursor = conn.execute(
+                "INSERT INTO knowledge_distillations "
+                "(profile, source_hash, status, episode_ids_json, extractor_model, "
+                "created_at, updated_at) VALUES (?, ?, 'running', ?, ?, ?, ?)",
+                (profile, source_hash, canonical, extractor_model, now, now),
+            )
+            return {"id": int(cursor.lastrowid), "source_hash": source_hash}
+
+        return self._execute_write(_do)
+
+    def finish_knowledge_distillation(
+        self,
+        distillation_id: int,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        self._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE knowledge_distillations SET status=?, last_error=?, "
+                "updated_at=? WHERE id=?",
+                (
+                    "succeeded" if success else "failed",
+                    None if success else str(error or "unknown error")[:1000],
+                    time.time(),
+                    int(distillation_id),
+                ),
+            )
+        )
+
+    def record_knowledge_disposition(
+        self,
+        episode_id: int,
+        *,
+        kind: str,
+        disposition: str,
+        target_ref: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO episode_knowledge_dispositions "
+                "(episode_id, kind, disposition, target_ref, detail_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(episode_id, kind) DO UPDATE SET "
+                "disposition=excluded.disposition, target_ref=excluded.target_ref, "
+                "detail_json=excluded.detail_json, updated_at=excluded.updated_at",
+                (
+                    int(episode_id),
+                    str(kind),
+                    str(disposition),
+                    str(target_ref or "") or None,
+                    json.dumps(detail or {}, ensure_ascii=False, sort_keys=True),
+                    time.time(),
+                ),
+            )
+        )
+
+    def record_memory_audit(
+        self,
+        *,
+        target: str,
+        action: str,
+        origin: str,
+        before_hash: str,
+        after_hash: str,
+        content_hash: str,
+        episode_ids: Iterable[int],
+    ) -> None:
+        self._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO memory_entry_audit "
+                "(target, action, origin, before_hash, after_hash, content_hash, "
+                "evidence_episode_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    target,
+                    action,
+                    origin,
+                    before_hash or None,
+                    after_hash or None,
+                    content_hash or None,
+                    json.dumps(sorted({int(value) for value in episode_ids})),
+                    time.time(),
+                ),
+            )
+        )
+
+    def is_auto_managed_memory_entry(self, content: str) -> bool:
+        digest = hashlib.sha256(str(content).strip().encode()).hexdigest()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM memory_entry_audit "
+                "WHERE origin='episode_distillation' AND content_hash=? LIMIT 1",
+                (digest,),
+            ).fetchone()
+        return row is not None
+
+    def upsert_learning_candidate(
+        self,
+        *,
+        kind: str,
+        semantic_key: str,
+        title: str,
+        payload: Dict[str, Any],
+        evidence: Iterable[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        now = time.time()
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        version_hash = hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM learning_candidates WHERE kind=? AND semantic_key=?",
+                (kind, semantic_key),
+            ).fetchone()
+            if row is None:
+                cursor = conn.execute(
+                    "INSERT INTO learning_candidates "
+                    "(kind, semantic_key, title, status, payload_json, version_hash, "
+                    "created_at, updated_at) VALUES (?, ?, ?, 'observe', ?, ?, ?, ?)",
+                    (kind, semantic_key, title[:240], encoded, version_hash, now, now),
+                )
+                candidate_id = int(cursor.lastrowid)
+            else:
+                candidate_id = int(row["id"])
+                reviewed_version_changed = (
+                    str(row["version_hash"]) != version_hash
+                    and str(row["status"])
+                    not in {"observe", "ready_for_review"}
+                )
+                conn.execute(
+                    "UPDATE learning_candidates SET title=?, payload_json=?, "
+                    "version_hash=?, status=CASE WHEN ? THEN 'observe' ELSE status END, "
+                    "application_json=CASE WHEN ? THEN '{}' ELSE application_json END, "
+                    "applied_at=CASE WHEN ? THEN NULL ELSE applied_at END, "
+                    "updated_at=? WHERE id=?",
+                    (
+                        title[:240],
+                        encoded,
+                        version_hash,
+                        reviewed_version_changed,
+                        reviewed_version_changed,
+                        reviewed_version_changed,
+                        now,
+                        candidate_id,
+                    ),
+                )
+            for item in evidence:
+                conn.execute(
+                    "INSERT INTO learning_candidate_evidence "
+                    "(candidate_id, episode_id, source_hash, outcome, evidence_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(candidate_id, episode_id) "
+                    "DO UPDATE SET evidence_count=max(evidence_count, excluded.evidence_count)",
+                    (
+                        candidate_id,
+                        int(item["episode_id"]),
+                        str(item["source_hash"]),
+                        str(item.get("outcome") or ""),
+                        max(1, int(item.get("evidence_count") or 1)),
+                        now,
+                    ),
+                )
+            stats = conn.execute(
+                "SELECT COUNT(DISTINCT CASE WHEN lower(outcome)='success' "
+                "THEN source_hash END) AS successes, "
+                "COALESCE(MAX(evidence_count), 0) AS repeated, COUNT(*) AS episodes "
+                "FROM learning_candidate_evidence WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            successes = int(stats["successes"] or 0)
+            repeated = int(stats["repeated"] or 0)
+            episode_count = int(stats["episodes"] or 0)
+            ready = successes >= 3 if kind == "skill" else (
+                episode_count >= 2 or repeated >= 3
+            )
+            status = "ready_for_review" if ready else "observe"
+            conn.execute(
+                "UPDATE learning_candidates SET status=CASE "
+                "WHEN status IN ('observe','ready_for_review') THEN ? ELSE status END, "
+                "successful_run_count=?, repeated_failure_count=?, updated_at=? WHERE id=?",
+                (status, successes, repeated, now, candidate_id),
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM learning_candidates WHERE id=?",
+                    (candidate_id,),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def list_learning_candidates(
+        self,
+        *,
+        statuses: Iterable[str] = ("ready_for_review",),
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        values = tuple(str(value) for value in statuses)
+        if not values:
+            return []
+        placeholders = ",".join("?" for _ in values)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM learning_candidates WHERE status IN ("
+                + placeholders + ") ORDER BY updated_at DESC LIMIT ?",
+                (*values, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _ensure_learning_candidate_fts(self) -> bool:
+        if not self._fts_enabled:
+            return False
+        tokenizer = "cjk_unicode61" if self._fts_cjk_loaded else "trigram"
+        version = f"2:{tokenizer}"
+        sql = f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS learning_candidates_fts
+        USING fts5(title, semantic_key, payload_json,
+            content='learning_candidates', content_rowid='id',
+            tokenize='{tokenizer}');
+        CREATE TRIGGER IF NOT EXISTS learning_candidates_fts_ai
+        AFTER INSERT ON learning_candidates BEGIN
+          INSERT INTO learning_candidates_fts(
+            rowid, title, semantic_key, payload_json)
+          VALUES (new.id, new.title, new.semantic_key, new.payload_json);
+        END;
+        CREATE TRIGGER IF NOT EXISTS learning_candidates_fts_ad
+        AFTER DELETE ON learning_candidates BEGIN
+          INSERT INTO learning_candidates_fts(
+            learning_candidates_fts, rowid, title, semantic_key, payload_json)
+          VALUES ('delete', old.id, old.title, old.semantic_key, old.payload_json);
+        END;
+        CREATE TRIGGER IF NOT EXISTS learning_candidates_fts_au
+        AFTER UPDATE ON learning_candidates BEGIN
+          INSERT INTO learning_candidates_fts(
+            learning_candidates_fts, rowid, title, semantic_key, payload_json)
+          VALUES ('delete', old.id, old.title, old.semantic_key, old.payload_json);
+          INSERT INTO learning_candidates_fts(
+            rowid, title, semantic_key, payload_json)
+          VALUES (new.id, new.title, new.semantic_key, new.payload_json);
+        END;
+        """
+        try:
+            with self._lock:
+                current = self._conn.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key='learning_candidates_fts_version'"
+                ).fetchone()
+                if current is None or str(current["value"]) != version:
+                    self._conn.executescript(
+                        "DROP TRIGGER IF EXISTS learning_candidates_fts_ai;"
+                        "DROP TRIGGER IF EXISTS learning_candidates_fts_ad;"
+                        "DROP TRIGGER IF EXISTS learning_candidates_fts_au;"
+                        "DROP TABLE IF EXISTS learning_candidates_fts;"
+                    )
+                self._conn.executescript(sql)
+                if current is None or str(current["value"]) != version:
+                    self._conn.execute(
+                        "INSERT INTO learning_candidates_fts"
+                        "(learning_candidates_fts) VALUES('rebuild')"
+                    )
+                    self._conn.execute(
+                        "INSERT INTO state_meta(key, value) "
+                        "VALUES('learning_candidates_fts_version', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (version,),
+                    )
+            return True
+        except sqlite3.Error:
+            logger.debug(
+                "Learning candidate CJK FTS unavailable; using LIKE fallback",
+                exc_info=True,
+            )
+            return False
+
+    def search_learning_candidates(
+        self, query: str, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """FTS/BM25 candidate preselection with bounded LIKE fallback."""
+        terms = re.findall(
+            r"[\w\u3400-\u9fff]+", str(query or "")[:2048], re.UNICODE
+        )
+        fts_query = " OR ".join(f'"{value}"' for value in terms[:24] if value)
+        if fts_query and self._ensure_learning_candidate_fts():
+            try:
+                with self._lock:
+                    rows = self._conn.execute(
+                        "SELECT c.*, bm25(learning_candidates_fts) AS rank "
+                        "FROM learning_candidates_fts JOIN learning_candidates c "
+                        "ON c.id=learning_candidates_fts.rowid "
+                        "WHERE learning_candidates_fts MATCH ? "
+                        "AND c.status IN ('observe','ready_for_review') "
+                        "ORDER BY rank, c.updated_at DESC LIMIT ?",
+                        (fts_query, max(1, int(limit))),
+                    ).fetchall()
+                if rows:
+                    return [dict(row) for row in rows]
+            except sqlite3.Error:
+                logger.debug(
+                    "Learning candidate FTS unavailable; using LIKE fallback",
+                    exc_info=True,
+                )
+        like = f"%{str(query or '')[:500]}%"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM learning_candidates "
+                "WHERE status IN ('observe','ready_for_review') AND "
+                "(title LIKE ? OR semantic_key LIKE ? OR payload_json LIKE ?) "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (like, like, like, max(1, int(limit))),
+            ).fetchall()
+            if not rows:
+                rows = self._conn.execute(
+                    "SELECT * FROM learning_candidates "
+                    "WHERE status IN ('observe','ready_for_review') "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_learning_candidates_notified(
+        self, values: Iterable[tuple[int, str]]
+    ) -> None:
+        items = [(str(version), int(candidate_id)) for candidate_id, version in values]
+        if not items:
+            return
+        self._execute_write(
+            lambda conn: conn.executemany(
+                "UPDATE learning_candidates SET last_notified_version=? WHERE id=?",
+                items,
+            )
+        )
+
+    def review_learning_candidate(
+        self,
+        candidate_id: int,
+        *,
+        action: str,
+        version_hash: str,
+    ) -> Optional[Dict[str, Any]]:
+        target = "approved" if action == "approve" else "rejected"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM learning_candidates WHERE id=?",
+                (int(candidate_id),),
+            ).fetchone()
+            if row is None or str(row["version_hash"]) != str(version_hash):
+                return None
+            current = str(row["status"])
+            if action == "approve" and current not in {"ready_for_review", "failed"}:
+                return None
+            if action == "reject" and current not in {
+                "ready_for_review", "approved", "failed"
+            }:
+                return None
+            conn.execute(
+                "UPDATE learning_candidates SET status=?, "
+                "application_claim_id=NULL, application_reviewer=NULL, "
+                "application_lease_until=NULL, updated_at=? WHERE id=?",
+                (target, time.time(), int(candidate_id)),
+            )
+            result = dict(row)
+            result["status"] = target
+            return result
+
+        return self._execute_write(_do)
+
+    def claim_learning_candidate_application(
+        self,
+        candidate_id: int,
+        *,
+        version_hash: str,
+        reviewer: str,
+        lease_seconds: int = 900,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim one approved candidate for foreground application."""
+        now = time.time()
+        claim_id = hashlib.sha256(
+            (
+                f"{candidate_id}\0{version_hash}\0{reviewer}\0"
+                f"{time.time_ns()}\0{random.random()}"
+            ).encode()
+        ).hexdigest()[:24]
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE learning_candidates SET status='applying', "
+                "application_claim_id=?, application_reviewer=?, "
+                "application_lease_until=?, updated_at=? "
+                "WHERE id=? AND version_hash=? AND (status='approved' OR "
+                "(status='applying' AND COALESCE(application_lease_until, 0) < ?))",
+                (
+                    claim_id,
+                    reviewer,
+                    now + max(60, int(lease_seconds)),
+                    now,
+                    int(candidate_id),
+                    str(version_hash),
+                    now,
+                ),
+            )
+            if not cursor.rowcount:
+                return None
+            return dict(
+                conn.execute(
+                    "SELECT * FROM learning_candidates WHERE id=?",
+                    (int(candidate_id),),
+                ).fetchone()
+            )
+
+        return self._execute_write(_do)
+
+    def record_learning_candidate_result(
+        self,
+        candidate_id: int,
+        *,
+        version_hash: str,
+        claim_id: str,
+        success: bool,
+        result: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Record the foreground application result for an approved candidate."""
+        encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)[:8000]
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM learning_candidates WHERE id=?",
+                (int(candidate_id),),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["version_hash"]) != str(version_hash)
+                or str(row["status"]) != "applying"
+                or str(row["application_claim_id"] or "") != str(claim_id)
+            ):
+                return None
+            status = "applied" if success else "failed"
+            conn.execute(
+                "UPDATE learning_candidates SET status=?, application_json=?, "
+                "application_claim_id=NULL, application_reviewer=NULL, "
+                "application_lease_until=NULL, applied_at=?, updated_at=? WHERE id=?",
+                (
+                    status,
+                    encoded,
+                    now if success else None,
+                    now,
+                    int(candidate_id),
+                ),
+            )
+            result_row = dict(row)
+            result_row["status"] = status
+            result_row["application_json"] = encoded
+            result_row["applied_at"] = now if success else None
+            return result_row
 
         return self._execute_write(_do)
 

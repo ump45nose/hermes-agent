@@ -109,7 +109,7 @@
   清单。
 - **Runtime overlay**：由明确进程状态决定的短协议，例如真实 Kanban worker。
   它不是语义路由。
-- **Scenario card**：由一个或多个 Episode 提炼出的、可被关键词命中的情景知识。
+- **Episode recall**：从 Profile `state.db` 直接检索并只注入当前请求的历史情景。
 - **Evidence bundle**：Research leaf 保存在本地的完整报告、来源和证据。
 - **Handoff envelope**：Research leaf 回给父 Agent 的结构化、有限长度摘要。
 
@@ -131,7 +131,7 @@
   关闭。
 - 同时记录原始请求体的 SHA-256 和经过脱敏、适合人工查看的副本。若原始正文
   需要保留，必须是短期、显式、owner-only 的诊断产物。
-- 快照标注每个上下文块的来源：compiled prompt、SOUL、USER、scenario card、
+- 快照标注每个上下文块的来源：compiled prompt、SOUL、USER、Episode、
   runtime overlay、history、tool result、tool schema。
 - 提供只读检查命令，能按 Profile/session/request id 定位快照。
 
@@ -272,7 +272,7 @@ agent:
 4. `USER.md`；
 5. 平台格式 overlay；
 6. 明确运行身份 overlay；
-7. 命中的 scenario cards；
+7. 命中的 Episode；
 8. 会话历史；
 9. Tool Context Editor 处理后的工具消息。
 
@@ -282,7 +282,7 @@ agent:
 缓存要求：
 
 - compiled prompt、SOUL、USER 的 hash 可独立观测。
-- scenario card 和进程 overlay 属于 volatile 区，不污染固定 Prompt hash。
+- Episode recall 和进程 overlay 属于 volatile 区，不污染固定 Prompt hash。
 - 会话冻结修复完成后，新会话读取当前 Profile 固化版本；旧会话的升级策略由
   冻结修复任务定义。
 
@@ -351,79 +351,89 @@ result 内容，从而维持 Chat Completions、Responses 和 Anthropic 三类 P
 - Anthropic context editing 会清除旧 Tool result、保留最近窗口并用占位保持
   上下文可理解。
 
-### 6.8 本地 Episode 与关键词情景知识
+### 6.8 Profile state.db Episode
 
-#### 6.8.1 沿用现有 Episode 提炼
+#### 6.8.1 Context trigger 与每日兜底
 
-保留现有逻辑：
-
-- 只扫描 ended sessions；
-- 排除 cron、subagent 和测试来源；
-- 按 subject 隔离 leaf 上下文；
-- source hash 校验和幂等处理；
-- 不保存 system prompt、reasoning、凭据或原始 user id；
-- Episode 继续包含 goal、context、actions、decisions、outcome、summary、
-  artifacts、open loops 和 reusable lesson。
-
-将 `upload` 从 Mem0 HTTP 写入改为本地事务写入。
+final assistant 与 canonical message 同一 SQLite 事务写入脱敏、有界的
+`episode_extractions.input_json`，前台 Provider 路径不调用提炼模型。每日 22:15
+按 Profile round-robin 租约消费 durable queue，并补发现历史完整 turn；单个
+Profile 失败不阻塞其他 Profile，不依赖 session ended 或 message active 状态。
 
 #### 6.8.2 本地存储
 
-推荐位置：
-
-```text
-~/.hermes/user-context/context.db
-```
-
-这是独立的“用户情景知识层”，不是任一 Profile 的 `MEMORY.md`，也不是
-shared-state。Profile 不直接打开数据库，而是通过本地 broker 按
-`subject_id + profile + purpose` 查询，防止跨用户和跨 Profile 泄露。
+Episode 直接存入来源 Profile 的 `state.db`，与 canonical transcript 同库但
+分表。默认只读当前 Profile；跨库读取必须同时通过
+`episode_memory.read_scopes` 中的 Profile 与 subject 范围。
 
 最小数据模型：
 
-- `episodes`：Episode 正文、subject、来源 Profile/session hash、outcome、时间；
-- `scenario_cards`：可注入正文、profile scope、状态、置信度、有效期；
-- `scenario_keywords`：关键词/短语、别名、权重、匹配模式；
-- `scenario_evidence`：card 到 episode 的证据关系；
-- `sync_state`：扫描游标、幂等 key、失败状态；
-- `audit_events`：创建、合并、失效和人工编辑记录。
+- `episodes`：结构化正文、retrieval text、keywords、subject、来源消息范围、
+  source/body hash、outcome 和 extractor provenance；
+- `episode_extractions`：持久化脱敏 input、pending/running 租约、
+  succeeded/skipped/failed、attempt 和 bounded error；
+- `episode_injections`：本次命中 Episode、来源 Profile、body hash、分数及
+  prepared/sent/failed 发送状态。
 
-SQLite 使用 WAL、事务、owner/group 权限和定期备份。数据库不保存原始 transcript。
+唯一键为 session、首尾 message id 和 source hash；在线与每日路径通过同一 claim
+事务幂等竞争。
 
-#### 6.8.3 关键词命中 v1
+#### 6.8.3 直接 Episode 召回
 
 不调用 LLM、不使用 embedding：
 
-1. 对 user query 做 Unicode NFKC、大小写和空白规范化；
-2. 先匹配配置的完整短语，再匹配明确 token/别名；
-3. 按 subject、Profile scope、状态和有效期过滤；
-4. 以短语精确度、命中数量、人工权重、置信度和最近验证时间排序；
-5. 默认注入 top 3，合计最多 3,000 字符；
-6. 无命中则完全不注入知识库块。
+1. 通过 Episode FTS5/BM25 查询 title、retrieval text 和 keywords；
+2. FTS 不可用时使用有界 LIKE 回退；
+3. 按 subject 和配置允许的 Profile 严格过滤；
+4. 默认注入 top 3，合计最多 3,000 字符；
+5. 只注入当前 Provider request sidecar 并进入实际 `api_content`，不持久化到
+   canonical message。
 
-每个命中块必须标注 card id、更新时间和来源 Episode 数量，方便审计，但不把
-原始 session id 发给 LLM。
+每个命中块只标注 Episode id、更新时间和 body hash，方便审计，但不把原始
+session id 发给 LLM。
 
-#### 6.8.4 Scenario card 维护
+#### 6.8.4 旧库迁移
 
-- Episode 日任务在本地写入后，可对同一 subject 的新 Episode 生成或更新
-  scenario card 和关键词。
-- 单一 Episode 可创建临时 card，但低置信度、短有效期；涉及稳定流程的 card
-  仍需多个独立成功 run 才能升级。
-- 冲突 Episode 不直接覆盖旧 card，而是标记 `needs_review`。
-- 人工编辑优先级高于自动生成，自动任务不得静默覆盖。
-- Profile scope 默认来自 Episode 来源和内容类别；跨 Profile 共享必须显式标记。
+旧 `user-context/context.db` Episode 以 source hash 幂等导入来源 Profile
+`state.db`。旧库保留只读备份；运行时停用 Mem0 upload、shadow、Scenario Card
+和 consolidation，不自动删除远端数据或凭据文件。
 
-#### 6.8.5 从 Mem0 迁移
+### 6.9 Episode 驱动的 Profile Markdown
 
-1. 停止新的 Mem0 Episode 写入前，导出远端 Episode 元数据和正文；
-2. 以 `subject_id + run_id + source_hash` 幂等导入本地；
-3. 对比 subject 数、Episode 数、hash 和随机样本；
-4. 将 daily sync 和 consolidation reader 切换到本地；
-5. 连续观察至少 7 天后，禁用 Mem0 凭据和 cron 路径；
-6. 不在本 PRD 中删除远端 Mem0 数据。若以后需要删除，单独取得授权。
+五个 Profile 的 `state.db.episodes` 是 Hermes 内部自动归纳的唯一事实入口。
+每日 22:15 在 Episode 补提炼之后，每个 Profile 最多处理 50 条 Episode，并以
+`add/replace/remove/skip` 原子 operation 更新自己的 `MEMORY.md`（4,000 字符）
+和 `USER.md`（3,000 字符）。
 
-### 6.9 遗留 `MEMORY.md` 清洗
+- 现有 Markdown 与前台 `memory` 写入登记为人工条目并受保护；
+- 自动链只可替换或删除具有自动审计、且正文 hash 匹配的条目；
+- USER 只接受配置的 owner subject，群内其他成员为 `excluded_by_policy`；
+- 模型失败、非法 JSON、漂移或预算超限均不覆盖文件，保留状态供次日重试；
+- 双文件更新使用固定锁顺序、原子替换和 crash journal；变化从下一个会话生效，
+  不在当前长会话热重载。正文仍不写入 canonical message 或 `api_content`。
+
+审计表为 `knowledge_distillations`、`memory_entry_audit` 与
+`episode_knowledge_dispositions`。Lingjun 跨 Profile Episode 召回权限不适用于
+归纳，各 Profile 只能写自己的 Markdown 和数据库。
+
+### 6.10 Skill/Tool 学习候选与审批
+
+每三日按 Profile 聚合 Episode。相似候选先以 FTS/BM25 预选，再由辅助模型做
+merge/new/discard；不维护手写同义词 vocabulary。
+
+- Skill：三个不同 source hash 且 outcome=success 才进入待审；
+- Tool：工具名、状态、effect 与 digest 来自确定性 Tool receipt；两个独立
+  Episode 或单 Episode 三次相同确定性失败才进入待审；
+- ready 候选投递到 Telegram 运维话题 `11829`；
+- Lingjun 的 `learning_review` 以 reviewer subject ACL、candidate ID、version
+  和原子 lease claim 防止越权、并发重复应用及陈旧审批；
+- cron 永不修改正式 Skill/Tool。批准后的同一前台 turn 走现有 provenance、
+  ownership、approval 和最小验证流程，随后登记 applied/failed、目标 hash 和
+  验证摘要。
+
+普通 Mem0 每日同步保持为跨客户端高层用户记忆，不参与此候选链。
+
+### 6.11 遗留 `MEMORY.md` 清洗
 
 一次性迁移按以下分类处理：
 
@@ -556,8 +566,10 @@ flowchart TD
     F["SOUL / USER"] --> E
     G["明确 runtime_role"] --> H["短 runtime overlay"]
     H --> E
-    I["本地 Scenario DB"] --> J["关键词匹配"]
+    I["Profile state.db Episodes"] --> J["FTS/BM25 单次召回"]
     J --> E
+    I --> O["每日 MEMORY/USER 归纳"]
+    I --> P["每三日 Skill/Tool 人审候选"]
     K["会话与 Tool results"] --> L["Tool Context Editor"]
     L --> E
     E --> M["Provider adapter"]
@@ -597,14 +609,14 @@ flowchart TD
   call/result 配对测试；
 - 使用统一占位文本，并保留 artifact 引用和逐条审计报告作为内部元数据。
 
-### Phase 4：本地 Episode/Scenario
+### Phase 4：Profile-local Episode 与知识归纳
 
-- 建本地 DB 和 broker；
-- 导入 Mem0 Episode 并校验；
-- daily sync 双写观察，期间本地为 shadow；
-- 切换 reader 和 writer；
-- 启用关键词注入；
-- 禁用 Mem0 写入，保留远端数据。
+- Episode 直接写入来源 Profile `state.db`，导入旧库并核对 hash；
+- 召回切换为 FTS/BM25 单次 Provider projection；
+- 每日归纳 `MEMORY.md/USER.md`，登记既有人工条目并启用 owner policy；
+- 每三日聚合 Skill/Tool 人审候选，接入 Telegram 运维话题审批；
+- 退役旧 Mem0 Episode/Scenario/turn-based consolidation，保留普通 Mem0 日同步
+  与远端数据。
 
 ### Phase 5：Memory 清洗
 
@@ -668,10 +680,10 @@ flowchart TD
 
 - system prompt 字符/token，按来源块拆分；
 - tool schema 字符/token；
-- history、tool result、scenario card 字符/token；
+- history、tool result、Episode recall 字符/token；
 - Tool Context Editor 各分类数量与节省量；
 - compiled prompt hash 和 runtime overlay 枚举；
-- scenario 命中数、候选数和注入字符数；
+- Episode 命中数、候选数和注入字符数；
 - Research fan-out 数、leaf 时长、来源数、envelope 字符、artifact 字符；
 - Provider 400/上下文超限/compaction 次数。
 
@@ -695,11 +707,10 @@ flowchart TD
 
 以下采用推荐默认值进入原型，评审时可调整：
 
-1. Scenario 注入：top 3、总计 3,000 字符。
+1. Episode 注入：top 3、总计 3,000 字符。
 2. Research envelope：目标 8,000 字符、硬上限 12,000 字符/leaf。
-3. Mem0 切换后观察期：至少 7 天；远端数据不自动删除。
-4. 本地用户知识库：采用 root-local 的 `~/.hermes/user-context/context.db`，
-   由 broker 做 subject/Profile 隔离，而不是每个 Profile 各存一份。
+3. 旧 Mem0 远端数据不自动删除。
+4. Episode 采用 Profile `state.db` 本地存储；跨 Profile 读取必须显式授权。
 5. 现有 Profile 的 Prompt 迁移只生成 diff，不自动覆盖。
 
 ## 13. 外部设计参考

@@ -1145,11 +1145,18 @@ def hydrate_tool_search_result(agent: Any, result: Any) -> Any:
             loaded.remove(name)
         loaded.append(name)
     active = rebuild_hydrated_tool_surface(agent, loaded)
-    payload["loaded_tools"] = accepted
+    active_set = set(active)
+    payload["loaded_tools"] = [name for name in accepted if name in active_set]
+    evicted = [name for name in loaded if name not in active_set]
+    if evicted:
+        payload["evicted_tools"] = evicted
     if accepted:
         payload["instruction"] = (
             "The referenced tools are now loaded with their real schemas. "
-            "Call them directly by name; do not use tool_describe or tool_call."
+            "Call them directly by name; do not use tool_describe or tool_call. "
+            "Only names in active_hydrated_tools are callable now; earlier "
+            "tool_search results may have been evicted. Never substitute a "
+            "similarly named tool."
         )
     if rejected:
         payload["rejected_references"] = rejected
