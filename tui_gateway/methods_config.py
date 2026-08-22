@@ -9,37 +9,48 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
+from hermes_constants import DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES
+
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
 @method("projects.discover_repos")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""
     try:
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"repos": []})
-        from hermes_cli import projects_db as pdb
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"repos": []})
+            from hermes_cli import projects_db as pdb
 
-        policy = _repo_discovery_policy()
-        policy_key = _repo_discovery_policy_key(policy)
-        with pdb.connect_closing() as conn:
-            pdb.reconcile_discovered_repos_policy(
-                conn,
-                policy_key,
-                preserve_unversioned=_repo_discovery_policy_is_default(policy),
-            )
-            repos = _discover_repos_payload(
-                db, conn=conn, include_cached=policy["enabled"]
-            )
-        return _ok(rid, {"repos": repos, "discovery_policy": policy})
+            policy = _repo_discovery_policy()
+            policy_key = _repo_discovery_policy_key(policy)
+            with pdb.connect_closing() as conn:
+                pdb.reconcile_discovered_repos_policy(
+                    conn,
+                    policy_key,
+                    preserve_unversioned=_repo_discovery_policy_is_default(policy),
+                )
+                # `scan=true` (set by the desktop in remote-gateway mode): run a
+                # backend-side filesystem scan of the policy roots so repos with
+                # zero Hermes sessions still surface. The desktop's native scan
+                # only runs on the local filesystem; on a remote connection it
+                # must ask the host to scan itself (#81723).
+                if params.get("scan") and policy["enabled"]:
+                    _scan_discovered_repos_remote(conn, policy)
+                repos = _discover_repos_payload(
+                    db, conn=conn, include_cached=policy["enabled"]
+                )
+            return _ok(rid, {"repos": repos, "discovery_policy": policy})
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.record_repos")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Persist git repo roots found by the client's filesystem scan, then return
     the merged repo list. The native crawl runs on the desktop (local fs); this
@@ -86,24 +97,25 @@ def _(rid, params: dict) -> dict:
             elif not policy["enabled"]:
                 pdb.clear_discovered_repos(conn, policy_key=policy_key)
 
-        db = _get_db()
-        return _ok(
-            rid,
-            {
-                "repos": _discover_repos_payload(
-                    db, include_cached=policy["enabled"]
-                )
-                if db is not None
-                else [],
-                "accepted": accepted,
-                "discovery_policy": policy,
-            },
-        )
+        with _profile_db(params) as db:
+            return _ok(
+                rid,
+                {
+                    "repos": _discover_repos_payload(
+                        db, include_cached=policy["enabled"]
+                    )
+                    if db is not None
+                    else [],
+                    "accepted": accepted,
+                    "discovery_policy": policy,
+                },
+            )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.tree")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Authoritative project overview: project -> repo -> lane structure with
     counts + a few preview sessions per project, plus the flat set of session
@@ -111,26 +123,27 @@ def _(rid, params: dict) -> dict:
     Lanes carry no session rows here; drill-in uses ``projects.project_sessions``.
     """
     try:
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
 
-        tree, active_id = _build_project_tree(
-            db,
-            preview_limit=int(params.get("preview_limit") or 3),
-            hydrate=False,
-            session_limit=int(params.get("session_limit") or 2000),
-            include_discovered=True,
-        )
-        return _ok(
-            rid,
-            {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
-        )
+            tree, active_id = _build_project_tree(
+                db,
+                preview_limit=int(params.get("preview_limit") or 3),
+                hydrate=False,
+                session_limit=int(params.get("session_limit") or 2000),
+                include_discovered=True,
+            )
+            return _ok(
+                rid,
+                {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
+            )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.project_sessions")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Fully hydrated lanes (repo -> lane -> session rows) for one project,
     built from the same authoritative grouping as ``projects.tree`` so ids and
@@ -140,18 +153,18 @@ def _(rid, params: dict) -> dict:
         if not project_id:
             return _err(rid, 5063, "project_id required")
 
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"project": None})
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"project": None})
 
-        # Drill-in only needs the entered project (which has sessions), so skip
-        # the zero-session discovery tier entirely.
-        tree, _active = _build_project_tree(
-            db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
-            include_discovered=False,
-        )
-        proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
-        return _ok(rid, {"project": proj})
+            # Drill-in only needs the entered project (which has sessions), so skip
+            # the zero-session discovery tier entirely.
+            tree, _active = _build_project_tree(
+                db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
+                include_discovered=False,
+            )
+            proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
+            return _ok(rid, {"project": proj})
     except Exception as e:
         return _err(rid, 5061, str(e))
 
@@ -198,18 +211,22 @@ def _(rid, params: dict) -> dict:
         # Normalize so a hand-edited config.yaml with stray casing or
         # an unknown value reads back the SAME value the TUI actually
         # rendered (frontend's `normalizeIndicatorStyle` falls back to
-        # `_INDICATOR_DEFAULT` for the same inputs).  Otherwise
+        # `DEFAULT_INDICATOR_STYLE` for the same inputs).  Otherwise
         # `/indicator` would print one thing while the UI shows another.
         raw = (_load_cfg().get("display") or {}).get("tui_status_indicator", "")
         norm = str(raw).strip().lower()
         return _ok(
             rid,
-            {"value": norm if norm in _INDICATOR_STYLES else _INDICATOR_DEFAULT},
+            {"value": norm if norm in INDICATOR_STYLES else DEFAULT_INDICATOR_STYLE},
         )
     if key == "personality":
+        # Report the EFFECTIVE personality via the single owner — a stale or
+        # unknown name in config must not display as active.
+        from hermes_cli.personality import active_personality_name
+
         return _ok(
             rid,
-            {"value": (_load_cfg().get("display") or {}).get("personality") or "none"},
+            {"value": active_personality_name(_load_cfg()) or "none"},
         )
     if key == "reasoning":
         cfg = _load_cfg()
