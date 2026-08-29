@@ -1125,6 +1125,14 @@ def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
     }
 
 
+def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+    """Return the compact, hydration-safe record for one search hit."""
+    return {
+        "name": entry.name,
+        **_shared_tool_record(entry),
+    }
+
+
 def _format_tool_reference(entry: CatalogEntry) -> Dict[str, str]:
     return {
         "type": "tool_reference",
