@@ -217,6 +217,7 @@ def run_oneshot(
             model=model,
             provider=provider,
             toolsets=toolsets,
+            skills=skills,
             usage_file=usage_file,
         )
 
@@ -226,6 +227,7 @@ def _run_oneshot_scoped(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    skills: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
