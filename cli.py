@@ -55,6 +55,7 @@ from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
 from agent.interrupt_compat import request_hard_interrupt
+from agent.pet import render as pet_render
 
 # prompt_toolkit for fixed input area TUI
 from prompt_toolkit.history import FileHistory
@@ -458,6 +459,7 @@ def load_cli_config() -> Dict[str, Any]:
             "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
+            "docker_shared_container_key": "",
         },
         "browser": {
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
@@ -524,12 +526,6 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "auxiliary": {
             "vision": {
-                "provider": "auto",
-                "model": "",
-                "base_url": "",
-                "api_key": "",
-            },
-            "web_extract": {
                 "provider": "auto",
                 "model": "",
                 "base_url": "",
@@ -683,6 +679,7 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_network": "TERMINAL_DOCKER_NETWORK",
         "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
         "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+        "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
         "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
@@ -734,12 +731,6 @@ def load_cli_config() -> Dict[str, Any]:
             "model": "AUXILIARY_VISION_MODEL",
             "base_url": "AUXILIARY_VISION_BASE_URL",
             "api_key": "AUXILIARY_VISION_API_KEY",
-        },
-        "web_extract": {
-            "provider": "AUXILIARY_WEB_EXTRACT_PROVIDER",
-            "model": "AUXILIARY_WEB_EXTRACT_MODEL",
-            "base_url": "AUXILIARY_WEB_EXTRACT_BASE_URL",
-            "api_key": "AUXILIARY_WEB_EXTRACT_API_KEY",
         },
         "approval": {
             "provider": "AUXILIARY_APPROVAL_PROVIDER",
@@ -1436,9 +1427,50 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+def _wait_for_oneshot_background_completions(cli) -> None:
+    """Bounded linger for notify_on_complete background processes (#90879).
+
+    A one-shot run (``-q`` / ``-Q``) that spawned bounded background work —
+    most importantly a Bot Mode handoff reply via ``message_agent`` /
+    ``bot_relay``, spawned as ``terminal(background=true,
+    notify_on_complete=true)`` — must not exit while that work is still
+    running: the children write to pipes owned by this process and are
+    destroyed shortly after it dies. Delegates the actual wait (and its
+    ``terminal.oneshot_completion_wait_seconds`` bound) to the process
+    registry. Cheap no-op when nothing is pending.
+    """
+    from tools.process_registry import process_registry
+
+    agent = getattr(cli, "agent", None)
+    task_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
+    # Wait on the whole registry, not just this task's processes: a one-shot
+    # CLI process hosts exactly one agent, so every tracked process in this
+    # interpreter was spawned by this run (task_id filtering would silently
+    # skip processes registered before the session id settled).
+    result = process_registry.wait_for_pending_completions(None)
+    if result.get("waited"):
+        logger.info(
+            "One-shot exit linger for session %s: completed=%s timed_out=%s",
+            task_id or "<unknown>",
+            result.get("completed"),
+            result.get("timed_out"),
+        )
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
+        # Linger (bounded) for background processes the turn spawned with
+        # notify_on_complete=true BEFORE any teardown. The one-shot parent
+        # owns those children's stdout pipes; exiting now kills the delivery
+        # a few seconds later. Bot Mode handoff replies dispatched from a
+        # short-lived `hermes -p <bot> chat -Q` recipient (message_agent /
+        # bot_relay spawns) are exactly this shape and were silently
+        # destroyed on parent exit (#90879).
+        try:
+            _wait_for_oneshot_background_completions(cli)
+        except Exception:
+            logger.debug("one-shot background completion wait failed", exc_info=True)
         # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
         # can issue aux-LLM calls, and nothing after it may fail in a way
         # that loses the turn (#88583).
@@ -4967,6 +4999,53 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SeededQueryMessage:
+    """Sentinel wrapper for a ``-q/--query`` prompt seeded into an
+    interactive session.
+
+    When ``hermes chat -q "…"`` runs on a real TTY, the query is submitted as
+    the first turn of a normal interactive session instead of the legacy
+    answer-and-exit single-query mode. The prompt is arbitrary user text (an
+    OS launcher, a desktop integration, a script) — it must be treated
+    LITERALLY: no slash-command routing, no ``!`` shell dispatch, no
+    file-drop detection. This sentinel marks the seeded first message so
+    ``process_loop`` skips those dispatchers for it (and only it).
+    """
+
+    __slots__ = ("text", "images")
+
+    def __init__(self, text: str, images=None):
+        self.text = text or ""
+        self.images = list(images or [])
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
+    """Whether a ``-q/--image`` invocation should seed an interactive session.
+
+    New default (Aug 2026): on a real TTY, ``chat -q`` submits the prompt as
+    the first turn of a normal interactive session (parity with other coding
+    agents' seeded launches — e.g. Omarchy's prompted agent terminals).
+
+    The legacy answer-and-exit behavior is preserved for every automation
+    surface:
+      - ``--oneshot`` on the chat subcommand (explicit legacy opt-in)
+      - ``-Q/--quiet`` (machine-readable single-query contract)
+      - any non-TTY stdin/stdout (kanban workers, cron, pipes, A2A)
+    ``-z/--oneshot`` at the top level never reaches this path at all.
+    """
+    if not (query or image):
+        return False
+    if oneshot or quiet:
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -4974,7 +5053,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     Provides a REPL interface with rich formatting, command history,
     and tool execution capabilities.
     """
-    
+
+    # Seeded -q handoff from main() → run() (see _should_seed_interactive):
+    # run() re-creates _pending_input, so the seeded first message rides in
+    # on this attribute and is enqueued after the fresh queue exists.
+    _seeded_first_message: Optional["_SeededQueryMessage"] = None
+
     def __init__(
         self,
         model: str = None,
@@ -5511,15 +5595,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._command_running = False
         self._command_blocks_input = False
         self._command_status = ""
-        # Petdex mascot (opt-in via display.pet). The base CLI mirrors the TUI's
-        # PetPane: a half-block sprite above the prompt that reacts to agent
-        # activity. Lazily resolved; an invalidate timer drives the animation.
+        # Petdex mascot (opt-in via display.pet). Kitty/Ghostty use Unicode
+        # placeholders plus out-of-band image transmission; other terminals
+        # use the truecolor half-block fallback.
         self._pet_renderer = None  # agent.pet.render.PetRenderer | None
         self._pet_slug: str = ""
         self._pet_enabled: bool = False
         self._pet_cols: int = 18
         self._pet_scale: float = 0.7
         self._pet_frames_cache: dict = {}  # state -> list[grid]
+        self._pet_kitty_cache: dict = {}  # state -> kitty placeholder payload
+        self._pet_kitty_image_id: int = 0
+        self._pet_kitty_pending: str = ""
         self._pet_frame_idx: int = 0
         self._pet_lock = threading.Lock()
         self._pet_cfg_checked: float = 0.0
@@ -5730,6 +5817,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if getattr(self, "_terminal_io_broken", False):
             return
         _replay_output_history()
+        self._pet_queue_kitty_frame()
         try:
             app.invalidate()
         except OSError as exc:
@@ -5948,6 +6036,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
         if new_width is not None:
             self._last_resize_width = new_width
+        if width_changed:
+            self._pet_queue_kitty_frame()
         original_on_resize()
         self._schedule_status_bar_unsuppress(app)
 
@@ -6694,15 +6784,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     # ── Petdex mascot (base-CLI pet pane) ───────────────────────────────
     #
-    # Parity with the TUI: a half-block sprite rendered as a prompt_toolkit
-    # window above the prompt, reacting to agent state and animated by a timer
-    # that calls ``app.invalidate()``. Half-blocks only — the crisp Kitty image
-    # protocol can't coexist with prompt_toolkit's patch_stdout output layer
-    # (raw image escapes get swallowed/mangled), so we use truecolor styled
-    # text, which prompt_toolkit renders natively in any 24-bit terminal.
+    # Parity with the TUI: a sprite in a prompt_toolkit window above the
+    # prompt. Kitty/Ghostty use Unicode placeholders — prompt_toolkit owns
+    # the measurable grid; image bytes go out-of-band as a virtual placement
+    # via after_render + write_raw (cursor untouched). WezTerm/iTerm/sixel
+    # stay on half-blocks: they are not placeholder-capable.
 
     _PET_FRAME_INTERVAL = 0.16
     _PET_CFG_INTERVAL = 2.5
+
+    def _pet_clear_runtime(self) -> None:
+        """Drop renderer + queued Kitty state. Caller holds ``_pet_lock``."""
+        self._pet_enabled = False
+        self._pet_renderer = None
+        self._pet_frames_cache.clear()
+        self._pet_kitty_cache.clear()
+        self._pet_kitty_pending = ""
+        self._pet_kitty_image_id = 0
 
     def _pet_resolve_config(self) -> None:
         """(Re)resolve the active pet from config — picks up live enable/disable/
@@ -6712,7 +6810,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         try:
             from agent.pet import constants, store
-            from agent.pet.render import PetRenderer
             from hermes_cli.config import load_config
 
             cfg = load_config()
@@ -6725,43 +6822,48 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             slug = str(pet_cfg.get("slug", "") or "")
             scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
             cols = constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
+            configured_mode = str(pet_cfg.get("render_mode", "auto") or "auto").lower()
+            # Placeholders only on kitty/Ghostty. WezTerm speaks kitty APC but
+            # not U+10EEEE — detect_terminal_graphics() still returns kitty
+            # there, which is why this gate is narrower.
+            use_kitty = configured_mode in ("", "auto", "kitty") and pet_render.supports_kitty_placeholders()
+            renderer_mode = "kitty" if use_kitty else "unicode"
 
-            if not enabled:
+            if not enabled or configured_mode == "off":
                 with self._pet_lock:
-                    self._pet_enabled = False
-                    self._pet_renderer = None
-                    self._pet_frames_cache.clear()
+                    self._pet_clear_runtime()
                 return
 
             pet = store.resolve_active_pet(slug)
             if pet is None or not pet.exists:
                 with self._pet_lock:
-                    self._pet_enabled = False
-                    self._pet_renderer = None
-                    self._pet_frames_cache.clear()
+                    self._pet_clear_runtime()
                 return
 
             with self._pet_lock:
-                # Rebuild only when the resolved pet or geometry changes.
+                # Rebuild only when the resolved pet, mode, or geometry changes.
                 if (
                     self._pet_renderer is None
                     or self._pet_slug != pet.slug
                     or self._pet_cols != cols
                     or self._pet_scale != scale
+                    or self._pet_renderer.mode != renderer_mode
                 ):
-                    self._pet_renderer = PetRenderer(
-                        str(pet.spritesheet), mode="unicode", scale=scale, unicode_cols=cols
+                    self._pet_renderer = pet_render.PetRenderer(
+                        str(pet.spritesheet), mode=renderer_mode, scale=scale, unicode_cols=cols
                     )
                     self._pet_slug = pet.slug
                     self._pet_cols = cols
                     self._pet_scale = scale
                     self._pet_frames_cache.clear()
+                    self._pet_kitty_cache.clear()
+                    self._pet_kitty_pending = ""
+                    self._pet_kitty_image_id = pet_render.kitty_image_id(pet.slug)
                     self._pet_frame_idx = 0
                 self._pet_enabled = True
         except Exception:
             with self._pet_lock:
-                self._pet_enabled = False
-                self._pet_renderer = None
+                self._pet_clear_runtime()
 
     def _pet_flash(self, state: str, secs: float = 1.6) -> None:
         """Briefly force a transient reaction (wave/jump/failed) before resting."""
@@ -6836,12 +6938,79 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pet_frames_cache[state] = grids
         return grids
 
+    def _pet_kitty_payload_for(self, state: str) -> dict | None:
+        """Return and cache a Kitty virtual-placeholder payload for *state*."""
+        with self._pet_lock:
+            cached = self._pet_kitty_cache.get(state)
+            if cached is not None:
+                return cached
+            renderer = self._pet_renderer
+            image_id = self._pet_kitty_image_id
+            if renderer is None or renderer.mode != "kitty":
+                return None
+        try:
+            # PNG encoding is outside _pet_lock: first visit of a state must
+            # not stall the prompt under the lock.
+            payload = renderer.kitty_payload(state, image_id=image_id)
+        except Exception:
+            payload = None
+        if payload is not None:
+            payload = {**payload, "image_id": image_id}
+            with self._pet_lock:
+                if self._pet_renderer is renderer and self._pet_kitty_image_id == image_id:
+                    self._pet_kitty_cache[state] = payload
+        return payload
+
+    def _pet_queue_kitty_frame(self, state: str | None = None) -> None:
+        """Queue one virtual Kitty frame for the next prompt_toolkit render.
+
+        No-op when the pet pane was never initialized (``__new__`` fixtures
+        and ``_force_full_redraw`` / resize recovery on a pet-less CLI).
+        """
+        if not getattr(self, "_pet_enabled", False):
+            return
+        if state is None:
+            state = self._derive_pet_state()
+        payload = self._pet_kitty_payload_for(state)
+        if not payload or not payload.get("frames"):
+            return
+        with self._pet_lock:
+            if self._pet_renderer is not None and self._pet_renderer.mode == "kitty":
+                self._pet_kitty_pending = payload["frames"][self._pet_frame_idx % len(payload["frames"])]
+
+    def _pet_flush_kitty_frame(self, app) -> None:
+        """Write a queued APC after prompt_toolkit has finished its screen diff."""
+        with self._pet_lock:
+            frame = self._pet_kitty_pending
+            self._pet_kitty_pending = ""
+        if not frame:
+            return
+        try:
+            # U=1/q=2 leaves the cursor and input stream untouched.
+            app.output.write_raw(frame)
+            app.output.flush()
+        except (OSError, ValueError):
+            pass
+
     def _pet_fragments(self):
         """Return prompt_toolkit FormattedText for the current pet frame, or []."""
         with self._pet_lock:
             if not self._pet_enabled or self._pet_renderer is None:
                 return []
             state = self._derive_pet_state()
+            kitty = self._pet_renderer.mode == "kitty"
+        if kitty:
+            payload = self._pet_kitty_payload_for(state)
+            if not payload:
+                return []
+            color = pet_render.kitty_color_hex(payload["image_id"])
+            frags = []
+            for y, row in enumerate(payload["placeholder"]):
+                if y:
+                    frags.append(("", "\n"))
+                frags.append((f"fg:{color}", row))
+            return frags
+        with self._pet_lock:
             grids = self._pet_frames_for(state)
             if not grids:
                 return []
@@ -6873,7 +7042,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         with self._pet_lock:
             if not self._pet_enabled or self._pet_renderer is None:
                 return 0
-            grids = self._pet_frames_for(self._derive_pet_state())
+            state = self._derive_pet_state()
+            kitty = self._pet_renderer.mode == "kitty"
+        if kitty:
+            payload = self._pet_kitty_payload_for(state)
+            return int(payload.get("rows", 0)) if payload else 0
+        with self._pet_lock:
+            grids = self._pet_frames_for(state)
             if not grids or not grids[0]:
                 return 0
             return len(grids[0])
@@ -6893,6 +7068,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 continue
             with self._pet_lock:
                 self._pet_frame_idx += 1
+                kitty = self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
+            if kitty:
+                self._pet_queue_kitty_frame()
             app = getattr(self, "_app", None)
             if app is not None:
                 try:
@@ -6908,6 +7086,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._pet_anim_running:
             return
         self._pet_resolve_config()
+        with self._pet_lock:
+            kitty = self._pet_enabled and self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
+        if kitty:
+            self._pet_queue_kitty_frame()
         self._pet_anim_running = True
         self._pet_anim_thread = threading.Thread(target=self._pet_anim_loop, daemon=True)
         self._pet_anim_thread.start()
@@ -10133,6 +10315,118 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"       Resume the live session with: hermes --resume {self.session_id}")
         except Exception as e:
             print(f"(x_x) Failed to save: {e}")
+
+    def _rewind_persisted_user_turn(
+        self,
+        *,
+        warm_history: List[Dict[str, Any]],
+        user_ordinal: int,
+        warm_live_view: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """Bind one warm user ordinal to a durable row and rewind it atomically."""
+        if self._session_db is None or not self.session_id:
+            raise RuntimeError("session database is unavailable")
+
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            split_user_originated_turn,
+            user_originated_turn_view,
+        )
+        from agent.memory_manager import sanitize_context
+        from agent.tool_dispatch_helpers import (
+            _is_multimodal_tool_result,
+            _multimodal_text_summary,
+        )
+        from run_agent import _is_ephemeral_scaffolding
+
+        def _persistence_content(content: Any) -> Any:
+            """Project warm content exactly as the session DB flush does."""
+            if _is_multimodal_tool_result(content):
+                return _multimodal_text_summary(content)
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                    elif isinstance(part, dict) and part.get("type") in {
+                        "image",
+                        "image_url",
+                        "input_image",
+                    }:
+                        text_parts.append("[screenshot]")
+                return "\n".join(text_parts) if text_parts else None
+            return content
+
+        def _comparison_content(message: Dict[str, Any]) -> Any:
+            content = _persistence_content(message.get("content"))
+            if message.get("role") in {"user", "assistant"} and isinstance(
+                content, str
+            ):
+                return sanitize_context(content).strip()
+            return content
+
+        expected_active_ids = self._session_db.get_active_message_ids(
+            self.session_id
+        )
+        durable = self._session_db.get_messages_as_conversation(
+            self.session_id,
+            include_row_ids=True,
+        )
+        warm_persistence_history = [
+            message
+            for message in warm_history
+            if not _is_ephemeral_scaffolding(message)
+        ]
+        warm_user_indices = [
+            index
+            for index, message in enumerate(warm_persistence_history)
+            if user_originated_turn_view(message) is not None
+        ]
+        durable_user_indices = [
+            index
+            for index, message in enumerate(durable)
+            if user_originated_turn_view(message) is not None
+        ]
+        if len(durable_user_indices) != len(warm_user_indices):
+            raise RuntimeError(
+                "session history changed before the rewind could be persisted"
+            )
+        if user_ordinal < 0 or user_ordinal >= len(durable_user_indices):
+            raise RuntimeError("persisted rewind target is no longer available")
+
+        warm_prefix, _ = history_before_user_originated_turn(
+            warm_persistence_history, warm_user_indices[user_ordinal]
+        )
+        durable_target_index = durable_user_indices[user_ordinal]
+        durable_target = durable[durable_target_index]
+        durable_prefix, durable_live_view = history_before_user_originated_turn(
+            durable, durable_target_index
+        )
+        if _comparison_content(durable_live_view) != _comparison_content(
+            warm_live_view
+        ):
+            raise RuntimeError(
+                "session history changed before the rewind could be persisted"
+            )
+        target_row_id = durable_target.get("_row_id")
+        if not isinstance(target_row_id, int):
+            raise RuntimeError("persisted rewind target has no row identity")
+        scaffold, _ = split_user_originated_turn(durable_target)
+        result = self._session_db.rewind_to_message(
+            self.session_id,
+            target_row_id,
+            preserve_compaction_handoff=scaffold is not None,
+            expected_active_ids=expected_active_ids,
+            expected_target_content=durable_live_view.get("content"),
+        )
+        if scaffold is not None:
+            replacement_id = result.get("replacement_message_id")
+            if not isinstance(replacement_id, int) or not durable_prefix:
+                raise RuntimeError("rewind did not retain its compaction handoff")
+            durable_prefix[-1]["_row_id"] = replacement_id
+            durable_prefix[-1]["_db_persisted"] = True
+            warm_prefix[-1] = durable_prefix[-1]
+        return warm_prefix, durable_live_view, result
     
     def retry_last(self):
         """Retry the last user message by removing the last exchange and re-sending.
@@ -10147,25 +10441,71 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         
         # Walk backwards to the last *real* user message. Timeline bookkeeping
         # rows (display_kind set) are role=user but are not user turns — match
-        # CLI resume counting and list_recent_user_messages. Compaction
+        # CLI resume counting and user_originated_turn_view. Compaction
         # handoffs are excluded too (durable role=user, sometimes without
         # display_kind on legacy sessions; #80622).
-        from agent.context_compressor import is_user_originated_turn
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            retryable_user_text,
+            user_originated_turn_view,
+        )
+        from agent.memory_manager import sanitize_context
+        from run_agent import _is_ephemeral_scaffolding
 
-        last_user_idx = None
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            msg = self.conversation_history[i]
-            if is_user_originated_turn(msg):
-                last_user_idx = i
-                break
+        warm_history = list(self.conversation_history)
+
+        user_indices = [
+            index
+            for index, message in enumerate(warm_history)
+            if not _is_ephemeral_scaffolding(message)
+            and user_originated_turn_view(message) is not None
+        ]
         
-        if last_user_idx is None:
+        if not user_indices:
             print("(._.) No user message found to retry.")
             return None
+        last_user_idx = user_indices[-1]
         
-        # Extract the message text and remove everything from that point forward
-        last_message = self.conversation_history[last_user_idx].get("content", "")
-        self.conversation_history = self.conversation_history[:last_user_idx]
+        # Resolve a lossless live payload before touching either persistence or
+        # memory. A force-user-leading compaction row is one physical carrier:
+        # its historical handoff remains in the prefix while only the embedded
+        # human ask is retried. Media cannot be replayed by /retry, so fail
+        # closed before archiving anything.
+        try:
+            truncated, live_view = history_before_user_originated_turn(
+                warm_history, last_user_idx
+            )
+            live_content = live_view.get("content")
+            if isinstance(live_content, str):
+                live_content = sanitize_context(live_content).strip()
+            last_message = retryable_user_text(live_content)
+        except ValueError as exc:
+            print(f"(._.) Cannot retry that message safely: {exc}")
+            return None
+
+        # Persist the rewind before publishing the shorter in-memory view.
+        # The DB owns the physical carrier split so the archived original and
+        # retained scaffold are committed atomically. A plain user row keeps
+        # the legacy rewind shape (no replacement scaffold).
+        if self._session_db is not None and self.session_id:
+            try:
+                truncated, _, _ = self._rewind_persisted_user_turn(
+                    warm_history=warm_history,
+                    user_ordinal=len(user_indices) - 1,
+                    warm_live_view=live_view,
+                )
+            except Exception as exc:
+                print(f"(x_x) Retry rewind failed; history was not changed: {exc}")
+                return None
+
+        self.conversation_history = truncated
+        if self.agent is not None:
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                self.agent._last_flushed_db_idx = len(self.conversation_history)
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
         
         print(f"(^_^)b Retrying: \"{last_message[:60]}{'...' if len(last_message) > 60 else ''}\"")
         return last_message
@@ -10202,61 +10542,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Walk backwards collecting the indices of the last N *real* user
         # messages (exclude display_kind timeline rows and compaction
-        # handoffs — same predicate as list_recent_user_messages, resume
+        # handoffs — same predicate as user_originated_turn_view, resume
         # turn counting, and /retry; #80622).
-        from agent.context_compressor import is_user_originated_turn
+        from agent.context_compressor import (
+            history_before_user_originated_turn,
+            user_originated_turn_view,
+        )
+        from run_agent import _is_ephemeral_scaffolding
 
-        user_indices = []
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            msg = self.conversation_history[i]
-            if is_user_originated_turn(msg):
-                user_indices.append(i)
-                if len(user_indices) >= n:
-                    break
+        warm_history = list(self.conversation_history)
+
+        user_indices = [
+            index
+            for index, message in enumerate(warm_history)
+            if not _is_ephemeral_scaffolding(message)
+            and user_originated_turn_view(message) is not None
+        ]
 
         if not user_indices:
             print("(._.) No user message found to undo.")
             return
 
-        # The oldest of the collected user messages is our truncation point.
-        cut_idx = user_indices[-1]
-        turns_undone = len(user_indices)
+        turns_undone = min(n, len(user_indices))
+        target_ordinal = len(user_indices) - turns_undone
+        cut_idx = user_indices[target_ordinal]
 
-        removed_count = len(self.conversation_history) - cut_idx
-        removed_msg = self.conversation_history[cut_idx].get("content", "")
-        removed_text = self._undo_content_to_text(removed_msg)
-
-        # Truncate the in-memory history to before that user message.
-        self.conversation_history = self.conversation_history[:cut_idx]
+        removed_count = len(warm_history) - cut_idx
+        truncated, live_view = history_before_user_originated_turn(
+            warm_history, cut_idx
+        )
+        removed_text = self._undo_content_to_text(live_view.get("content"))
 
         # Soft-delete the truncated rows on disk so re-prompts and search
         # see the clean transcript while the rows survive for audit.
         rewound_rows = 0
         if self._session_db is not None and self.session_id:
             try:
-                recents = self._session_db.list_recent_user_messages(
-                    self.session_id, limit=max(turns_undone, 10)
+                truncated, durable_live_view, result = (
+                    self._rewind_persisted_user_turn(
+                        warm_history=warm_history,
+                        user_ordinal=target_ordinal,
+                        warm_live_view=live_view,
+                    )
                 )
-                if recents:
-                    target_idx = min(turns_undone - 1, len(recents) - 1)
-                    target_id = recents[target_idx]["id"]
-                    result = self._session_db.rewind_to_message(
-                        self.session_id, target_id
-                    )
-                    rewound_rows = result.get("rewound_count", 0)
-                    # Prefer the DB's decoded target text for the prefill —
-                    # it's the canonical persisted copy.
-                    db_text = self._undo_content_to_text(
-                        (result.get("target_message") or {}).get("content")
-                    )
-                    if db_text:
-                        removed_text = db_text
-            except ValueError as e:
-                # Non-user target / cross-session — keep the in-memory undo
-                # but skip the soft-delete; surface a debug-level note.
-                logger.debug("undo: soft-delete skipped: %s", e)
+                # Canonicalize the editable prefill before mutation. The raw
+                # physical carrier contains the reference summary wrapper.
+                durable_text = self._undo_content_to_text(
+                    durable_live_view.get("content")
+                )
+                if durable_text:
+                    removed_text = durable_text
+                rewound_rows = result.get("rewound_count", 0)
             except Exception as e:
-                logger.debug("undo: soft-delete failed: %s", e)
+                logger.debug("undo: durable rewind failed: %s", e)
+                print(f"(x_x) Undo failed; history was not changed: {e}")
+                return
+
+        # Publish only after the durable rewind succeeds (or no store exists).
+        self.conversation_history = truncated
 
         # Agent surgery: invalidate the system-prompt cache and reset the
         # flush index so the next turn re-flushes from the truncated head.
@@ -10271,6 +10614,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.agent._last_flushed_db_idx = len(self.conversation_history)
                 except Exception:
                     pass
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
             # Notify memory providers — same hook /branch fires, with the
             # rewound flag so per-turn document caches invalidate (#6672, #21910).
             try:
@@ -12273,6 +12620,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_heartbeat_command(cmd_original)
         elif canonical == "refine":
             self._handle_refine_command(cmd_original)
+        elif canonical == "review":
+            self._handle_review_command(cmd_original)
         elif canonical == "loop":
             self._handle_loop_command(cmd_original)
         elif canonical == "moa":
@@ -15661,14 +16010,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
+                           allow_session: bool = True,
                            smart_denied: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
         with choices: once / session / always / deny. Smart DENY owner
-        overrides show only once / deny. When allow_permanent is False for
-        another reason (for example tirith), only 'always' is hidden.
+        overrides show only once / deny, as do gates that re-ask every time
+        (allow_session=False). When allow_permanent is False for another
+        reason (for example tirith), only 'always' is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -15688,6 +16039,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "choices": self._approval_choices(
                     command,
                     allow_permanent=allow_permanent,
+                    allow_session=allow_session,
                     smart_denied=smart_denied,
                 ),
                 "selected": 0,
@@ -15739,9 +16091,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
+                          allow_session: bool = True,
                           smart_denied: bool = False) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        if smart_denied:
+        if smart_denied or not allow_session:
             choices = ["once", "deny"]
         else:
             choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
@@ -17539,6 +17892,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        # Seeded -q handoff: main() can't put directly into _pending_input
+        # (this reinit would discard it), so the seeded first message rides
+        # in on an attribute and is enqueued into the fresh queue here.
+        _seed_msg = getattr(self, "_seeded_first_message", None)
+        if _seed_msg is not None:
+            self._seeded_first_message = None
+            self._pending_input.put(_seed_msg)
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -19224,10 +19584,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             wrap_lines=True,
         )
 
-        # Petdex mascot — right-aligned half-block sprite above the prompt,
-        # mirroring the TUI's PetPane. Collapses to height 0 when no pet is
-        # enabled, so it's a no-op for everyone else. The _pet_anim_loop thread
-        # advances frames + invalidates; align=RIGHT pins it to the edge.
+        # Petdex mascot — right-aligned Kitty placeholder or half-block sprite
+        # above the prompt. Collapses to height 0 when no pet is enabled.
+        # The animation thread queues virtual Kitty frames; after_render
+        # writes them out-of-band while prompt_toolkit owns the placeholder grid.
         self._pet_widget = Window(
             content=FormattedTextControl(self._pet_fragments),
             height=self._pet_widget_height,
@@ -20014,7 +20374,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # in _strip_leaked_terminal_responses still guards residual leaks.
         _cpr_disabled_output = _select_classic_cli_pt_output(sys.stdout)
 
-        # Create the application
+        # Kitty placeholders encode their image id in exact foreground RGB, so
+        # placeholder-capable terminals (kitty/Ghostty) use 24-bit color for
+        # the whole prompt_toolkit application — quantizing only that pane
+        # is not supported. WezTerm is excluded: it is not placeholder-capable.
+        # ColorDepth is imported here (not at module load) so tests that stub
+        # ``prompt_toolkit`` as a MagicMock can still import cli.
+        color_depth_kw = {}
+        if pet_render.supports_kitty_placeholders():
+            from prompt_toolkit.output import ColorDepth
+
+            color_depth_kw = {"color_depth": ColorDepth.DEPTH_24_BIT}
         app = Application(
             layout=layout,
             key_bindings=kb,
@@ -20022,6 +20392,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             full_screen=False,
             mouse_support=False,
             **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
+            **color_depth_kw,
             # Read from display.cli_refresh_interval (default 0 = disabled).
             # When non-zero, prompt_toolkit redraws the UI on this cadence
             # during idle, keeping wall-clock status-bar read-outs ticking.
@@ -20043,6 +20414,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         _disable_prompt_toolkit_cpr_warning(app)
+        app.after_render += self._pet_flush_kitty_frame
         self._app = app  # Store reference for clarify_callback
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
@@ -20174,6 +20546,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if is_voice_input:
                         user_input = user_input.text
 
+                    # Seeded -q prompts arrive wrapped in _SeededQueryMessage:
+                    # arbitrary launcher/script text that must be submitted
+                    # LITERALLY — skip slash routing, ! shell dispatch, and
+                    # file-drop detection for this one message.
+                    is_seeded_query = isinstance(user_input, _SeededQueryMessage)
+                    if is_seeded_query:
+                        seeded = user_input
+                        user_input = (
+                            (seeded.text, seeded.images)
+                            if seeded.images
+                            else seeded.text
+                        )
+
                     if not user_input:
                         continue
 
@@ -20201,8 +20586,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
-                    # See _detect_file_drop() for details.
-                    _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
+                    # See _detect_file_drop() for details. Seeded -q prompts are
+                    # literal text: no file-drop detection, no !/slash dispatch.
+                    _file_drop = (
+                        _detect_file_drop(user_input)
+                        if isinstance(user_input, str) and not is_seeded_query
+                        else None
+                    )
                     if _file_drop:
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
@@ -20234,12 +20624,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # turn is spent. See handle_bang_shell().
                     if (
                         not _file_drop
+                        and not is_seeded_query
                         and isinstance(user_input, str)
                         and self.handle_bang_shell(user_input)
                     ):
                         continue
 
-                    if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
+                    if (
+                        not _file_drop
+                        and not is_seeded_query
+                        and isinstance(user_input, str)
+                        and _looks_like_slash_command(user_input)
+                    ):
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
@@ -20843,6 +21239,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 def main(
     query: str = None,
     q: str = None,
+    oneshot: bool = False,
     image: str = None,
     toolsets: str = None,
     skills: str | list[str] | tuple[str, ...] = None,
@@ -20871,8 +21268,12 @@ def main(
     Hermes Agent CLI - Interactive AI Assistant
     
     Args:
-        query: Single query to execute (then exit). Alias: -q
+        query: Query to run. On a real TTY this seeds an interactive session
+            (submitted literally as the first turn); with --oneshot/-Q or a
+            non-TTY it answers and exits. Alias: -q
         q: Shorthand for --query
+        oneshot: With -q: force the legacy answer-and-exit single-query mode
+            even on a TTY.
         image: Optional local image path to attach to a single query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
         skills: Comma-separated or repeated list of skills to preload for the session
@@ -21202,6 +21603,21 @@ def main(
     
     # Handle single query mode
     if query or image:
+        # NEW DEFAULT (Aug 2026): on a real TTY, a -q/--image invocation
+        # seeds a normal interactive session with the prompt as the first
+        # turn, submitted LITERALLY (no slash/! dispatch). Legacy
+        # answer-and-exit behavior is kept for --oneshot, -Q, and every
+        # non-TTY invocation (kanban/cron/pipes) — see
+        # _should_seed_interactive().
+        if _should_seed_interactive(query, image, quiet, oneshot):
+            seeded_query, seeded_images = _collect_query_images(query, image)
+            logger.info(
+                "Seeding interactive session with -q prompt (%d chars, %d images)",
+                len(seeded_query or ""), len(seeded_images),
+            )
+            cli._seeded_first_message = _SeededQueryMessage(seeded_query, seeded_images)
+            cli.run()
+            return
         # One-shot mode: no between-turns MCP late-binding refresh, so the
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
@@ -21330,9 +21746,25 @@ def main(
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays
                         # machine-readable (no styled "Hermes" box, no tool-gen
-                        # status lines).  The response is printed once below.
+                        # status lines, no reasoning box).  The response is
+                        # printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.reasoning_callback = None
+                        # Inline-diff and progress callbacks print directly to
+                        # stdout and are gated by NEITHER quiet_mode nor
+                        # tool_progress_mode: _on_tool_complete renders full
+                        # file diffs via render_edit_diff_with_delta, and
+                        # _on_tool_progress prints MoA reference blocks before
+                        # its mode check. Neutralize them too so -Q stdout
+                        # carries only the final response (#93220).
+                        cli.agent.tool_progress_callback = None
+                        cli.agent.tool_start_callback = None
+                        cli.agent.tool_complete_callback = None
+                        # Belt-and-braces for the executor's direct prints
+                        # (they check agent.tool_progress_mode, initialized
+                        # from display.tool_progress at construction).
+                        cli.agent.tool_progress_mode = "off"
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,

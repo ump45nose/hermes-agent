@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import sys
+import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -280,6 +281,86 @@ def get_profile_home(
     return canonical_root if name == "default" else canonical_root / "profiles" / name
 
 
+# Named-profile deletion must survive stale mkdir from live serve/logging.
+# The marker lives beside the profile dir, not inside it, so rmtree cannot
+# erase the fact that the profile was deleted.
+_DELETED_PROFILES_DIR = ".deleted"
+_HERMES_HOME_MARKERS = ("config.yaml", ".env", "state.db")
+
+
+def _is_hermes_profiles_root(profiles_dir: Path) -> bool:
+    """Return True when *profiles_dir* is a canonical Hermes profiles root."""
+    root = profiles_dir.parent
+    if root.name == ".hermes":
+        return True
+    try:
+        if (profiles_dir / _DELETED_PROFILES_DIR).is_dir():
+            return True
+        if any((root / marker).exists() for marker in _HERMES_HOME_MARKERS):
+            return True
+    except OSError:
+        pass
+    try:
+        return root.resolve(strict=False) == get_default_hermes_root().resolve(
+            strict=False
+        )
+    except OSError:
+        return False
+
+
+def named_profile_home(path: str | Path) -> Path | None:
+    """Return the named profile home containing *path*, if there is one."""
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        if (
+            candidate.parent.name == "profiles"
+            and not candidate.name.startswith(".")
+            and _is_hermes_profiles_root(candidate.parent)
+        ):
+            return candidate
+        if candidate.name == ".hermes":
+            return None
+    return None
+
+
+def profile_tombstone_path(profile_home: Path) -> Path:
+    return profile_home.parent / _DELETED_PROFILES_DIR / profile_home.name
+
+
+def named_profile_is_deleted(profile_home: str | Path) -> bool:
+    return profile_tombstone_path(Path(profile_home)).exists()
+
+
+def mark_named_profile_deleted(profile_home: str | Path) -> None:
+    marker = profile_tombstone_path(Path(profile_home))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("deleted\n", encoding="utf-8")
+
+
+def clear_named_profile_deleted(profile_home: str | Path) -> None:
+    profile_tombstone_path(Path(profile_home)).unlink(missing_ok=True)
+
+
+def assert_named_profile_home_live(path: str | Path) -> None:
+    """Refuse missing or tombstoned named profile homes."""
+    home = named_profile_home(path)
+    if home is None:
+        return
+    if named_profile_is_deleted(home) or not home.exists():
+        raise FileNotFoundError(
+            f"Named profile home does not exist: {home}. "
+            "Create the profile explicitly before using it."
+        )
+
+
+def mkdir_under_hermes_home(path: str | Path) -> Path:
+    """Create *path*, but never materialize a deleted/missing named profile."""
+    target = Path(path)
+    assert_named_profile_home_live(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _get_packaged_data_dir(name: str) -> Path | None:
     """Return an installed data-files directory if one exists.
 
@@ -419,6 +500,11 @@ def _candidate_node_command_names(command: str) -> list[str]:
 _HERMES_NODE_TARGET_MAJOR = int(os.environ.get("HERMES_NODE_TARGET_MAJOR", "22"))
 _managed_node_heal_attempted = False
 _NODE_BOOTSTRAP_SCRIPT = Path(__file__).resolve().parent / "scripts" / "lib" / "node-bootstrap.sh"
+
+# Install tree root (this file lives at <install_root>/hermes_constants.py).
+# Used by secure_parent_dir() to skip chmod on the install dir — chmodding it
+# 0700 breaks hermes-user traversal in Docker (UID 10000). See #25821, #93050.
+_INSTALL_ROOT = Path(__file__).resolve().parent
 
 
 def node_tool_runnable(path: str | None) -> bool:
@@ -1074,7 +1160,13 @@ def display_hermes_home() -> str:
     """
     home = get_hermes_home()
     try:
-        return "~/" + str(home.relative_to(Path.home()))
+        # as_posix(): on Windows, str() of a relative Path renders
+        # backslashes, producing mixed-separator chimeras like
+        # ``~/AppData\Local\hermes/skills/`` once callers append
+        # sub-paths. ``~/`` shorthand implies POSIX rendering; keep the
+        # whole string consistent (forward slashes work everywhere,
+        # including Windows shells and Python APIs).
+        return "~/" + home.relative_to(Path.home()).as_posix()
     except ValueError:
         return str(home)
 
@@ -1087,11 +1179,35 @@ def secure_parent_dir(path: Path) -> None:
     prevent catastrophic host bricking when ``HERMES_HOME`` or other path
     env vars resolve to an unexpected location.
 
-    See https://github.com/NousResearch/hermes-agent/issues/25821.
+    Also refuses to chmod the hermes-agent install tree (the directory this
+    module lives in, and anything below it): restricting the install dir to
+    0700 locks the runtime user out of traversing it when it does not own
+    the dir, as in the Docker image. A warning is logged when this happens.
+
+    See https://github.com/NousResearch/hermes-agent/issues/25821 and
+    https://github.com/NousResearch/hermes-agent/pull/93050.
     """
     parent = path.parent.resolve()
     # Refuse root and its direct children (/usr, /home, /var, /tmp, …).
     if parent == Path("/") or len(parent.parts) < 3:
+        return
+    # Refuse the install tree root. chmodding it 0700 breaks hermes-user
+    # traversal in Docker (UID 10000) and any other install where the
+    # runtime user doesn't own the install dir. See #25821, #93050.
+    if parent == _INSTALL_ROOT or _INSTALL_ROOT in parent.parents:
+        # A credential file inside the install tree usually means HERMES_HOME
+        # resolved somewhere unexpected — surface it instead of skipping
+        # silently, since this same misconfiguration previously caused
+        # production lockouts.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Not restricting permissions on %s: it is inside the "
+            "hermes-agent install directory (%s). Credential files are "
+            "normally stored under the hermes home directory instead.",
+            parent,
+            _INSTALL_ROOT,
+        )
         return
     try:
         os.chmod(parent, 0o700)

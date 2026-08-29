@@ -44,14 +44,18 @@ for the full rationale):
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import math
 import re
 import copy
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+
+import snowballstemmer
 
 from tools.registry import tool_error
 
@@ -88,6 +92,11 @@ DEFAULT_MAX_HYDRATED_TOOLS = 16
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
 
+# Bound the work one tool_search bridge call can request.
+_MAX_QUERIES_PER_CALL = 10
+# Bound the work one tool_describe bridge call can request.
+_MAX_DESCRIBE_NAMES_PER_CALL = 10
+
 
 # ---------------------------------------------------------------------------
 # Configuration plumbing
@@ -98,7 +107,7 @@ CHARS_PER_TOKEN = 4.0
 class ToolSearchConfig:
     """Resolved, validated tool-search configuration for a single assembly."""
 
-    enabled: str  # "auto" | "on" | "off"
+    enabled: str  # "auto" | "on" | "off" — "auto" is an alias of "on" today
     # Listing budget as a percentage of the model's context window. Under
     # tiered disclosure this no longer gates *activation* (any deferrable
     # tool activates the bridge) — it bounds how much context the embedded
@@ -195,6 +204,20 @@ def load_config() -> ToolSearchConfig:
     """Load tool-search config from the user config file."""
     try:
         from hermes_cli.config import load_config as _load
+        cfg = _load() or {}
+        tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+        if not isinstance(tools_cfg, dict):
+            tools_cfg = {}
+        return ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+    except Exception as e:
+        logger.debug("Failed to load tool-search config: %s", e)
+        return ToolSearchConfig.from_raw(None)
+
+
+def load_config_readonly() -> ToolSearchConfig:
+    """Load tool-search config without copying the cached full config."""
+    try:
+        from hermes_cli.config import load_config_readonly as _load
         cfg = _load() or {}
         tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
         if not isinstance(tools_cfg, dict):
@@ -384,6 +407,13 @@ def should_activate(
     ``"off"`` skips unconditionally. ``"on"`` and ``"auto"`` activate whenever
     at least one deferrable tool exists (there's no point swapping a no-op).
 
+    ``"auto"`` is an ALIAS of ``"on"`` under tiered disclosure — it is kept
+    as the shipped default so that a future budget-gated mode ("inline the
+    schemas when they fit, defer only when they don't") can change ``auto``'s
+    behavior without breaking users who explicitly pinned ``on`` or ``off``.
+    Do not add behavior that distinguishes them without that design; see the
+    config reference for the user-facing statement of this contract.
+
     Tiered-disclosure semantics (July 2026): the presence of ANY MCP/plugin
     tool activates the bridge — schemas always defer. What the threshold now
     controls is the *listing budget* (see :func:`listing_token_budget`), not
@@ -451,8 +481,34 @@ def _cjk_tokens(run: str) -> List[str]:
         tokens.extend(run)
     return tokens
 
+# Snowball stemmer instances keep mutable parsing state, so they are not
+# safe to share across threads — and bridge dispatch can run on parallel
+# tool-call threads. One stemmer per thread, created lazily.
+_thread_local = threading.local()
+
+
+def _stemmer() -> Any:
+    st = getattr(_thread_local, "stemmer", None)
+    if st is None:
+        st = snowballstemmer.stemmer("english")
+        _thread_local.stemmer = st
+    return st
+
+
+@functools.lru_cache(maxsize=16384)
+def _stem(token: str) -> str:
+    """Stem one token, memoized across stateless catalog rebuilds."""
+    return _stemmer().stemWord(token)
+
 
 def _tokenize(text: str) -> List[str]:
+    """Lowercase alphanumeric tokens, Snowball-stemmed (English).
+
+    Stemming is applied here so it hits BOTH the index path
+    (:func:`build_catalog` via :func:`_entry_search_text`) and the query
+    path (:func:`search_catalog`) identically — a query for "issues"
+    matches a tool named ``create_issue``.
+    """
     if not text:
         return []
     tokens: List[str] = []
@@ -465,7 +521,7 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
-def _entry_search_text(td: Dict[str, Any]) -> str:
+def _entry_search_text(td: Dict[str, Any], source_label: str = "") -> str:
     """Build the search-text blob for a deferrable tool.
 
     Includes the tool name (with underscores broken into words so BM25 can
@@ -475,6 +531,8 @@ def _entry_search_text(td: Dict[str, Any]) -> str:
     """
     fn = td.get("function") or {}
     name = fn.get("name", "")
+    if name.startswith("mcp__"):
+        name = name[len("mcp__"):]
     desc = fn.get("description", "") or ""
     argument_terms: List[str] = []
 
@@ -538,6 +596,10 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
             continue
         desc = fn.get("description", "") or ""
         source, source_name = _classify_source(name)
+        # Index the human-facing group label ("linear", not "mcp-linear") so
+        # a service-name query matches tools from that source even when the
+        # tool's own name omits the service.
+        source_label = _listing_group_label(source_name) if source_name else ""
         entry = CatalogEntry(
             name=name,
             description=desc,
@@ -582,14 +644,36 @@ def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
     return score
 
 
-def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
+_CorpusStats = Tuple[List[int], float, Dict[str, int], int]
+
+
+def _corpus_stats(catalog: List[CatalogEntry]) -> _CorpusStats:
+    """Compute the BM25 statistics shared by every query over a catalog."""
+    doc_lengths = [len(entry._tokens) for entry in catalog]
+    avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
+    doc_freq: Dict[str, int] = {}
+    for entry in catalog:
+        for token in set(entry._tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+    return doc_lengths, avg_dl, doc_freq, len(catalog)
+
+
+def search_catalog(
+    catalog: List[CatalogEntry],
+    query: str,
+    limit: int = 5,
+    *,
+    corpus_stats: Optional[_CorpusStats] = None,
+) -> List[CatalogEntry]:
     """Return the top-``limit`` catalog entries for ``query`` by BM25.
 
-    Falls back to a stable name-substring match when BM25 yields no hits
-    above zero. That ensures a query like ``"github"`` against a catalog
-    where every tool is named ``github_*`` still returns results — BM25
-    can underperform when query and document share only one token that
-    appears in every document (zero IDF).
+    Falls back to a stable name-substring match when every query token
+    misses every document — e.g. the query ``"hub"`` against ``github_*``
+    tools ("hub" is a substring of the name but never a token, so BM25
+    scores nothing). The IDF variant used here,
+    ``log(1 + (N - df + 0.5) / (df + 0.5))``, is strictly positive even
+    when a term appears in every document, so the fallback only runs when
+    no query token appears in any document.
     """
     if not catalog or limit <= 0:
         return []
@@ -597,20 +681,15 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     if not query_tokens:
         return []
 
-    # Precompute doc statistics.
-    doc_lengths = [len(e._tokens) for e in catalog]
-    avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
-    doc_freq: Dict[str, int] = {}
-    for e in catalog:
-        seen = set(e._tokens)
-        for t in seen:
-            doc_freq[t] = doc_freq.get(t, 0) + 1
-    n_docs = len(catalog)
+    if corpus_stats is None:
+        corpus_stats = _corpus_stats(catalog)
+    doc_lengths, avg_dl, doc_freq, n_docs = corpus_stats
 
     distinct_query_tokens = set(query_tokens)
     require_multiple_terms = len(distinct_query_tokens) >= 3
     normalized_query = " ".join(query_tokens)
     scored: List[Tuple[float, CatalogEntry]] = []
+    exact_name = query.strip().lower()
     for entry in catalog:
         matched_terms = distinct_query_tokens.intersection(entry._tokens)
         # A multi-term capability query sharing only one generic word
@@ -828,16 +907,17 @@ def bridge_tool_schemas(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Keywords describing the capability you need (e.g. 'create github issue').",
+                        "queries": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Search queries, each a few keywords describing one capability (e.g. ['create github issue', 'send slack message']). Searched in parallel; results come back grouped per query. A single string is accepted and treated as one query.",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of results to return. Default 5.",
+                            "description": "Maximum number of matches per query. Defaults to 5 and is clamped to the configured maximum (25 by default).",
                         },
                     },
-                    "required": ["query"],
+                    "required": ["queries"],
                 },
             },
         },
@@ -1018,9 +1098,25 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
-def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
+    """One record for the response's shared ``tools`` map.
+
+    Held once per tool no matter how many query groups matched it — the
+    per-query groups carry names only. ``required`` lists the schema's
+    required parameter names so the model can attempt a call without a
+    ``tool_describe`` round-trip when the required surface is trivial.
+    """
+    schema = entry.schema if isinstance(entry.schema, dict) else {}
+    fn = schema.get("function")
+    if not isinstance(fn, dict):
+        fn = {}
+    params = fn.get("parameters")
+    if not isinstance(params, dict):
+        params = {}
+    required = params.get("required")
+    if not isinstance(required, list):
+        required = []
     return {
-        "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
         "schema_hash": entry.schema_hash,
@@ -1065,9 +1161,21 @@ def dispatch_tool_search(args: Dict[str, Any],
     """Execute the ``tool_search`` bridge tool. Returns a JSON string."""
     if config is None:
         config = load_config()
-    query = str(args.get("query") or "").strip()
-    if not query:
-        return tool_error("query is required")
+
+    raw_queries = args.get("queries")
+    if isinstance(raw_queries, str):
+        # A bare string is an understandable model slip; treat as one query.
+        raw_queries = [raw_queries]
+    if not isinstance(raw_queries, list):
+        return tool_error("queries is required and must be an array of strings")
+    queries = [str(q).strip() for q in raw_queries if str(q or "").strip()]
+    if not queries:
+        return tool_error("queries is required and must contain at least one non-empty string")
+    if len(queries) > _MAX_QUERIES_PER_CALL:
+        return tool_error(
+            f"too many queries: {len(queries)} > max {_MAX_QUERIES_PER_CALL}. "
+            "Retry with fewer, more targeted queries."
+        )
 
     raw_limit = args.get("limit")
     if raw_limit is None:
@@ -1077,21 +1185,33 @@ def dispatch_tool_search(args: Dict[str, Any],
 
     _, deferrable = classify_tools(current_tool_defs, progressive=progressive)
     catalog = build_catalog(deferrable)
-    hits = search_catalog(catalog, query, limit=limit)
+
+    results: List[Dict[str, Any]] = []
+    tools_map: Dict[str, Dict[str, Any]] = {}
+    corpus_stats = _corpus_stats(catalog)
+    available_sources = _available_source_summary(catalog) if catalog else []
+    for query in queries:
+        hits = search_catalog(catalog, query, limit=limit, corpus_stats=corpus_stats)
+        for h in hits:
+            if h.name not in tools_map:
+                tools_map[h.name] = _shared_tool_record(h)
+        group: Dict[str, Any] = {"query": query, "matches": [h.name for h in hits]}
+        if not hits and catalog:
+            group["available_sources"] = available_sources
+            group["hint"] = (
+                "This query returned no lexical matches, but the sources above "
+                "are connected and their tools remain available. Retry "
+                "tool_search with the service name plus a concrete action or "
+                "object before concluding the capability is unavailable."
+            )
+        results.append(group)
+
     result: Dict[str, Any] = {
-        "query": query,
+        "queries": queries,
         "total_available": len(catalog),
         "matches": [_format_search_hit(h) for h in hits],
         "tool_references": [_format_tool_reference(h) for h in hits],
     }
-    if not hits and catalog:
-        result["available_sources"] = _available_source_summary(catalog)
-        result["hint"] = (
-            "No lexical match was found, but the sources above are connected "
-            "and their tools remain available. Retry tool_search with the "
-            "service name plus a concrete action or object before concluding "
-            "the capability is unavailable."
-        )
     return json.dumps(result, ensure_ascii=False)
 
 
